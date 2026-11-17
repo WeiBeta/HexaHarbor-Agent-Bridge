@@ -19,7 +19,7 @@ from agent_bridge.worker_env import is_worker_context
 
 log = logging.getLogger(__name__)
 
-GIT_SOURCE = "git+https://github.com/FeiZhuLulu/Agent-Bridge.git"
+GIT_SOURCE = "git+https://github.com/WeiBeta/HexaHarbor-Agent-Bridge.git"
 PACKAGE = "agent-bridge"
 
 SKILL_RELATIVE = (
@@ -31,7 +31,7 @@ SKILL_RELATIVE = (
     Path(".claude") / "skills" / "agent-bridge" / "SKILL.md",
 )
 
-HELP = f"""Agent Bridge — connect local coding agents.
+HELP = f"""HexaHarbor Agent Bridge — connect local coding agents.
 
 Usage:
   agent-bridge                 start the MCP server on stdio
@@ -46,9 +46,9 @@ Install:
   uv tool install {GIT_SOURCE}
 
 Then register the MCP server in Codex, Cursor, Kimi Code, ZCode, Grok
-Build, or Claude Code (Devin reads the Cursor entry). Skill files are written when a top-level
-coordinator first starts the server and refreshed after each upgrade;
-ordinary restarts leave your local edits alone.
+Build, or Claude Code (Devin reads the Cursor entry). Startup skill installation
+is disabled by default; opt in with [server] auto_install_skill = true.
+Upgrades refresh existing skill copies, so back up local edits first.
 
 Update:
   agent-bridge upgrade
@@ -209,11 +209,14 @@ def upgrade(
 def main(argv: Sequence[str] | None = None) -> None:
     args = list(sys.argv[1:] if argv is None else argv)
     if not args:
+        from agent_bridge.config import load_config
         from agent_bridge.logging_setup import setup_logging
         from agent_bridge.server import mcp
 
-        setup_logging(ensure_home())
-        ensure_coordinator_skill()
+        home = ensure_home()
+        setup_logging(home)
+        if load_config(home).server.auto_install_skill:
+            ensure_coordinator_skill()
         mcp.run(transport="stdio")
         return
 

@@ -1,14 +1,15 @@
 [project]
 name = "agent-bridge"
 version = "0.1.0"
-description = "Connect local coding agents. Codex, Cursor, Kimi Code, ZCode, Grok Build, Claude Code, or Devin coordinates Antigravity CLI, Grok Build, Kimi Code, DeepSeek Harness, OpenCode, Claude Code, Codex CLI, Devin CLI, ZCode, and MiniMax Code."
+description = "HexaHarbor Agent Bridge: connect local coding agents through their native harnesses."
 readme = "README.md"
-license = "MIT"
-authors = [{ name = "FeiZhuLulu" }]
+license = "AGPL-3.0-only"
+license-files = ["LICENSE", "LICENSES/Agent-Bridge-MIT.txt", "NOTICE.md"]
+authors = [{ name = "FeiZhuLulu" }, { name = "WeiBeta" }]
 requires-python = ">=3.11"
 dependencies = [
     "mcp>=2.0.0",
-    "agent-client-protocol>=0.12.0",
+    "agent-client-protocol>=0.12.0,<1.0",
     "httpx2>=2.5.0",
     "pydantic>=2.7",
     "psutil>=6.0",
@@ -24,8 +25,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/FeiZhuLulu/Agent-Bridge"
-Repository = "https://github.com/FeiZhuLulu/Agent-Bridge"
+Homepage = "https://github.com/WeiBeta/HexaHarbor-Agent-Bridge"
+Repository = "https://github.com/WeiBeta/HexaHarbor-Agent-Bridge"
 
 [project.scripts]
 agent-bridge = "agent_bridge.server:main"

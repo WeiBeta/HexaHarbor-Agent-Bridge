@@ -130,6 +130,12 @@ class AgentConfig(BaseModel):
     # key=value). No key validation, no filtering, user config.toml is
     # never read.
     config_overrides: list[str] = Field(default_factory=list)
+    # Antigravity CLI only: execution mode (--mode accept-edits|auto|plan),
+    # optional terminal sandbox (--sandbox), and explicit opt-in for
+    # --dangerously-skip-permissions (disabled by default).
+    agy_mode: str | None = "auto"
+    agy_sandbox: bool = False
+    skip_permissions: bool = False
 
 
 class EnvConfig(BaseModel):
@@ -146,9 +152,11 @@ class EnvConfig(BaseModel):
 
 
 class ServerConfig(BaseModel):
-    """Process-level server behavior (optional idle self-exit)."""
+    """Process-level server behavior (idle exit, skill install, agent filter)."""
 
     idle_exit_sec: int = 0
+    auto_install_skill: bool = False
+    enabled_agents: list[str] = Field(default_factory=list)
 
 
 class QuotaConfig(BaseModel):
@@ -306,6 +314,15 @@ def _coerce_server(raw: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if "idle_exit_sec" in block and block["idle_exit_sec"] is not None:
         out["idle_exit_sec"] = int(block["idle_exit_sec"])
+    if "auto_install_skill" in block and block["auto_install_skill"] is not None:
+        out["auto_install_skill"] = bool(block["auto_install_skill"])
+    if "enabled_agents" in block and block["enabled_agents"] is not None:
+        raw_enabled = block["enabled_agents"]
+        out["enabled_agents"] = (
+            [raw_enabled]
+            if isinstance(raw_enabled, str)
+            else [str(item) for item in raw_enabled if str(item).strip()]
+        )
     return out
 
 

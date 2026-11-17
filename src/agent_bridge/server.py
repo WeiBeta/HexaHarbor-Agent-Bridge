@@ -32,38 +32,29 @@ async def lifespan(_server: MCPServer[Registry]) -> AsyncIterator[Registry]:
         await registry.stop()
 
 
-# Injected into the coordinator's context at the MCP handshake — the one
-# channel that needs no copied rules file and no skill install.
+# Injected into the coordinator's context at the MCP handshake — concise,
+# neutral bridge protocol rules (no hardcoded worker routing bias).
 INSTRUCTIONS = (
-    "Agent Bridge dispatches tasks to local worker CLIs (Grok, Kimi Code, "
-    "Antigravity, DeepSeek Harness, OpenCode, Claude Code, Codex CLI, Devin CLI, "
-    "Cursor, ZCode, MiniMax Code) and keeps their "
-    "sessions resumable.\n"
-    "Hard rules: workers are reached only through these tools — never drive the "
-    "worker CLIs or GUIs directly. dispatch_task.cwd is this conversation's "
-    "project folder (absolute), not the Agent Bridge install path. A wait_task "
-    "timeout is not failure; call it again. Verify results with get_result plus "
-    "your own git diff — do not trust a worker's self-report. An empty Kimi "
-    "result with non-empty warnings is a failed turn, not a no-op.\n"
-    "Call list_agents first. Read coordinator.mode, coordinator.instructions, "
-    "coordinator.runtime_context, and coordinator.dispatch_enabled. User "
-    "preferences in instructions override default worker routing. Each "
-    "agents[] row carries quota: status ok/exhausted/unknown, rolling windows "
-    "with remaining_percent and resets_at, and optional provider-reported balance for "
-    "workers. Custom API/auth endpoints are unsupported; cached readings expire at window reset. unknown means Bridge could not read it, not that it is empty; "
-    "an exhausted worker will most likely fail its turn. Quota is information "
-    "for you and the user, not a routing rule — instructions still decide. "
-    "Claude quota.status covers only shared 5h/weekly limits. Before dispatch, "
-    "check the requested model's weekly:opus or weekly:sonnet window even when "
-    "status is ok. A zero remaining_percent means that model is exhausted: "
-    "report its reset time or use an alternative allowed by the user's routing "
-    "instructions. Missing or null readings mean unknown; model-specific windows "
-    "alone cannot establish the shared status. If "
-    "dispatch_enabled is false, this Bridge was inherited inside a worker "
-    "process — do not call dispatch_task, set_preferences, cancel_task, "
-    "or end_session. When "
-    "dispatch_enabled is true and the user states a lasting preference, "
-    "persist it with set_preferences."
+    "Agent Bridge is a neutral local multi-agent communication bridge.\n"
+    "Hard rules: reach workers only through these MCP tools — never launch "
+    "worker CLIs or GUIs directly. dispatch_task.cwd and dispatch_ticket.cwd "
+    "must be this conversation's project folder (absolute), not the Bridge "
+    "install directory.\n"
+    "Call list_agents first to discover available workers and read "
+    "coordinator.mode, coordinator.instructions, coordinator.runtime_context, "
+    "and coordinator.dispatch_enabled. Each agents[] row includes quota "
+    "(ok/exhausted/unknown): unknown means Bridge could not read it, not that "
+    "it is empty; an exhausted worker will likely fail. Quota is advisory "
+    "information, not a routing rule — the active agent model and "
+    "coordinator.instructions decide routing.\n"
+    "Use dispatch_ticket for single-call ticket dispatch and automatic "
+    "structured receipt collection (or use dispatch_task + wait_task + "
+    "get_result for parallel fan-out; a wait_task timeout is not failure, "
+    "call it again). Pass the same session_id to continue a worker "
+    "conversation, and verify workspace changes via files_changed and git diff.\n"
+    "If dispatch_enabled is false (runtime_context is worker), this Bridge "
+    "was inherited inside a worker process — do not call dispatch_ticket, "
+    "dispatch_task, set_preferences, cancel_task, or end_session."
 )
 
 mcp = MCPServer[Registry]("agent-bridge", instructions=INSTRUCTIONS, lifespan=lifespan)
@@ -124,7 +115,7 @@ async def dispatch_task(
     user_requested: bool = False,
     request_id: str | None = None,
 ) -> dict[str, Any]:
-    """Start a worker turn. cwd is this coordinator conversation's project (absolute). model/effort are optional coordinator choices (agy: --model/--effort/--project (existing project for cwd, else --new-project); grok: session/setModel after /new; kimi/cursor/opencode/claude/devin/zcode/minimax: session/set_config_option after new/resume, devin has no effort; dsh: legacy demo spawn env + respawn on change, native --profile acp session/set_config_option; codex: exec -m / -c model_reasoning_effort, off->none). Pass session_id to continue. Set user_requested=true only when the user explicitly asked for a worker (required in manual mode). Rejected when coordinator.dispatch_enabled is false, even with user_requested=true. For optional retry deduplication, supply a UUID request_id on the first call and replay the same ID and original arguments on retries; keep session_id omitted if it was originally omitted. Adding an ID only on retry cannot deduplicate the first call. Identical retries reuse the task in this Bridge instance while it is retained; different arguments are rejected. Normal dispatch validation still applies. Bindings are lost on restart and are not shared with other instances. Returns immediately."""
+    """Start a worker turn. cwd is this coordinator conversation's project (absolute). model/effort are optional coordinator choices (agy: --model/--effort/--mode/--project (existing project for cwd, else --new-project); grok: session/setModel after /new; kimi/cursor/opencode/claude/devin/zcode/minimax: session/set_config_option after new/resume, devin has no effort; dsh: legacy demo spawn env + respawn on change, native --profile acp session/set_config_option; codex: exec -m / -c model_reasoning_effort, off->none). Pass session_id to continue. Set user_requested=true only when the user explicitly asked for a worker (required in manual mode). Rejected when coordinator.dispatch_enabled is false, even with user_requested=true. For optional retry deduplication, supply a UUID request_id on the first call and replay the same ID and original arguments on retries; keep session_id omitted if it was originally omitted. Adding an ID only on retry cannot deduplicate the first call. Identical retries reuse the task while retained (persists across single-instance restarts, not shared with concurrent instances); different arguments are rejected. Normal dispatch validation still applies. Returns immediately."""
     try:
         result = await _registry(ctx).dispatch_task(
             agent=agent,
@@ -134,6 +125,43 @@ async def dispatch_task(
             model=model,
             effort=effort,
             title=title,
+            user_requested=user_requested,
+            request_id=request_id,
+        )
+        return {"ok": True, **result}
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool()
+async def dispatch_ticket(
+    ctx: Context,
+    message: str,
+    cwd: str,
+    agent: str = "antigravity",
+    ticket_id: str | None = None,
+    session_id: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+    title: str | None = None,
+    timeout_sec: float = 480.0,
+    max_chars: int = RESULT_PAGE_MAX_CHARS,
+    user_requested: bool = False,
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    """Dispatch a self-contained work ticket to a local worker (default antigravity; also supports codex, cursor, etc.), wait up to timeout_sec, and return the structured receipt directly (also saved under receipts/<task_id>.json). Pass session_id to continue/rework in the same worker conversation. Pass a UUID request_id for idempotent retries. If the ticket exceeds timeout_sec, status='running' and task_id are returned so you can continue with wait_task and get_result. Rejected when coordinator.dispatch_enabled is false."""
+    try:
+        result = await _registry(ctx).dispatch_ticket(
+            agent=agent,
+            message=message,
+            cwd=cwd,
+            ticket_id=ticket_id,
+            session_id=session_id,
+            model=model,
+            effort=effort,
+            title=title,
+            timeout_sec=timeout_sec,
+            max_chars=max_chars,
             user_requested=user_requested,
             request_id=request_id,
         )

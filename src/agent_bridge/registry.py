@@ -39,7 +39,7 @@ from agent_bridge.models import (
     iso,
     normalize_effort,
 )
-from agent_bridge.paths import ensure_home, result_path, state_path, transcript_path
+from agent_bridge.paths import ensure_home, receipt_path, result_path, state_path, transcript_path
 from agent_bridge.persist import (
     atomic_write_json,
     atomic_write_text,
@@ -589,13 +589,22 @@ class Registry:
                 return task
         return None
 
+    def _active_agents(self) -> dict[str, AgentConfig]:
+        enabled = [item.strip() for item in self.config.server.enabled_agents if item.strip()]
+        if not enabled:
+            return dict(self.config.agents)
+        allowed = set(enabled)
+        if "fake" in self.config.agents:
+            allowed.add("fake")
+        return {name: cfg for name, cfg in self.config.agents.items() if name in allowed}
+
     async def list_agents(self) -> list[dict]:
         async def describe(cfg: AgentConfig) -> dict:
             row = await probe_agent(cfg, self.config.env)
             row["quota"] = await self._quota_for(cfg, available=bool(row.get("available")))
             return row
 
-        return list(await asyncio.gather(*(describe(cfg) for cfg in self.config.agents.values())))
+        return list(await asyncio.gather(*(describe(cfg) for cfg in self._active_agents().values())))
 
     async def _quota_for(self, cfg: AgentConfig, *, available: bool) -> dict:
         """The ``quota`` block for one ``list_agents`` row. Never raises, never gates ``available``."""
@@ -720,6 +729,9 @@ class Registry:
             raise ValueError(f"cwd is not a directory: {cwd_path}")
         effort = normalize_effort(effort)
         self.config.get(agent)
+        if self.config.server.enabled_agents and agent not in self._active_agents():
+            enabled = ", ".join(sorted(self._active_agents())) or "(none)"
+            raise KeyError(f"agent {agent!r} is disabled by server.enabled_agents; enabled: {enabled}")
         # Compare supplied arguments, not selections inherited from a mutable session.
         request = (agent, message, str(cwd_path.resolve()), session_id, model, effort, title, user_requested)
         async with self._lock:
@@ -849,6 +861,8 @@ class Registry:
             result = await adapter.run_turn(session, task)
             if result.native_session_id:
                 session.native_session_id = result.native_session_id
+            if result.observed_permission_mode:
+                task.observed_permission_mode = result.observed_permission_mode
             task.result_chars = len(result.text)
             # Worker-derived text crosses the trust boundary here: scrub
             # before it lands in state.json/transcripts/MCP replies.
@@ -962,6 +976,7 @@ class Registry:
                 flush_session(session.session_id, self.home)
             except OSError:
                 log.exception("could not flush transcript for task %s", task.task_id)
+            await self._persist_receipt(task, session)
             self._done[task_id].set()
             self._bg.pop(task_id, None)
             self.save()
@@ -1111,6 +1126,49 @@ class Registry:
             else:
                 log.info("removed orphan result %s (no task row)", orphan.name)
 
+    def _receipt_payload(self, task: Task, session: Session) -> dict[str, Any]:
+        res_file = result_path(task.task_id, self.home)
+        return {
+            "task_id": task.task_id,
+            "session_id": task.session_id,
+            "native_session_id": session.native_session_id,
+            "agent": task.agent,
+            "cwd": task.cwd,
+            "title": session.title,
+            "status": task.status.value,
+            "stop_reason": task.stop_reason,
+            "model": task.model,
+            "effort": task.effort,
+            "observed_model": task.observed_model,
+            "observed_effort": task.observed_effort,
+            "observed_permission_mode": task.observed_permission_mode,
+            "files_changed": list(task.files_changed),
+            "files_changed_total": task.files_changed_total,
+            "files_outside_cwd": list(task.files_outside_cwd),
+            "files_outside_cwd_total": task.files_outside_cwd_total,
+            "result_chars": task.result_chars,
+            "result_preview": _tail(task.result_text),
+            "result_file": str(res_file) if res_file.is_file() else None,
+            "usage": dict(task.usage),
+            "warnings": list(task.warnings),
+            "error": task.error,
+            "created_at": task.created_at,
+            "started_at": task.started_at,
+            "finished_at": task.finished_at,
+        }
+
+    async def _persist_receipt(self, task: Task, session: Session) -> Path | None:
+        if task.status not in TERMINAL_STATUSES:
+            return None
+        payload = self._receipt_payload(task, session)
+        dest = receipt_path(task.task_id, self.home)
+        try:
+            await asyncio.to_thread(atomic_write_json, dest, payload)
+        except OSError:
+            log.exception("could not persist receipt for task %s", task.task_id)
+            return None
+        return dest
+
     def _drop_task(self, task_id: str) -> None:
         self.tasks.pop(task_id, None)
         self._requests = {
@@ -1121,6 +1179,10 @@ class Registry:
             result_path(task_id, self.home).unlink(missing_ok=True)
         except OSError:
             log.warning("could not remove pruned result for task %s", task_id)
+        try:
+            receipt_path(task_id, self.home).unlink(missing_ok=True)
+        except OSError:
+            log.warning("could not remove pruned receipt for task %s", task_id)
 
     def _prune_sessions(self) -> None:
         now = time.time()
@@ -1331,6 +1393,7 @@ class Registry:
             "effort": task.effort,
             "observed_model": task.observed_model,
             "observed_effort": task.observed_effort,
+            "observed_permission_mode": task.observed_permission_mode,
             "created_at": task.created_at,
             "started_at": task.started_at,
             "finished_at": task.finished_at,
@@ -1394,10 +1457,69 @@ class Registry:
             payload["persisted"] = persisted
         return payload
 
+    async def dispatch_ticket(
+        self,
+        agent: str,
+        message: str,
+        cwd: str,
+        *,
+        ticket_id: str | None = None,
+        session_id: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+        title: str | None = None,
+        timeout_sec: float = 480.0,
+        max_chars: int = RESULT_PAGE_MAX_CHARS,
+        user_requested: bool = False,
+        request_id: str | None = None,
+    ) -> dict:
+        if timeout_sec <= 0:
+            raise ValueError("timeout_sec must be positive")
+        if not 1 <= max_chars <= RESULT_PAGE_MAX_CHARS:
+            raise ValueError(f"max_chars must be between 1 and {RESULT_PAGE_MAX_CHARS}")
+        dispatched = await self.dispatch_task(
+            agent=agent,
+            message=message,
+            cwd=cwd,
+            session_id=session_id,
+            model=model,
+            effort=effort,
+            title=title or ticket_id,
+            user_requested=user_requested,
+            request_id=request_id,
+        )
+        waited = await self.wait_task(dispatched["task_id"], timeout_sec=timeout_sec)
+        session = self.sessions.get(dispatched["session_id"])
+        native_session_id = session.native_session_id if session is not None else None
+        extra: dict[str, Any] = {
+            "ticket_id": ticket_id,
+            "reused": dispatched.get("reused", False),
+            "native_session_id": native_session_id,
+        }
+        if "request_id" in dispatched:
+            extra["request_id"] = dispatched["request_id"]
+        if not waited["timed_out"]:
+            result = await self.get_result(dispatched["task_id"], cursor=0, max_chars=max_chars)
+            rcpt = receipt_path(dispatched["task_id"], self.home)
+            return {
+                **result,
+                **extra,
+                "timed_out": False,
+                "receipt_path": str(rcpt) if rcpt.is_file() else None,
+            }
+        return {
+            **waited,
+            **extra,
+            "receipt_path": None,
+            "hint": "Ticket is still running; call wait_task and then get_result with task_id to collect the receipt.",
+        }
+
     async def wait_task(self, task_id: str, timeout_sec: float = DEFAULT_WAIT_SEC) -> dict:
         task = self._require_task(task_id)
         event = self._done.setdefault(task_id, asyncio.Event())
-        if task.status not in TERMINAL_STATUSES:
+        # A live turn can reach terminal status before its receipt is written.
+        # Loaded historical tasks have no background finalizer to wait for.
+        if task.status not in TERMINAL_STATUSES or (task_id in self._bg and not event.is_set()):
             try:
                 await asyncio.wait_for(event.wait(), timeout=timeout_sec)
             except TimeoutError:
@@ -1492,6 +1614,7 @@ class Registry:
             if task.started_at is None and session.proc_state == ProcState.spawning:
                 session.proc_state = ProcState.idle_unloaded
             self._bg.pop(task_id, None)
+            await self._persist_receipt(task, session)
             self._done[task_id].set()
             self.save()
         task = self.tasks[task_id]

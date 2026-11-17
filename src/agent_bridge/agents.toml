@@ -112,6 +112,8 @@ discover_proxy = true
 [server]
 # Optional idle self-exit; enable only when the host can reconnect reliably.
 idle_exit_sec = 0
+# Keep the bridge pure: do not auto-write SKILL.md into host skill directories on startup.
+auto_install_skill = false
 
 [coordinator]
 # How eagerly the coordinator should dispatch to workers.
@@ -241,6 +243,9 @@ idle_unload_sec = 900
 [agents.antigravity]
 protocol = "agy"
 command = ["agy"]
+agy_mode = "auto"
+agy_sandbox = false
+skip_permissions = false
 print_timeout = "120m"
 revivable = true
 idle_unload_sec = 0

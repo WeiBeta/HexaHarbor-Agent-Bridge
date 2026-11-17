@@ -10,16 +10,18 @@ from agent_bridge.adapters.antigravity import (
     _scoped_usage,
     collect_tool_paths,
     conversation_id_of,
+    discovered_agy_commands,
     find_agy_project,
     is_agy_tool_schema_error,
     is_result_event,
+    permission_mode_of,
     recovered_agy_tool_error,
     result_error_of,
     result_text_of,
     text_delta_of,
 )
 from agent_bridge.config import AgentConfig
-from agent_bridge.models import Session, Task
+from agent_bridge.models import Session, Task, agy_effort
 
 FAKE_AGY = Path(__file__).resolve().parent / "fake_agy.py"
 
@@ -168,15 +170,67 @@ def test_agy_model_and_effort_precede_print(tmp_path, monkeypatch):
     cmd = adapter._build_cmd(session, task)
     assert cmd.index("--model") < cmd.index("-p")
     assert cmd.index("--effort") < cmd.index("-p")
+    assert cmd.index("--mode") < cmd.index("-p")
+    assert cmd[cmd.index("--mode") + 1] == "auto"
     assert cmd.index("--add-dir") < cmd.index("-p")
     assert cmd.index("--new-project") < cmd.index("-p")
     assert cmd[cmd.index("--model") + 1] == "gemini-3.7-flash"
     assert cmd[cmd.index("--effort") + 1] == "low"
     assert cmd[cmd.index("--add-dir") + 1] == str(tmp_path)
     assert "--conversation" not in cmd
+    assert "--sandbox" not in cmd
+    assert "--dangerously-skip-permissions" not in cmd
     assert "--input-format" in cmd
     assert cmd[cmd.index("-p") + 1] == ""
     assert task.message not in cmd
+
+
+def test_agy_sandbox_and_skip_permissions_flags(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "agent_bridge.adapters.antigravity.resolve_command",
+        lambda command, fallbacks=None: ["agy"],
+    )
+    monkeypatch.setattr("agent_bridge.adapters.antigravity.agy_projects_dir", lambda: tmp_path / "projects")
+    adapter = AgyAdapter(
+        AgentConfig(
+            name="antigravity",
+            protocol="agy",
+            command=["agy"],
+            agy_mode="",
+            agy_sandbox=True,
+            skip_permissions=True,
+        ),
+        tmp_path,
+    )
+    session = Session(session_id="sess_s", agent="antigravity", cwd=str(tmp_path))
+    task = Task(task_id="task_s", session_id=session.session_id, agent="antigravity", message="go", cwd=str(tmp_path))
+    cmd = adapter._build_cmd(session, task)
+    assert "--mode" not in cmd
+    assert cmd.index("--sandbox") < cmd.index("-p")
+    assert "--dangerously-skip-permissions" in cmd
+
+
+def test_agy_effort_preserves_xhigh_and_max():
+    assert agy_effort("off") == "low"
+    assert agy_effort("low") == "low"
+    assert agy_effort("medium") == "medium"
+    assert agy_effort("high") == "high"
+    assert agy_effort("xhigh") == "xhigh"
+    assert agy_effort("max") == "max"
+
+
+def test_permission_mode_of_reads_init_block():
+    assert permission_mode_of({"event": "init", "init": {"permission_mode": "always-proceed"}}) == "always-proceed"
+    assert permission_mode_of({"event": "init", "init": {}}) is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows LOCALAPPDATA fallback")
+def test_discovered_agy_commands_finds_localappdata_exe(tmp_path):
+    exe = tmp_path / "agy" / "bin" / "agy.exe"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("", encoding="utf-8")
+    found = discovered_agy_commands({"LOCALAPPDATA": str(tmp_path)})
+    assert found == [[str(exe.resolve())]]
 
 
 def test_agy_follow_up_uses_conversation_not_new_project(tmp_path, monkeypatch):
@@ -391,6 +445,35 @@ async def test_run_turn_labels_resumed_usage_as_conversation(tmp_path, monkeypat
 
 def test_scoped_usage_leaves_empty_dict_alone():
     assert _scoped_usage({}, True) == {}
+
+
+@pytest.mark.asyncio
+async def test_run_turn_captures_observed_permission_mode(tmp_path, monkeypatch):
+    script = tmp_path / "emit_pm.py"
+    script.write_text(
+        "import json, sys\n"
+        "sys.stdin.readline()\n"
+        "print(json.dumps({'event':'init','conversation_id':'c1','init':{'permission_mode':'always-proceed'}}))\n"
+        "print(json.dumps({'event':'result','result':{'conversation_id':'c1','status':'SUCCESS','response':'done'}}))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "agent_bridge.adapters.antigravity.resolve_command",
+        lambda command, fallbacks=None: [sys.executable, str(script)],
+    )
+    monkeypatch.setattr(
+        "agent_bridge.adapters.antigravity.agy_projects_dir",
+        lambda: tmp_path / "projects",
+    )
+    adapter = AgyAdapter(
+        AgentConfig(name="antigravity", protocol="agy", command=["agy"]),
+        tmp_path,
+    )
+    session = Session(session_id="sess_pm", agent="antigravity", cwd=str(tmp_path))
+    task = Task(task_id="task_pm", session_id=session.session_id, agent="antigravity", message="hi", cwd=str(tmp_path))
+    result = await adapter.run_turn(session, task)
+    assert result.stop_reason == "end_turn"
+    assert result.observed_permission_mode == "always-proceed"
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
@@ -18,6 +19,7 @@ from agent_bridge.diagnostics import redact_diagnostic
 from agent_bridge.models import Session, Task, TurnResult, agy_effort
 from agent_bridge.processes import (
     drop_pid,
+    interrupt_then_reap,
     process_create_time,
     process_image_name,
     reap_subprocess,
@@ -57,6 +59,44 @@ def conversation_id_of(obj: dict[str, Any]) -> str | None:
             if found:
                 return found
     return None
+
+
+def permission_mode_of(obj: dict[str, Any]) -> str | None:
+    init = obj.get("init")
+    if isinstance(init, dict):
+        mode = init.get("permission_mode")
+        if isinstance(mode, str) and mode.strip():
+            return mode
+    mode = obj.get("permission_mode")
+    if isinstance(mode, str) and mode.strip():
+        return mode
+    return None
+
+
+def discovered_agy_commands(env: Mapping[str, str] | None = None) -> list[list[str]]:
+    """Locate agy outside PATH when an MCP host clears the child environment."""
+    source = os.environ if env is None else env
+    candidates: list[Path] = []
+    if sys.platform == "win32" or os.name == "nt":
+        local_raw = str(source.get("LOCALAPPDATA", "")).strip()
+        local_root = Path(local_raw) if local_raw else Path.home() / "AppData" / "Local"
+        candidates.append(local_root / "agy" / "bin" / "agy.exe")
+        candidates.append(Path.home() / ".local" / "bin" / "agy.exe")
+    else:
+        candidates.append(Path.home() / ".local" / "bin" / "agy")
+    found: list[list[str]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            if not candidate.is_file():
+                continue
+            resolved = str(candidate.resolve())
+        except OSError:
+            continue
+        if resolved not in seen:
+            seen.add(resolved)
+            found.append([resolved])
+    return found
 
 
 def is_result_event(obj: dict[str, Any]) -> bool:
@@ -244,14 +284,19 @@ class AgyAdapter(Adapter):
         return None
 
     def _build_cmd(self, session: Session, task: Task) -> list[str]:
-        cmd = resolve_command(self.agent.command, self.agent.fallback_commands)
+        fallbacks = [*self.agent.fallback_commands, *discovered_agy_commands()]
+        cmd = resolve_command(self.agent.command, fallbacks)
         model = task.model or session.model
         effort = agy_effort(task.effort or session.effort)
-        # --model/--effort before -p: print mode can swallow later flags.
+        # --model/--effort/--mode/--sandbox before -p: print mode can swallow later flags.
         if model:
             cmd += ["--model", model]
         if effort:
             cmd += ["--effort", effort]
+        if self.agent.agy_mode:
+            cmd += ["--mode", self.agent.agy_mode]
+        if self.agent.agy_sandbox:
+            cmd.append("--sandbox")
         # Process cwd is the workspace, but default-cli-project can keep a
         # stale scratch root. Pin this turn to the requested folder before -p.
         if session.cwd:
@@ -270,7 +315,10 @@ class AgyAdapter(Adapter):
             "stream-json",
             "--output-format",
             "stream-json",
-            "--dangerously-skip-permissions",
+        ]
+        if self.agent.skip_permissions:
+            cmd.append("--dangerously-skip-permissions")
+        cmd += [
             "--print-timeout",
             self.agent.print_timeout or "120m",
         ]
@@ -347,6 +395,7 @@ class AgyAdapter(Adapter):
         await self._write_prompt(proc, task.message)
         text_parts: list[str] = []
         conversation_id = session.native_session_id
+        observed_permission_mode: str | None = None
         resumed = bool(session.native_session_id)
         usage: dict[str, Any] = {}
         files: set[str] = set()
@@ -379,6 +428,9 @@ class AgyAdapter(Adapter):
                 cid = conversation_id_of(obj)
                 if cid:
                     conversation_id = cid
+                pm = permission_mode_of(obj)
+                if pm:
+                    observed_permission_mode = pm
                 event = str(obj.get("event") or obj.get("type") or "")
                 raw_step = obj.get("step_update")
                 step: dict[str, Any] = raw_step if isinstance(raw_step, dict) else {}
@@ -422,6 +474,7 @@ class AgyAdapter(Adapter):
                     files_changed=sorted(files),
                     stop_reason="cancelled",
                     native_session_id=conversation_id,
+                    observed_permission_mode=observed_permission_mode,
                 )
             exit_warnings: list[str] = []
             if proc.returncode not in (0, None):
@@ -449,6 +502,7 @@ class AgyAdapter(Adapter):
                             usage=_scoped_usage(usage, resumed),
                             native_session_id=cid,
                             warnings=[err, *exit_warnings],
+                            observed_permission_mode=observed_permission_mode,
                         )
                     append_event(
                         session.session_id,
@@ -463,6 +517,7 @@ class AgyAdapter(Adapter):
                         error=err,
                         usage=_scoped_usage(usage, resumed),
                         native_session_id=cid,
+                        observed_permission_mode=observed_permission_mode,
                     )
                 append_event(session.session_id, "turn_end", {"stop_reason": "end_turn"}, self.home)
                 return TurnResult(
@@ -472,13 +527,19 @@ class AgyAdapter(Adapter):
                     usage=_scoped_usage(usage, resumed),
                     native_session_id=cid,
                     warnings=exit_warnings,
+                    observed_permission_mode=observed_permission_mode,
                 )
             if proc.returncode not in (0, None) and not text_parts:
                 detail = stderr_tail.strip()
                 error = f"agy exit {proc.returncode}"
                 if detail:
                     error += f": {detail}"
-                return TurnResult(text="", stop_reason="error", error=error)
+                return TurnResult(
+                    text="",
+                    stop_reason="error",
+                    error=error,
+                    observed_permission_mode=observed_permission_mode,
+                )
             session.native_session_id = conversation_id
             append_event(session.session_id, "turn_end", {"stop_reason": "end_turn"}, self.home)
             return TurnResult(
@@ -488,15 +549,17 @@ class AgyAdapter(Adapter):
                 usage=_scoped_usage(usage, resumed),
                 native_session_id=conversation_id,
                 warnings=exit_warnings,
+                observed_permission_mode=observed_permission_mode,
             )
         except asyncio.CancelledError:
-            await reap_subprocess(proc)
+            await interrupt_then_reap(proc)
             append_event(session.session_id, "turn_end", {"stop_reason": "cancelled"}, self.home)
             return TurnResult(
                 text="".join(text_parts),
                 files_changed=sorted(files),
                 stop_reason="cancelled",
                 native_session_id=conversation_id,
+                observed_permission_mode=observed_permission_mode,
             )
         except Exception:
             # e.g. readline() past STDIO_LIMIT. Without this, agy would keep
@@ -516,7 +579,7 @@ class AgyAdapter(Adapter):
         self._cancelled.add(session.session_id)
         proc = self._procs.get(session.session_id)
         if proc is not None:
-            await reap_subprocess(proc)
+            await interrupt_then_reap(proc)
 
     async def shutdown(self, session: Session) -> None:
         await self.cancel(session)

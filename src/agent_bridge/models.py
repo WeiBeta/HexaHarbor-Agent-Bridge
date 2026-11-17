@@ -54,12 +54,10 @@ def normalize_effort(raw: str | None) -> str | None:
 
 
 def agy_effort(effort: str | None) -> str | None:
-    if effort in {None, "low", "medium", "high"}:
+    if effort in {None, "low", "medium", "high", "xhigh", "max"}:
         return effort
     if effort == "off":
         return "low"
-    if effort == "max":
-        return "high"
     return None
 
 
@@ -126,6 +124,7 @@ class Task(BaseModel):
     effort: str | None = None
     observed_model: str | None = None
     observed_effort: str | None = None
+    observed_permission_mode: str | None = None
     status: TaskStatus = TaskStatus.queued
     stop_reason: str | None = None
     result_text: str = ""
@@ -167,3 +166,4 @@ class TurnResult(BaseModel):
     # Kimi observers in Registry overwrite these with on-disk sampler truth.
     observed_model: str | None = None
     observed_effort: str | None = None
+    observed_permission_mode: str | None = None

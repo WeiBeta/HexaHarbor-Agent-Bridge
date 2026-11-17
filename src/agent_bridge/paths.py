@@ -38,6 +38,7 @@ def ensure_home(home: Path | None = None) -> Path:
     path = home or bridge_home()
     (path / "transcripts").mkdir(parents=True, exist_ok=True)
     (path / "results").mkdir(parents=True, exist_ok=True)
+    (path / "receipts").mkdir(parents=True, exist_ok=True)
     (path / "logs").mkdir(parents=True, exist_ok=True)
     return path
 
@@ -56,6 +57,10 @@ def transcript_path(session_id: str, home: Path | None = None) -> Path:
 
 def result_path(task_id: str, home: Path | None = None) -> Path:
     return (home or bridge_home()) / "results" / f"{task_id}.txt"
+
+
+def receipt_path(task_id: str, home: Path | None = None) -> Path:
+    return (home or bridge_home()) / "receipts" / f"{task_id}.json"
 
 
 def log_path(home: Path | None = None) -> Path:

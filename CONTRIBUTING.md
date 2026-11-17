@@ -4,7 +4,7 @@
 
 ## Setup
 
-This is the source checkout. End users install with `uv tool install git+https://github.com/FeiZhuLulu/Agent-Bridge.git` and do not need this repo.
+This is the source checkout. End users install with `uv tool install git+https://github.com/WeiBeta/HexaHarbor-Agent-Bridge.git` and do not need this repo.
 
 ```powershell
 uv sync --extra dev
@@ -32,4 +32,4 @@ Proving a new host can drive existing workers over MCP is a different process: [
 
 ## License
 
-By contributing you agree the work is released under the [MIT License](LICENSE).
+By contributing you agree the work is released under the [AGPL-3.0-only license](LICENSE), retaining applicable upstream notices in [NOTICE.md](NOTICE.md).

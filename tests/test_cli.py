@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent_bridge.cli import (
+    GIT_SOURCE,
     checkout_root,
     detect_install,
     ensure_coordinator_skill,
@@ -99,6 +100,8 @@ def test_help_and_version(capsys):
     out = capsys.readouterr().out
     assert "uv tool install" in out
     assert "Claude Code" in out
+    assert "HexaHarbor Agent Bridge" in out
+    assert GIT_SOURCE == "git+https://github.com/WeiBeta/HexaHarbor-Agent-Bridge.git"
     assert "install-skill" not in out.split("Install:")[1].split("Update:")[0]
     main(["--version"])
     assert capsys.readouterr().out.strip()
@@ -160,3 +163,18 @@ def test_ensure_coordinator_skill_survives_unreadable_stamp(tmp_path):
     stamp.mkdir(parents=True)
     result = ensure_coordinator_skill(home=tmp_path)
     assert result == [] or all(path.is_file() for path in result)
+
+
+def test_cli_stdio_does_not_auto_install_skill_by_default(tmp_path, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setenv("AGENT_BRIDGE_HOME", str(tmp_path))
+    monkeypatch.setattr("agent_bridge.cli.ensure_coordinator_skill", lambda: calls.append("skill") or [])
+    monkeypatch.setattr("agent_bridge.server.mcp.run", lambda transport="stdio": calls.append(f"run:{transport}"))
+
+    main([])
+    assert calls == ["run:stdio"]
+
+    (tmp_path / "agents.toml").write_text("[server]\nauto_install_skill = true\n", encoding="utf-8")
+    calls.clear()
+    main([])
+    assert calls == ["skill", "run:stdio"]

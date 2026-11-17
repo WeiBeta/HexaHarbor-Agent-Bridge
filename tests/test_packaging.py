@@ -39,6 +39,16 @@ def test_wheel_ships_coordinator_defaults(tmp_path: Path):
         names = [name for name in archive.namelist() if name.endswith("agent_bridge/agents.toml")]
         assert names == ["agent_bridge/agents.toml"]
         text = archive.read(names[0]).decode("utf-8")
+        metadata_name = next(name for name in archive.namelist() if name.endswith(".dist-info/METADATA"))
+        metadata = archive.read(metadata_name).decode("utf-8")
+        assert "License-Expression: AGPL-3.0-only" in metadata
+        assert "https://github.com/WeiBeta/HexaHarbor-Agent-Bridge" in metadata
+        license_root = metadata_name.removesuffix("METADATA") + "licenses/"
+        assert "GNU AFFERO GENERAL PUBLIC LICENSE" in archive.read(license_root + "LICENSE").decode("utf-8")
+        mit = archive.read(license_root + "LICENSES/Agent-Bridge-MIT.txt").decode("utf-8")
+        assert "Copyright (c) 2026 FeiZhuLulu" in mit
+        assert "Permission is hereby granted, free of charge" in mit
+        assert "5560e065f5aa7d7d5155cd17a28baa231208b7ed" in archive.read(license_root + "NOTICE.md").decode("utf-8")
     assert "[coordinator]" in text
     assert 'mode = "auto"' in text
     assert "instructions" in text

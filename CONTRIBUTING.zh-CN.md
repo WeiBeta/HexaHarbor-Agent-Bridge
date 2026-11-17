@@ -4,7 +4,7 @@
 
 ## 环境
 
-这是源码检出。最终用户用 `uv tool install git+https://github.com/FeiZhuLulu/Agent-Bridge.git` 安装，不需要这份仓库。
+这是源码检出。最终用户用 `uv tool install git+https://github.com/WeiBeta/HexaHarbor-Agent-Bridge.git` 安装，不需要这份仓库。
 
 ```powershell
 uv sync --extra dev
@@ -32,4 +32,4 @@ uv run mypy
 
 ## 许可证
 
-提交即表示同意以 [MIT License](LICENSE) 发布。
+提交即表示同意以 [AGPL-3.0-only](LICENSE)，并保留 [NOTICE.md](NOTICE.md) 中适用的上游版权与许可声明 发布。

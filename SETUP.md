@@ -1,14 +1,22 @@
-# Coordinator setup for Agent Bridge
+# Coordinator setup for HexaHarbor Agent Bridge
 
 Codex, Cursor, Kimi Code, ZCode, Grok Build, Claude Code, and Devin can all act as the coordinator. Register the same stdio server in whichever host you use. Devin Desktop needs no entry of its own: Devin imports `~/.cursor/mcp.json` and the Cursor / Claude skill directories (`read_config_from.cursor`, on by default; `devin mcp list` shows what it picked up), so a Cursor setup is enough. The same product can also be a worker (Grok Build, Claude Code, Codex CLI, and Devin CLI are); those are different processes and different session roles.
 
 ## Install
 
 ```powershell
-uv tool install git+https://github.com/FeiZhuLulu/Agent-Bridge.git
+uv tool install git+https://github.com/WeiBeta/HexaHarbor-Agent-Bridge.git
 ```
 
-That is the whole install. Then register the MCP server in the coordinator. The first time a top-level host starts Bridge, the coordinator skill is written automatically (skipped if Bridge was inherited inside a worker); later starts rewrite it only after the bundled skill changed, so local edits survive restarts but not upgrades. Need [uv](https://docs.astral.sh/uv/) first.
+Then register the MCP server in the coordinator. Startup does not install skills by default. Set `[server] auto_install_skill = true` to opt in, or explicitly run `agent-bridge install-skill`. Opted-in startup skips nested workers and refreshes only when the bundle changes. `agent-bridge upgrade` still refreshes existing skill copies; back up local edits before upgrading. Need [uv](https://docs.astral.sh/uv/) first.
+
+### Work tickets and local records
+
+`dispatch_ticket` combines dispatch, bounded waiting (480 seconds by default), and result collection. Keep its wait below the host MCP timeout. A `timed_out` response does not cancel or restart the worker: use its `task_id` with `wait_task` and `get_result`. While finalization is pending, task status can already be terminal; wait for collection to finish before treating a receipt as available. A retained UUID `request_id` deduplicates identical submissions, not different work tickets.
+
+Terminal receipts are written atomically to `$AGENT_BRIDGE_HOME/receipts/<task_id>.json` (default `~/.agent-bridge/receipts/`). A missing `receipt_path` is not evidence that the worker failed or never ran. Results, transcripts, and receipts are **plaintext local files**, not encrypted shadow storage; keep this runtime home outside Git and review any material before sharing it.
+
+For Antigravity, `[agents.antigravity]` accepts `agy_mode` (default `"auto"`), `agy_sandbox` (default `false`), and `skip_permissions` (default `false`). These select CLI flags; they do not impose a filesystem boundary. The worker's own settings can still allow automatic execution. Inspect `observed_permission_mode` when reported; a missing value means unknown. The task `cwd` and changed-file tracking are not a sandbox. `[server] enabled_agents = ["antigravity", "codex"]` can restrict available workers; an empty list exposes all configured workers.
 
 ## Resolve the Agent Bridge executable
 
@@ -173,7 +181,7 @@ ZCode has **three** JSON shapes. Do not mix them.
 - `timeoutMs` is milliseconds. 600000 leaves room for `wait_task` default 180 s. Without it, poll about 15–20 s.
 - If a `.zcode` file in the **same scope** already lists any MCP server, ZCode skips that scope's `.agents/mcp.json` entirely. The two sources are not merged.
 - After saving, confirm the server is enabled under **Settings → MCP 服务器** (configured-MCP group). Agent Bridge is a hand-added stdio server, not a marketplace plugin — it will not appear under 设置 → 插件 / 插件市场. Official: [MCP](https://zcode.z.ai/cn/docs/mcp-services), [Plugin](https://zcode.z.ai/cn/docs/plugin), [Skill](https://zcode.z.ai/en/docs/skill).
-- Native user skills live in `%USERPROFILE%\.zcode\skills`. Bridge writes `agent-bridge` there on first top-level start.
+- Native user skills live in `%USERPROFILE%\.zcode\skills`. Bridge writes `agent-bridge` there only when skill installation is requested or opted in.
 
 ## Register the MCP server (Grok Build)
 
@@ -196,7 +204,7 @@ pattern = "agent_bridge__*"
 - `startup_timeout_sec` / `tool_timeout_sec` are seconds. Official Grok default for tools is 6000; 600 is the Agent Bridge recommendation so `wait_task` default 180 s has headroom. If the host still kills the call, poll about 30–45 s.
 - Permission rules use the official verbose `[[permission.rules]]` form. MCP tools are named `{server}__{tool}` (for example `agent_bridge__dispatch_task`).
 - Project files may contain MCP servers and permission rules. `[ui] permission_mode` is a user-level setting — do not put it in a project example.
-- Grok also discovers the coordinator skill from `%USERPROFILE%\.agents\skills` (already installed). It reads `~/.grok/skills` too; Bridge does not need a second copy. Official: [MCP](https://docs.x.ai/build/features/mcp-servers), [permissions](https://docs.x.ai/build/features/permissions), [skills](https://docs.x.ai/build/features/skills-plugins-marketplaces).
+- Grok also discovers the coordinator skill from `%USERPROFILE%\.agents\skills` if installed. It reads `~/.grok/skills` too; Bridge does not need a second copy. Official: [MCP](https://docs.x.ai/build/features/mcp-servers), [permissions](https://docs.x.ai/build/features/permissions), [skills](https://docs.x.ai/build/features/skills-plugins-marketplaces).
 - Grok also merges `~/.cursor/mcp.json` and project `.cursor/mcp.json` below `config.toml` ([compat](https://docs.x.ai/build/features/mcp-servers)). That second server is usually named `agent-bridge` (hyphen). To test the native `[mcp_servers.agent_bridge]` block only, set `[compat.cursor] mcps = false` (and `[compat.claude] mcps = false` if needed). `grok inspect` shows each server's origin.
 - Grok as a **worker** is a different process. If that worker inherits this MCP config, the nested Bridge has dispatch, preference updates, cancel, and session shutdown disabled: `dispatch_enabled=false`, and nested `dispatch_task` / `set_preferences` / `cancel_task` / `end_session` are rejected. It also uses a `nested/` subdirectory of `AGENT_BRIDGE_HOME` so it cannot share the coordinator's `state.json`. A host that env-clears the MCP child drops both the worker-context mark and that home override; Grok's stdio MCP does not env-clear.
 
@@ -256,7 +264,7 @@ Use `--scope user` for every project. After adding, put `"timeout": 600000` on t
 ```
 
 MCP tools are named `mcp__{server}__{tool}` (for example `mcp__agent-bridge__dispatch_task`). Do not put `permissions.defaultMode` in a project example — that is a user-scoped preference.
-- Native user skills live in `%USERPROFILE%\.claude\skills`. Bridge writes `agent-bridge` there on first top-level start. Claude Code does **not** read `~/.agents/skills`.
+- Native user skills live in `%USERPROFILE%\.claude\skills`. Bridge writes `agent-bridge` there only when skill installation is requested or opted in. Claude Code does **not** read `~/.agents/skills`.
 - Rules file: copy [ORCHESTRATION.md](ORCHESTRATION.md) as `CLAUDE.md` at the project root (native). Claude Code may also read `AGENTS.md`; CLAUDE.md is the one to use when you have a choice.
 - Claude Code stdio MCP inherits the process environment (no Codex-style env-clear). Still use the resolved absolute `command`.
 - Claude Code as a **worker** is a different process (`claude-agent-acp`, not the product TUI). If that worker inherits this MCP config from the project `.mcp.json`, the nested Bridge has dispatch, preference updates, cancel, and session shutdown disabled.
@@ -309,13 +317,13 @@ agent-bridge upgrade
 
 - `uv tool` install → `uv tool upgrade agent-bridge`, then refresh skill copies that already exist.
 - git checkout → `git pull` and `uv sync --extra dev` in that checkout, then the same skill refresh.
-- Anything else → the command tells you to `uv tool install git+https://github.com/FeiZhuLulu/Agent-Bridge.git`.
+- Anything else → the command tells you to `uv tool install git+https://github.com/WeiBeta/HexaHarbor-Agent-Bridge.git`.
 
 Restart Codex / Cursor / Kimi Code / ZCode / Grok Build / Claude Code so they reconnect and pick up new tools and the MCP handshake instructions.
 
 What you do **not** redo: `codex mcp add` / `mcp.json`, `%USERPROFILE%\.agent-bridge\agents.toml` (proxy, `[coordinator]`, `set_preferences`), or worker CLIs and their logins. If you copied `ORCHESTRATION.md` into another repo as `AGENTS.md`, that copy is still yours to refresh.
 
-Already on a clone and want the tool install instead: `uv tool install git+https://github.com/FeiZhuLulu/Agent-Bridge.git`, point each host `command` at `agent-bridge`, then delete the clone. The overlay in `~/.agent-bridge` stays.
+Already on a clone and want the tool install instead: `uv tool install git+https://github.com/WeiBeta/HexaHarbor-Agent-Bridge.git`, point each host `command` at `agent-bridge`, then delete the clone. The overlay in `~/.agent-bridge` stays.
 
 ## Multiple coordinators on one machine
 
@@ -406,7 +414,7 @@ A task that fails with a quota-looking error (`quota`, `rate limit`, `insufficie
 The coordinator learns how to drive the Bridge through three channels; [ORCHESTRATION.md](ORCHESTRATION.md) is the source of truth for all of them ([ORCHESTRATION.zh-CN.md](ORCHESTRATION.zh-CN.md) is the human-readable translation):
 
 1. **MCP instructions — automatic.** The server sends its hard rules (tools-only access, `cwd` semantics, timeout-is-not-failure, verify-yourself) in the MCP handshake. Nothing to install, but hosts vary in how prominently they surface it, so don't rely on it alone.
-2. **Skill — automatic.** The first MCP start, any start after the bundled skill changed, and `agent-bridge upgrade` write [skills/agent-bridge/SKILL.md](skills/agent-bridge/SKILL.md) into the host skill directories. It loads on demand when the coordinator is about to dispatch.
+2. **Skill — optional.** Explicit installation or `[server] auto_install_skill = true` installs [skills/agent-bridge/SKILL.md](skills/agent-bridge/SKILL.md). `agent-bridge upgrade` refreshes existing copies. Review its routing guidance against your own policy before enabling it. It loads on demand when the coordinator is about to dispatch.
 3. **Rules file — fallback for hosts without skills.** Copy [ORCHESTRATION.md](ORCHESTRATION.md) to the target repository root as `AGENTS.md` (Codex, Cursor, Kimi Code, ZCode, and Grok Build all read it there) or as `CLAUDE.md` for Claude Code, or to `%USERPROFILE%\.codex\AGENTS.md` / `%USERPROFILE%\.kimi-code\AGENTS.md` / `%USERPROFILE%\.claude\CLAUDE.md` for a host-global default; the Cursor-global equivalent is User Rules in Cursor settings. Keep the English file under 9500 characters (Grok may copy it as `AGENTS.md`) and under 32 KiB — Codex concatenates the home file with per-directory `AGENTS.md` files from the git root down to cwd; Kimi Code does the same and warns past 32 KiB.
 
 Your own project's `AGENTS.md` stays yours: if you use the skill or the MCP instructions, the rulebook takes no `AGENTS.md` slot at all.

@@ -6,6 +6,7 @@ import re
 import shutil
 from pathlib import Path
 
+from agent_bridge.adapters.antigravity import discovered_agy_commands
 from agent_bridge.claude_meta import apply_claude_gateway_env, claude_config_home, describe_claude_auth
 from agent_bridge.codex_exec import resolve_codex_command
 from agent_bridge.config import AgentConfig, EnvConfig
@@ -127,6 +128,11 @@ async def probe_agent(cfg: AgentConfig, env_config: EnvConfig | None = None) -> 
             return resolve_dsh_command(cfg.command, cfg.fallback_commands)
         if cfg.protocol == "codex":
             return resolve_codex_command(cfg.command, cfg.fallback_commands, env=resolved)
+        if cfg.protocol == "agy":
+            return resolve_command(
+                cfg.command,
+                [*cfg.fallback_commands, *discovered_agy_commands(resolved)],
+            )
         return resolve_command(cfg.command, cfg.fallback_commands)
 
     try:
@@ -176,7 +182,10 @@ async def probe_agent(cfg: AgentConfig, env_config: EnvConfig | None = None) -> 
             )
 
     if cfg.name == "antigravity":
-        details.append("model=agy models slugs e.g. gemini-3.7-flash; effort=low|medium|high")
+        details.append(
+            f"model=agy models slugs e.g. gemini-3.8-flash-medium, gemini-4-carbon-high; "
+            f"effort=low|medium|high|max; mode={cfg.agy_mode or 'default'}"
+        )
         details.append("prompt via stdin (stream-json)")
 
     if cfg.name == "grok":

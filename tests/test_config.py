@@ -414,3 +414,32 @@ permission_policy = "deny"
     )
     cfg = load_config(tmp_path)
     assert cfg.agents["claude"].permission_policy == "deny"
+
+
+def test_server_auto_install_skill_and_enabled_agents_overlay(tmp_path):
+    cfg = load_config(tmp_path)
+    assert cfg.server.auto_install_skill is False
+    assert cfg.server.enabled_agents == []
+    assert cfg.agents["antigravity"].agy_mode == "auto"
+    assert cfg.agents["antigravity"].agy_sandbox is False
+    assert cfg.agents["antigravity"].skip_permissions is False
+
+    (tmp_path / "agents.toml").write_text(
+        """
+[server]
+auto_install_skill = true
+enabled_agents = ["antigravity", "codex"]
+
+[agents.antigravity]
+agy_mode = "accept-edits"
+agy_sandbox = true
+skip_permissions = false
+""",
+        encoding="utf-8",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg.server.auto_install_skill is True
+    assert cfg.server.enabled_agents == ["antigravity", "codex"]
+    assert cfg.agents["antigravity"].agy_mode == "accept-edits"
+    assert cfg.agents["antigravity"].agy_sandbox is True
+    assert cfg.agents["antigravity"].skip_permissions is False

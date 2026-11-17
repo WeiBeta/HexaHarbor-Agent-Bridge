@@ -1,9 +1,7 @@
-<p align="center">
-  <img src="logo.svg" alt="Agent Bridge" width="420">
-</p>
+<h1 align="center">六库仙贼 / HexaHarbor-Agent-Bridge</h1>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg" alt="AGPL-3.0-only"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.11+-green.svg" alt="Python 3.11+"></a>
 </p>
 
@@ -13,7 +11,7 @@
 
 ## English
 
-Agent Bridge is a connector for local coding agents. A coordinator — Codex, Cursor, Kimi Code, ZCode, Grok Build, Claude Code, or Devin — directs Antigravity CLI, Grok Build, Kimi Code, DeepSeek Harness, OpenCode, Claude Code, Codex CLI, Devin CLI, ZCode, and MiniMax Code. The same product can be a coordinator and a worker; those are different processes. More agents will follow.
+HexaHarbor-Agent-Bridge is a connector for local coding agents, derived from Agent-Bridge. A coordinator — Codex, Cursor, Kimi Code, ZCode, Grok Build, Claude Code, or Devin — directs Antigravity CLI, Grok Build, Kimi Code, DeepSeek Harness, OpenCode, Claude Code, Codex CLI, Devin CLI, ZCode, and MiniMax Code. The same product can be a coordinator and a worker; those are different processes. More agents will follow.
 
 ```text
 User → Coordinator (Codex / Cursor / Kimi Code / ZCode / Grok Build / Claude Code / Devin)
@@ -36,7 +34,7 @@ It does not drive GUIs. The user talks only to the coordinator.
 Need [uv](https://docs.astral.sh/uv/). Then:
 
 ```powershell
-uv tool install git+https://github.com/FeiZhuLulu/Agent-Bridge.git
+uv tool install git+https://github.com/WeiBeta/HexaHarbor-Agent-Bridge.git
 ```
 
 ### Connect Codex
@@ -45,7 +43,7 @@ uv tool install git+https://github.com/FeiZhuLulu/Agent-Bridge.git
 codex mcp add agent_bridge -- %USERPROFILE%\.local\bin\agent-bridge.exe
 ```
 
-Restart Codex. The coordinator skill is written the first time the server starts. More hosts and proxy notes: [SETUP.md](SETUP.md).
+Restart Codex. Skill auto-install is disabled by default; enable `[server] auto_install_skill = true` only if wanted. More hosts and proxy notes: [SETUP.md](SETUP.md).
 
 ### Connect Cursor
 
@@ -106,6 +104,7 @@ Close coordinators that are holding Bridge, then `agent-bridge upgrade`, then re
 | `list_agents` | Probe workers, report remaining quota, proxy/env + coordinator policy |
 | `set_preferences` | Persist coordinator mode / routing preferences |
 | `dispatch_task` | Start or resume a turn in the project `cwd` |
+| `dispatch_ticket` | Dispatch, wait, and collect a structured receipt (default wait 480 seconds) |
 | `wait_task` | Block up to `timeout_sec` (default 180) |
 | `check_task` | Non-blocking status |
 | `get_result` | Complete final result in pages + changed files |
@@ -156,7 +155,7 @@ Change it in chat, or set `[coordinator] mode` in `~/.agent-bridge/agents.toml`.
 
 ### Orchestration rulebook
 
-[ORCHESTRATION.md](ORCHESTRATION.md) is the coordinator rulebook: when to dispatch, to whom, how to verify. The skill and MCP handshake instructions are projections of it. First start writes the skill automatically. Chinese: [ORCHESTRATION.zh-CN.md](ORCHESTRATION.zh-CN.md).
+[ORCHESTRATION.md](ORCHESTRATION.md) is an optional coordinator rulebook. MCP handshake instructions describe the neutral bridge protocol; the caller's task and routing rules decide when and to whom to dispatch. Skill auto-install is opt-in. Chinese: [ORCHESTRATION.zh-CN.md](ORCHESTRATION.zh-CN.md).
 
 ### Tests
 
@@ -168,7 +167,7 @@ uv run pytest
 
 ## 中文
 
-Agent Bridge 是一个联通各个本地 Agent 的连接器。由协调者——Codex、Cursor、Kimi Code、ZCode、Grok Build、Claude Code 或 Devin——指挥 Antigravity CLI、Grok Build、Kimi Code、DeepSeek Harness、OpenCode、Claude Code、Codex CLI、Devin CLI、ZCode、MiniMax Code 进行工作。同一个产品可以同时是协调者和 Worker，但那是不同进程。后续将推出更多 Agent 支持。
+六库仙贼 / HexaHarbor-Agent-Bridge 是基于 Agent-Bridge 二次开发的本地 Agent 连接器。由协调者——Codex、Cursor、Kimi Code、ZCode、Grok Build、Claude Code 或 Devin——指挥 Antigravity CLI、Grok Build、Kimi Code、DeepSeek Harness、OpenCode、Claude Code、Codex CLI、Devin CLI、ZCode、MiniMax Code 进行工作。同一个产品可以同时是协调者和 Worker，但那是不同进程。后续将推出更多 Agent 支持。
 
 ```text
 用户 → 协调者（Codex / Cursor / Kimi Code / ZCode / Grok Build / Claude Code / Devin）
@@ -191,7 +190,7 @@ Agent Bridge 是一个联通各个本地 Agent 的连接器。由协调者——
 先装 [uv](https://docs.astral.sh/uv/)，然后：
 
 ```powershell
-uv tool install git+https://github.com/FeiZhuLulu/Agent-Bridge.git
+uv tool install git+https://github.com/WeiBeta/HexaHarbor-Agent-Bridge.git
 ```
 
 ### 接到 Codex
@@ -200,7 +199,7 @@ uv tool install git+https://github.com/FeiZhuLulu/Agent-Bridge.git
 codex mcp add agent_bridge -- %USERPROFILE%\.local\bin\agent-bridge.exe
 ```
 
-重启 Codex。协调者 skill 会在服务器第一次启动、以及升级后内容变化时自动写入；平时重启不会覆盖你的本地改动。其它宿主和代理见 [SETUP.md](SETUP.md)。
+重启 Codex。默认不自动安装协调者 skill；需要时显式启用 `[server] auto_install_skill = true`。其它宿主和代理见 [SETUP.md](SETUP.md)。
 
 ### 接到 Cursor
 
@@ -305,7 +304,7 @@ Claude 的整体状态只汇总通用额度；模型专属周额度保留在 `wi
 
 ### 协调规则书
 
-[ORCHESTRATION.md](ORCHESTRATION.md) 是给协调者的规则书：什么时候派、派给谁、怎么验收。skill 和 MCP 握手 instructions 是它的投影。第一次启动会自动写入 skill。中文译本：[ORCHESTRATION.zh-CN.md](ORCHESTRATION.zh-CN.md)。
+[ORCHESTRATION.md](ORCHESTRATION.md) 是可选的协调规则书。MCP 握手只描述中立通讯协议，派工时机与模型路由遵循调用方的任务和规则；自动安装 skill 须主动开启。中文译本：[ORCHESTRATION.zh-CN.md](ORCHESTRATION.zh-CN.md)。
 
 ### 测试
 
@@ -317,4 +316,8 @@ uv run pytest
 
 ## License
 
-[MIT](LICENSE) © FeiZhuLulu
+[AGPL-3.0-only](LICENSE). Derived from Agent-Bridge © 2026 FeiZhuLulu; upstream [MIT notice](LICENSES/Agent-Bridge-MIT.txt) preserved. See [NOTICE.md](NOTICE.md).
+
+Compatibility: the command remains `agent-bridge`, the MCP name remains `agent_bridge`, and runtime data remains under `~/.agent-bridge`. Install this fork from its Git repository; no separate HexaHarbor PyPI release is claimed.
+
+兼容性：命令、MCP 标识和运行数据目录保持不变；本分支通过 Git 仓库安装，未声明已在 PyPI 单独发布。
