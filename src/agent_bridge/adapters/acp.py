@@ -22,6 +22,7 @@ from acp.schema import (
     RequestPermissionResponse,
 )
 
+from agent_bridge import __version__
 from agent_bridge.acp_config import config_option_values
 from agent_bridge.adapters.base import STDIO_LIMIT, Adapter
 from agent_bridge.claude_meta import (
@@ -912,7 +913,7 @@ class AcpAdapter(Adapter):
         await self._rpc(
             live.conn.initialize(
                 protocol_version=PROTOCOL_VERSION,
-                client_info=Implementation(name="agent-bridge", version="0.1.0"),
+                client_info=Implementation(name="agent-bridge", version=__version__),
                 client_capabilities=capabilities,
             ),
             "initialize",

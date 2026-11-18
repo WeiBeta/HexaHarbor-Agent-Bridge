@@ -58,6 +58,8 @@ async def test_dispatch_records_model_and_effort(bridge_home, tmp_path):
         assert session.effort == "low"
         with pytest.raises(ValueError, match="effort"):
             await registry.dispatch_task("fake", "bad", cwd=str(work.resolve()), effort="turbo")
+        with pytest.raises(ValueError, match="effort"):
+            await registry.dispatch_task("fake", "bad", cwd=str(work.resolve()), effort="xhigh")
     finally:
         await registry.stop()
 

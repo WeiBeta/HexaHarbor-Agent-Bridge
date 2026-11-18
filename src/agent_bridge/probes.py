@@ -181,10 +181,10 @@ async def probe_agent(cfg: AgentConfig, env_config: EnvConfig | None = None) -> 
                 "effort=off|low|high|max via dispatch_task.effort; same session model change respawns"
             )
 
-    if cfg.name == "antigravity":
+    if cfg.protocol == "agy":
         details.append(
             f"model=agy models slugs e.g. gemini-3.8-flash-medium, gemini-4-carbon-high; "
-            f"effort=low|medium|high|max; mode={cfg.agy_mode or 'default'}"
+            f"effort=low|medium|high|xhigh|max; mode={cfg.agy_mode or 'default'}"
         )
         details.append("prompt via stdin (stream-json)")
 

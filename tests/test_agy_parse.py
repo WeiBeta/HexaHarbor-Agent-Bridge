@@ -493,3 +493,91 @@ async def test_run_turn_early_exit_reports_stderr(tmp_path, monkeypatch):
     assert result.error is not None
     assert "agy exit 3" in result.error
     assert "fake agy refused to start" in result.error
+
+
+def test_agy_build_cmd_distinguishes_xhigh_max_off_and_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "agent_bridge.adapters.antigravity.resolve_command",
+        lambda command, fallbacks=None: ["agy"],
+    )
+    monkeypatch.setattr("agent_bridge.adapters.antigravity.agy_projects_dir", lambda: tmp_path / "projects")
+    adapter = AgyAdapter(
+        AgentConfig(name="antigravity", protocol="agy", command=["agy"]),
+        tmp_path,
+    )
+
+    session_xhigh = Session(session_id="sess_x", agent="antigravity", cwd=str(tmp_path), effort="xhigh")
+    task_followup = Task(task_id="task_f", session_id="sess_x", agent="antigravity", message="m", cwd=str(tmp_path))
+    cmd_xhigh = adapter._build_cmd(session_xhigh, task_followup)
+    assert cmd_xhigh.index("--effort") < cmd_xhigh.index("-p")
+    assert cmd_xhigh[cmd_xhigh.index("--effort") + 1] == "xhigh"
+
+    task_max = Task(
+        task_id="task_m",
+        session_id="sess_x",
+        agent="antigravity",
+        message="m",
+        cwd=str(tmp_path),
+        effort="max",
+    )
+    cmd_max = adapter._build_cmd(session_xhigh, task_max)
+    assert cmd_max[cmd_max.index("--effort") + 1] == "max"
+
+    task_off = Task(
+        task_id="task_o",
+        session_id="sess_x",
+        agent="antigravity",
+        message="m",
+        cwd=str(tmp_path),
+        effort="off",
+    )
+    cmd_off = adapter._build_cmd(Session(session_id="sess_o", agent="antigravity", cwd=str(tmp_path)), task_off)
+    assert cmd_off[cmd_off.index("--effort") + 1] == "low"
+
+    task_none = Task(task_id="task_n", session_id="sess_n", agent="antigravity", message="m", cwd=str(tmp_path))
+    cmd_none = adapter._build_cmd(Session(session_id="sess_n", agent="antigravity", cwd=str(tmp_path)), task_none)
+    assert "--effort" not in cmd_none
+
+
+@pytest.mark.asyncio
+async def test_agy_run_turn_passes_xhigh_argv_to_subprocess(tmp_path, monkeypatch):
+    captured = tmp_path / "argv.json"
+    script = tmp_path / "stub_agy.py"
+    script.write_text(
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "sys.stdin.readline()\n"
+        f"Path({str(captured)!r}).write_text(json.dumps(sys.argv[1:]), encoding='utf-8')\n"
+        "print(json.dumps({'event':'result','result':{'conversation_id':'c-xhigh','status':'SUCCESS','response':'ok'}}))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "agent_bridge.adapters.antigravity.resolve_command",
+        lambda command, fallbacks=None: [sys.executable, str(script)],
+    )
+    monkeypatch.setattr("agent_bridge.adapters.antigravity.agy_projects_dir", lambda: tmp_path / "projects")
+    adapter = AgyAdapter(
+        AgentConfig(name="antigravity", protocol="agy", command=["agy"]),
+        tmp_path,
+    )
+    session = Session(
+        session_id="sess_run_x",
+        agent="antigravity",
+        cwd=str(tmp_path),
+        model="gemini-4-hydrogen",
+        effort="xhigh",
+    )
+    task = Task(
+        task_id="task_run_x",
+        session_id=session.session_id,
+        agent="antigravity",
+        message="hi",
+        cwd=str(tmp_path),
+        model="gemini-4-hydrogen",
+        effort="xhigh",
+    )
+    result = await adapter.run_turn(session, task)
+    assert result.stop_reason == "end_turn"
+    argv = json.loads(captured.read_text(encoding="utf-8"))
+    assert argv[argv.index("--effort") + 1] == "xhigh"
+    assert argv.index("--effort") < argv.index("-p")

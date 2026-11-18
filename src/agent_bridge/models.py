@@ -40,16 +40,30 @@ class ProcState(StrEnum):
 TERMINAL_STATUSES = {TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled}
 DEFAULT_WAIT_SEC = 180.0
 EFFORTS = ("off", "low", "medium", "high", "max")
+AGY_EFFORTS = ("off", "low", "medium", "high", "xhigh", "max")
 
 
-def normalize_effort(raw: str | None) -> str | None:
+def normalize_effort(
+    raw: str | None,
+    *,
+    agent: str | None = None,
+    allow_xhigh: bool = False,
+) -> str | None:
     if raw is None:
         return None
     value = raw.strip().lower()
     aliases = {"l": "low", "m": "medium", "med": "medium", "h": "high"}
     value = aliases.get(value, value)
-    if value not in EFFORTS:
-        raise ValueError(f"effort must be one of off, low, medium, high, max (got {raw!r})")
+    allowed = AGY_EFFORTS if allow_xhigh else EFFORTS
+    if value not in allowed:
+        if value == "xhigh" and not allow_xhigh:
+            target = f" for agent {agent!r}" if agent else ""
+            raise ValueError(
+                f"effort='xhigh' is only supported for antigravity (agy){target}; "
+                f"effort must be one of off, low, medium, high, max (got {raw!r})"
+            )
+        options = ", ".join(allowed)
+        raise ValueError(f"effort must be one of {options} (got {raw!r})")
     return value
 
 

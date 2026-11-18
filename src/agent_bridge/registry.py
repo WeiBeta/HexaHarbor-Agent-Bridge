@@ -727,11 +727,13 @@ class Registry:
             raise ValueError(f"cwd does not exist: {cwd_path}")
         if not cwd_path.is_dir():
             raise ValueError(f"cwd is not a directory: {cwd_path}")
-        effort = normalize_effort(effort)
-        self.config.get(agent)
+        agent_cfg = self.config.get(agent)
         if self.config.server.enabled_agents and agent not in self._active_agents():
             enabled = ", ".join(sorted(self._active_agents())) or "(none)"
             raise KeyError(f"agent {agent!r} is disabled by server.enabled_agents; enabled: {enabled}")
+        # 仅 agy 协议允许显式 xhigh, 避免扩大其他 harness 支持或静默降级
+        allow_xhigh = agent_cfg.protocol == "agy"
+        effort = normalize_effort(effort, agent=agent, allow_xhigh=allow_xhigh)
         # Compare supplied arguments, not selections inherited from a mutable session.
         request = (agent, message, str(cwd_path.resolve()), session_id, model, effort, title, user_requested)
         async with self._lock:
