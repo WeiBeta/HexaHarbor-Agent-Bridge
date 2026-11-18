@@ -8,9 +8,8 @@ def _read(name: str) -> str:
 
 
 def test_readme_and_setup_list_zcode_grok_and_claude_coordinators():
-    readme = _read("README.md")
-    setup = _read("SETUP.md")
-    for text in (readme, setup):
+    for name in ("README.md", "README.zh-CN.md", "SETUP.md"):
+        text = _read(name)
         assert "ZCode" in text
         assert "Grok Build" in text
         assert "Codex" in text
@@ -78,26 +77,41 @@ def test_orchestration_english_stays_under_char_budget():
 
 
 def test_readme_explains_coordinator_modes():
-    readme = _read("README.md")
-    for token in ("manual", "auto", "eager", "AGENT_BRIDGE_MODE"):
-        assert token in readme
-    assert "does not ask" in readme
-    assert "不会询问" in readme
-    assert "[coordinator] mode" in readme
-    assert "ORCHESTRATION.md" in readme
-    assert "ORCHESTRATION.zh-CN.md" in readme
-    assert "协调规则书" in readme
+    en, zh = _read("README.md"), _read("README.zh-CN.md")
+    for text in (en, zh):
+        for token in ("manual", "auto", "eager", "AGENT_BRIDGE_MODE", "[coordinator] mode"):
+            assert token in text
+    assert "does not ask" in en
+    assert "不会询问" in zh
+    assert "ORCHESTRATION.md" in en
+    assert "ORCHESTRATION.zh-CN.md" in zh
+    assert "协调规则书" in zh
+
+
+def test_bilingual_landing_pages_share_the_ticket_quickstart():
+    en, zh = _read("README.md"), _read("README.zh-CN.md")
+    assert "[简体中文](README.zh-CN.md)" in en
+    assert "[English](README.md)" in zh
+    # One copyable install path: translations must not drift on commands.
+    en_ps = en.split("```powershell\n", 1)[1].split("\n```", 1)[0]
+    zh_ps = zh.split("```powershell\n", 1)[1].split("\n```", 1)[0]
+    assert en_ps == zh_ps
+    for text in (en, zh):
+        for token in ("list_agents", "dispatch_ticket", "task_id", "wait_task", "get_result"):
+            assert token in text
 
 
 def test_live_workspace_is_local_lab_not_pytest():
     readme = _read("README.md")
     setup = _read("SETUP.md")
     contributing = _read("CONTRIBUTING.md")
-    for text in (readme, setup, contributing):
+    zh = _read("README.zh-CN.md")
+    for text in (readme, zh, setup, contributing):
         assert "lab/" in text
         assert "scripts/setup_lab.py" in text
         assert "tests/" in text
     assert "not in git" in readme
+    assert "不进 Git" in zh
     assert "not in git" in setup
     assert "pytest" in setup
 
@@ -139,4 +153,5 @@ def test_skill_mentions_stall_watchdog():
     skill = _read("skills/agent-bridge/SKILL.md")
     assert "stall_timeout_sec" in skill
     assert "silent_for_sec" in skill
-    assert _read("README.md").count("stall_timeout_sec") >= 2
+    for name in ("README.md", "README.zh-CN.md"):
+        assert "stall_timeout_sec" in _read(name)

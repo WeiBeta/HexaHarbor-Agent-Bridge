@@ -35,7 +35,8 @@ A clone is only for people changing Bridge itself. Pointing MCP at `uv --directo
 From a trusted project, or edit `%USERPROFILE%\.codex\config.toml`:
 
 ```powershell
-codex mcp add agent_bridge -- %USERPROFILE%\.local\bin\agent-bridge.exe
+$bridge = Join-Path (uv tool dir --bin) 'agent-bridge.exe'
+codex mcp add agent_bridge -- $bridge
 ```
 
 Use the full path so Codex does not have to inherit `PATH`. Then add the tuning keys. Codex **clears** the MCP child environment, so list every variable workers need:
