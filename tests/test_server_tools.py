@@ -228,7 +228,7 @@ async def test_ticket_retry_waits_for_receipt_finalization(bridge_home, tmp_path
 async def test_enabled_agents_filters_list_and_blocks_disabled_dispatch(bridge_home, tmp_path, monkeypatch):
     probed = []
 
-    async def fake_probe(cfg, env_config=None):
+    async def fake_probe(cfg, env_config=None, *, include_models=False):
         probed.append(cfg.name)
         return {"agent": cfg.name, "available": True, "version": "test", "detail": "mock probe"}
 

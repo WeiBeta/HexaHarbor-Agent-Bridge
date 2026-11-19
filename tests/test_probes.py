@@ -28,6 +28,76 @@ class VersionProcess:
         return self._out, self._err
 
 
+@pytest.mark.parametrize(
+    ("output", "code", "expected"),
+    [
+        (
+            b"Fetching...\nnew-id\tNew Model\norch-neon\tOrchestrator (Neon)\norch\tOrchestrator (Carbon)\n",
+            0,
+            {"new-id": "New Model", "orch-neon": "Orchestrator (Neon)", "orch": "Orchestrator (Carbon)"},
+        ),
+        (b"not a catalog\n", 0, {}),
+        (b"fake-id\tWrong on failure", 1, {}),
+    ],
+)
+async def test_agy_catalog_is_opt_in_and_never_guesses(monkeypatch, output, code, expected):
+    calls = []
+
+    async def version(_exe):
+        return "1.5.12"
+
+    async def spawn(*argv, **kwargs):
+        calls.append(argv)
+        assert kwargs["env"].get("DENIED") is None
+        assert kwargs["stdin"] == asyncio.subprocess.DEVNULL
+        return VersionProcess(code, out=output)
+
+    monkeypatch.setattr("agent_bridge.probes._version_string", version)
+    monkeypatch.setattr("agent_bridge.probes.resolve_command", lambda *args: ["selected-agy", "prefix"])
+    monkeypatch.setattr("agent_bridge.probes.build_worker_env", lambda *a, **kw: {"DENIED": "test"})
+    monkeypatch.setattr("agent_bridge.probes.asyncio.create_subprocess_exec", spawn)
+    cfg = AgentConfig(name="custom-agy", protocol="agy", command=["agy"])
+    env = EnvConfig(deny=["DENIED"])
+    assert "model_catalog" not in await probe_agent(cfg, env)
+    assert calls == []
+    row = await probe_agent(cfg, env, include_models=True)
+    assert row["available"] is True
+    assert calls == [("selected-agy", "prefix", "models")]
+    catalog = row["model_catalog"]
+    assert {item["id"]: item["label"] for item in catalog["models"]} == expected
+    if expected:
+        assert catalog["status"] == "ok"
+        assert catalog["dispatch"]["effort"] == "omit"
+        assert catalog["dispatch"]["session_id"].startswith("omit")
+    else:
+        assert catalog["status"] == "unknown" and "dispatch" not in catalog
+
+
+@pytest.mark.asyncio
+async def test_agy_catalog_timeout_reaps_only_its_probe(monkeypatch):
+    class TimedOut:
+        async def communicate(self):
+            raise TimeoutError
+
+    proc = TimedOut()
+    reaped = []
+
+    async def spawn(*args, **kwargs):
+        return proc
+
+    async def reap(child):
+        reaped.append(child)
+
+    from agent_bridge.probes import _agy_catalog
+
+    monkeypatch.setattr("agent_bridge.probes.asyncio.create_subprocess_exec", spawn)
+    monkeypatch.setattr("agent_bridge.probes.reap_subprocess", reap)
+    catalog = await _agy_catalog(["agy"], {})
+    assert reaped == [proc]
+    assert catalog["status"] == "unknown" and catalog["models"] == []
+    assert "timed out" in catalog["reason"]
+
+
 @pytest.mark.asyncio
 async def test_version_probe_rejects_failed_command_output(monkeypatch):
     processes = iter(

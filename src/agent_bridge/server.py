@@ -73,11 +73,11 @@ def _error(exc: Exception) -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def list_agents(ctx: Context) -> dict[str, Any]:
-    """List configured workers, the reconstructed host/proxy environment, and the coordinator policy (mode, instructions, runtime_context, dispatch_enabled). Call this first. Each agents[] row also carries quota: status ok | exhausted | unknown, windows[] with remaining_percent / resets_at / resets_in_sec, optional balance when reported by the provider, cached / stale flags, and detail. unknown means the quota could not be read (unsupported CLI, API-key login, timeout) — not that it is empty. Custom API/auth endpoints are unsupported; cached readings expire at window reset. Quota never affects available; treat it as information, routing still follows coordinator.instructions. Claude status covers shared 5h/weekly limits only: before dispatch, check the requested model's weekly:opus or weekly:sonnet remaining_percent even if status is ok. Zero means that model is exhausted; report its reset time or use an alternative allowed by coordinator.instructions. Missing or null readings mean unknown; model-specific windows alone cannot establish shared status. If dispatch_enabled is false, this is a nested worker-inherited instance — do not dispatch or set_preferences."""
+async def list_agents(ctx: Context, include_models: bool = False) -> dict[str, Any]:
+    """List configured workers, the reconstructed host/proxy environment, and the coordinator policy (mode, instructions, runtime_context, dispatch_enabled). Call this first. Set include_models=true to query the installed AGY CLI for exact model IDs and dispatch instructions in model_catalog (no model turn). Each agents[] row also carries quota: status ok | exhausted | unknown, windows[] with remaining_percent / resets_at / resets_in_sec, optional balance when reported by the provider, cached / stale flags, and detail. unknown means the quota could not be read (unsupported CLI, API-key login, timeout) — not that it is empty. Custom API/auth endpoints are unsupported; cached readings expire at window reset. Quota never affects available; treat it as information, routing still follows coordinator.instructions. Claude status covers shared 5h/weekly limits only: before dispatch, check the requested model's weekly:opus or weekly:sonnet remaining_percent even if status is ok. Zero means that model is exhausted; report its reset time or use an alternative allowed by coordinator.instructions. Missing or null readings mean unknown; model-specific windows alone cannot establish shared status. If dispatch_enabled is false, this is a nested worker-inherited instance — do not dispatch or set_preferences."""
     try:
         registry = _registry(ctx)
-        agents = await registry.list_agents()
+        agents = await registry.list_agents(include_models=include_models)
         return {
             "ok": True,
             "agents": agents,

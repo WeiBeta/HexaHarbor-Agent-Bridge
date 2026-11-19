@@ -598,9 +598,9 @@ class Registry:
             allowed.add("fake")
         return {name: cfg for name, cfg in self.config.agents.items() if name in allowed}
 
-    async def list_agents(self) -> list[dict]:
+    async def list_agents(self, *, include_models: bool = False) -> list[dict]:
         async def describe(cfg: AgentConfig) -> dict:
-            row = await probe_agent(cfg, self.config.env)
+            row = await probe_agent(cfg, self.config.env, include_models=include_models)
             row["quota"] = await self._quota_for(cfg, available=bool(row.get("available")))
             return row
 

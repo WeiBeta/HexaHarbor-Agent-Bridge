@@ -540,7 +540,16 @@ def test_agy_build_cmd_distinguishes_xhigh_max_off_and_none(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_agy_run_turn_passes_xhigh_argv_to_subprocess(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("model", "effort"),
+    [
+        ("gemini-4-hydrogen", "xhigh"),
+        ("gemini-4-neon-high", None),
+        ("gemini-4-neon-xhigh", None),
+        ("gemini-pro-orchestrator-neon", None),
+    ],
+)
+async def test_agy_fresh_turn_passes_exact_selection_to_subprocess(tmp_path, monkeypatch, model, effort):
     captured = tmp_path / "argv.json"
     script = tmp_path / "stub_agy.py"
     script.write_text(
@@ -564,8 +573,8 @@ async def test_agy_run_turn_passes_xhigh_argv_to_subprocess(tmp_path, monkeypatc
         session_id="sess_run_x",
         agent="antigravity",
         cwd=str(tmp_path),
-        model="gemini-4-hydrogen",
-        effort="xhigh",
+        model=model,
+        effort=effort,
     )
     task = Task(
         task_id="task_run_x",
@@ -573,11 +582,18 @@ async def test_agy_run_turn_passes_xhigh_argv_to_subprocess(tmp_path, monkeypatc
         agent="antigravity",
         message="hi",
         cwd=str(tmp_path),
-        model="gemini-4-hydrogen",
-        effort="xhigh",
+        model=model,
+        effort=effort,
     )
     result = await adapter.run_turn(session, task)
     assert result.stop_reason == "end_turn"
     argv = json.loads(captured.read_text(encoding="utf-8"))
-    assert argv[argv.index("--effort") + 1] == "xhigh"
-    assert argv.index("--effort") < argv.index("-p")
+    assert argv.count("--model") == 1
+    assert argv[argv.index("--model") + 1] == model
+    assert argv.index("--model") < argv.index("-p")
+    assert "--conversation" not in argv
+    if effort is None:
+        assert "--effort" not in argv
+    else:
+        assert argv[argv.index("--effort") + 1] == effort
+        assert argv.index("--effort") < argv.index("-p")

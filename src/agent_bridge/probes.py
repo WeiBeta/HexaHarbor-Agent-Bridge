@@ -115,7 +115,46 @@ def _kimi_auth(env: dict[str, str]) -> str:
     return "missing (run `kimi login`)"
 
 
-async def probe_agent(cfg: AgentConfig, env_config: EnvConfig | None = None) -> dict:
+async def _agy_catalog(command: list[str], env: dict[str, str]) -> dict:
+    """Query the selected CLI, not a bundled list. No prompt or worker session."""
+    unknown = {"source": "agy models", "status": "unknown", "models": []}
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            "models",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=env,
+        )
+    except OSError:
+        return {**unknown, "reason": "could not start catalog command"}
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=12)
+    except TimeoutError:
+        await reap_subprocess(proc)
+        return {**unknown, "reason": "catalog command timed out"}
+    except asyncio.CancelledError:
+        await reap_subprocess(proc)
+        raise
+    if proc.returncode != 0:
+        return {**unknown, "reason": f"catalog command exited {proc.returncode}"}
+
+    # AGY emits id<TAB>display name. Ignore banners; never derive an ID from a label.
+    models = []
+    for line in ANSI_ESCAPE_RE.sub("", out.decode("utf-8", errors="replace")).splitlines():
+        slug, _, label = line.strip().partition("\t")
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*", slug) and label.strip():
+            models.append({"id": slug, "label": label.strip()})
+    if not models:
+        return {**unknown, "reason": "no recognized catalog rows"}
+    return {
+        "source": "agy models", "status": "ok", "models": models,
+        "dispatch": {"model": "exact catalog id", "effort": "omit", "session_id": "omit (new session)"},
+    }
+
+
+async def probe_agent(cfg: AgentConfig, env_config: EnvConfig | None = None, *, include_models: bool = False) -> dict:
     if cfg.protocol == "fake":
         return {"agent": cfg.name, "available": True, "version": "fake", "detail": "in-process fake adapter"}
     resolved = build_worker_env(
@@ -138,7 +177,15 @@ async def probe_agent(cfg: AgentConfig, env_config: EnvConfig | None = None) -> 
     try:
         command = await asyncio.to_thread(_resolve_probe_command)
     except FileNotFoundError as exc:
-        return {"agent": cfg.name, "available": False, "version": None, "detail": str(exc)}
+        unavailable = {"agent": cfg.name, "available": False, "version": None, "detail": str(exc)}
+        if include_models and cfg.protocol == "agy":
+            unavailable["model_catalog"] = {
+                "source": "agy models",
+                "status": "unknown",
+                "models": [],
+                "reason": "worker command not found",
+            }
+        return unavailable
 
     details: list[str] = [f"command={command[0]}"]
     version = await _version_string(command[0])
@@ -152,9 +199,7 @@ async def probe_agent(cfg: AgentConfig, env_config: EnvConfig | None = None) -> 
                 "version": version or None,
                 "detail": f"dsh-acp-demo bin missing: {bin_path}",
             }
-        if command[0].lower().endswith(("node", "node.exe")) or any(
-            arg.endswith((".js", ".ts")) for arg in command
-        ):
+        if command[0].lower().endswith(("node", "node.exe")) or any(arg.endswith((".js", ".ts")) for arg in command):
             node = shutil.which("node")
             if not node:
                 return {"agent": cfg.name, "available": False, "version": None, "detail": "node not found"}
@@ -181,11 +226,17 @@ async def probe_agent(cfg: AgentConfig, env_config: EnvConfig | None = None) -> 
                 "effort=off|low|high|max via dispatch_task.effort; same session model change respawns"
             )
 
+    extra: dict = {}
     if cfg.protocol == "agy":
         details.append(
-            f"model=agy models slugs e.g. gemini-3.8-flash-medium, gemini-4-carbon-high; "
-            f"effort=low|medium|high|xhigh|max; mode={cfg.agy_mode or 'default'}"
+            f"model=exact ID from list_agents(include_models=true); omit effort and session_id "
+            f"for a fresh catalog selection; separate Bridge effort=low|medium|high|xhigh|max "
+            f"is not needed for full IDs; mode={cfg.agy_mode or 'default'}"
         )
+        if include_models:
+            env_cfg = env_config or EnvConfig()
+            spawn_env = enforce_env_deny(resolved, env_cfg, set(cfg.env) | set(env_cfg.set))
+            extra["model_catalog"] = await _agy_catalog(command, spawn_env)
         details.append("prompt via stdin (stream-json)")
 
     if cfg.name == "grok":
@@ -286,6 +337,7 @@ async def probe_agent(cfg: AgentConfig, env_config: EnvConfig | None = None) -> 
         "available": True,
         "version": version or None,
         "detail": "; ".join(details),
+        **extra,
     }
 
 

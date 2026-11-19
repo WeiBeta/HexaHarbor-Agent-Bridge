@@ -12,6 +12,16 @@ Then register the MCP server in the coordinator. Startup does not install skills
 
 ### Work tickets and local records
 
+**Discover Antigravity models:** call `list_agents({"include_models": true})` and find the
+Antigravity row. Its `model_catalog.models` contains exact `id` / display `label` pairs from
+the selected CLI's current `agy models` output. On timeout, failure or unrecognized output
+the catalog is `unknown`, not a fallback list. Ordinary `list_agents({})` skips this extra query.
+To select an entry with `dispatch_task` or `dispatch_ticket`, pass its full ID as `model`;
+omit **both** `effort` and `session_id` to start fresh without inheriting an old session's settings.
+For example, if advertised, `gemini-4-neon-high`, `gemini-4-neon-xhigh` and
+`gemini-pro-orchestrator-neon` are distinct. The unsuffixed `gemini-pro-orchestrator` is
+the Carbon orchestrator, not a Neon alias. Catalog availability is not a completed model turn.
+
 `dispatch_ticket` combines dispatch, bounded waiting (480 seconds by default), and result collection. Keep its wait below the host MCP timeout. A `timed_out` response does not cancel or restart the worker: use its `task_id` with `wait_task` and `get_result`. While finalization is pending, task status can already be terminal; wait for collection to finish before treating a receipt as available. A retained UUID `request_id` deduplicates identical submissions, not different work tickets.
 
 Terminal receipts are written atomically to `$AGENT_BRIDGE_HOME/receipts/<task_id>.json` (default `~/.agent-bridge/receipts/`). A missing `receipt_path` is not evidence that the worker failed or never ran. Results, transcripts, and receipts are **plaintext local files**, not encrypted shadow storage; keep this runtime home outside Git and review any material before sharing it.
