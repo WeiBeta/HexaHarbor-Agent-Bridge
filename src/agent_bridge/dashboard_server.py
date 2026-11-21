@@ -62,6 +62,7 @@ from agent_bridge.dashboard_service import (
     clear_pid_record,
     dashboard_update_response,
     get_autostart_status,
+    initialize_first_use_preferences,
     is_tray_running,
     load_service_config,
     open_billing_folder,
@@ -864,10 +865,12 @@ def run_dashboard(
     open_browser: bool = True,
 ) -> None:
     resolved = home or bridge_home()
-    cfg = load_service_config(resolved)
+    cfg = initialize_first_use_preferences(resolved)
     eff_host = host or cfg.host
     eff_port = cfg.port if port is None else port
     server = create_dashboard_server(home=resolved, host=eff_host, port=eff_port, backfill=True)
+    if cfg.tray_enabled and os.name == "nt":
+        start_tray(resolved, host=server.bound_host, port=server.bound_port)
     pid_record = write_pid_record(
         resolved, host=server.bound_host, port=server.bound_port, instance_id=server.instance_id
     )

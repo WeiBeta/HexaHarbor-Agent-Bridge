@@ -134,6 +134,32 @@ def load_service_config(home: Path | None = None) -> ServiceConfig:
         return ServiceConfig()
 
 
+def has_service_config(home: Path | None = None) -> bool:
+    """Return whether this home has a saved preference file, including explicit false values."""
+    return service_config_path(home or bridge_home()).is_file()
+
+
+def initialize_first_use_preferences(
+    home: Path,
+    *,
+    platform_is_windows: bool | None = None,
+    registry: RegistryBackend | None = None,
+) -> ServiceConfig:
+    """Apply the Windows first-use defaults once, then preserve every saved choice."""
+    is_win = (os.name == "nt") if platform_is_windows is None else platform_is_windows
+    if not is_win or has_service_config(home):
+        return load_service_config(home)
+    cfg = ServiceConfig(tray_enabled=True, auto_start=True)
+    try:
+        set_autostart(True, home, platform_is_windows=True, registry=registry)
+    except ValueError as exc:
+        # Another Bridge home owns the single Run entry; leave it untouched.
+        cfg = ServiceConfig(tray_enabled=True, auto_start=False)
+        log.warning("first-use autostart not enabled: %s", exc)
+    save_service_config(cfg, home)
+    return cfg
+
+
 def save_service_config(config: ServiceConfig, home: Path | None = None) -> ServiceConfig:
     resolved = home or bridge_home()
     validated = ServiceConfig.model_validate(config.model_dump(mode="json"))
@@ -375,7 +401,8 @@ def start_tray(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        **_detached_kwargs(),
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+        close_fds=True,
     )
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:

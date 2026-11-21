@@ -5,6 +5,7 @@ import http.client
 import json
 import re
 import threading
+import types
 from pathlib import Path
 from typing import Any
 
@@ -217,10 +218,11 @@ def test_dashboard_end_to_end_and_security_guards(tmp_path: Path):
         thread.join(timeout=5)
 
 
-def test_cli_dashboard_subcommand_parses_flags(monkeypatch):
+def test_cli_dashboard_subcommand_parses_flags(monkeypatch, tmp_path):
     from agent_bridge.cli import main
 
     captured: dict[str, Any] = {}
+    monkeypatch.setenv("AGENT_BRIDGE_HOME", str(tmp_path))
 
     def fake_run_dashboard(*, host: str, port: int, open_browser: bool) -> None:
         captured["host"] = host
@@ -230,6 +232,41 @@ def test_cli_dashboard_subcommand_parses_flags(monkeypatch):
     monkeypatch.setattr("agent_bridge.dashboard_server.run_dashboard", fake_run_dashboard)
     main(["dashboard", "--host", "localhost", "--port", "9123", "--no-open"])
     assert captured == {"host": "localhost", "port": 9123, "open_browser": False}
+
+
+def test_foreground_dashboard_initializes_first_use_tray_and_autostart(tmp_path: Path, monkeypatch):
+    from agent_bridge import dashboard_server, dashboard_service
+
+    calls = []
+    monkeypatch.setattr(dashboard_server, "start_tray", lambda *a, **kw: calls.append(("tray", kw)))
+    monkeypatch.setattr(dashboard_service, "get_autostart_status", lambda *a, **kw: {"occupied": False})
+    monkeypatch.setattr(
+        dashboard_service, "set_autostart", lambda enabled, home=None, **kw: calls.append((enabled, home))
+    )
+    monkeypatch.setattr(dashboard_service, "os", types.SimpleNamespace(name="nt"))
+    monkeypatch.setattr(dashboard_server, "os", types.SimpleNamespace(name="nt"))
+    monkeypatch.setattr(dashboard_server, "write_pid_record", lambda *a, **kw: None)
+    monkeypatch.setattr(dashboard_server, "webbrowser", types.SimpleNamespace(open=lambda *_a, **_kw: None))
+
+    def stop_after_one(*_args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        dashboard_server,
+        "create_dashboard_server",
+        lambda **kw: types.SimpleNamespace(
+            bound_host="127.0.0.1",
+            bound_port=8765,
+            instance_id="i",
+            url="http://127.0.0.1:8765",
+            server_close=lambda: None,
+            serve_forever=stop_after_one,
+        ),
+    )
+    monkeypatch.setattr(dashboard_server, "clear_pid_record", lambda *a, **kw: None)
+    dashboard_server.run_dashboard(home=tmp_path, open_browser=False)
+    assert [(kind, home) for kind, home in calls if kind is True] == [(True, tmp_path)]
+    assert any(kind == "tray" for kind, _payload in calls)
 
 
 @pytest.mark.asyncio

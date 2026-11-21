@@ -234,6 +234,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         from agent_bridge.dashboard_server import run_dashboard
         from agent_bridge.dashboard_service import (
             dashboard_update_response,
+            initialize_first_use_preferences,
             restart_background_service,
             service_status,
             start_background_service,
@@ -264,6 +265,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             parser.add_argument("--open", action="store_true")
             parser.add_argument("--tray", action="store_true")
             opts = parser.parse_args(rest)
+            initialize_first_use_preferences(bridge_home())
             res = start_background_service(
                 host=opts.host,
                 port=opts.port,
@@ -281,6 +283,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             parser.add_argument("--host", default=None)
             parser.add_argument("--port", type=int, default=None)
             opts = parser.parse_args(rest)
+            initialize_first_use_preferences(bridge_home())
             res = restart_background_service(host=opts.host, port=opts.port)
             print(res.get("message", ""))
             return

@@ -22,6 +22,8 @@ from agent_bridge.dashboard_service import (
     ServiceConfig,
     clear_pid_record,
     get_autostart_status,
+    has_service_config,
+    initialize_first_use_preferences,
     is_pid_record_alive,
     load_service_config,
     read_pid_record,
@@ -45,6 +47,16 @@ class _FakeRegistry:
 
     def delete_value(self, key_path: str, name: str) -> None:
         self.values.pop((key_path, name), None)
+
+
+class _OsNameProxy:
+    """Patch the module's platform view without changing the process-wide ``os`` module."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __getattr__(self, attr: str) -> Any:
+        return getattr(os, attr)
 
 
 def _request(
@@ -89,6 +101,7 @@ def test_service_config_defaults_and_validation(tmp_path: Path):
     assert cfg.port == 8765
     assert cfg.auto_start is False
     assert cfg.tray_enabled is False
+    assert has_service_config(tmp_path) is False
 
     saved = save_service_config(ServiceConfig(host="localhost", port=9100, auto_start=False, tray_enabled=True), tmp_path)
     assert saved.host == "localhost"
@@ -101,6 +114,279 @@ def test_service_config_defaults_and_validation(tmp_path: Path):
         ServiceConfig(host="::1")
     with pytest.raises(ValidationError):
         ServiceConfig(port=80)
+
+
+def _read_service_json(home: Path) -> dict[str, Any]:
+    return json.loads((home / "billing" / "service.json").read_text(encoding="utf-8"))
+
+
+def test_first_use_on_windows_saves_both_defaults_and_registers_autostart(tmp_path: Path, monkeypatch):
+    fake_reg = _FakeRegistry()
+    monkeypatch.setattr(dashboard_service, "os", _OsNameProxy("nt"))
+    monkeypatch.setattr(dashboard_service.subprocess, "Popen", _unexpected_popen)
+    cfg = initialize_first_use_preferences(tmp_path, registry=fake_reg)
+    assert cfg.auto_start is True and cfg.tray_enabled is True
+    assert has_service_config(tmp_path) is True
+    assert _read_service_json(tmp_path)["auto_start"] is True
+    assert _read_service_json(tmp_path)["tray_enabled"] is True
+    value = fake_reg.read_value(AUTOSTART_REG_PATH, AUTOSTART_VALUE_NAME)
+    assert value is not None and value.startswith('wscript.exe "')
+    assert (tmp_path / "billing" / "dashboard-autostart.vbs").is_file()
+
+
+def test_first_use_respects_another_homes_run_entry(tmp_path: Path, monkeypatch):
+    fake_reg = _FakeRegistry()
+    fake_reg.write_value(AUTOSTART_REG_PATH, AUTOSTART_VALUE_NAME, 'wscript.exe "C:/other/path.vbs"')
+    monkeypatch.setattr(dashboard_service, "os", _OsNameProxy("nt"))
+    cfg = initialize_first_use_preferences(tmp_path, registry=fake_reg)
+    assert cfg.tray_enabled is True
+    assert cfg.auto_start is False
+    assert fake_reg.read_value(AUTOSTART_REG_PATH, AUTOSTART_VALUE_NAME) == 'wscript.exe "C:/other/path.vbs"'
+    assert not (tmp_path / "billing" / "dashboard-autostart.vbs").exists()
+
+
+def test_first_use_reload_preserves_defaults_and_explicit_false(tmp_path: Path, monkeypatch):
+    fake_reg = _FakeRegistry()
+    monkeypatch.setattr(dashboard_service, "os", _OsNameProxy("nt"))
+    initialize_first_use_preferences(tmp_path, registry=fake_reg)
+    reloaded = load_service_config(tmp_path)
+    assert reloaded.auto_start is True and reloaded.tray_enabled is True
+
+    # A later unrelated write through save_service_config must not revive either flag.
+    save_service_config(ServiceConfig(auto_start=False, tray_enabled=True), tmp_path)
+    again = initialize_first_use_preferences(tmp_path, registry=fake_reg)
+    assert again.auto_start is False and again.tray_enabled is True
+
+
+@pytest.mark.parametrize(
+    ("auto_start", "tray_enabled"),
+    [(True, True), (True, False), (False, True), (False, False)],
+)
+def test_saved_switch_combinations_round_trip_without_upgrade(tmp_path: Path, monkeypatch, auto_start, tray_enabled):
+    fake_reg = _FakeRegistry()
+    monkeypatch.setattr(dashboard_service, "os", _OsNameProxy("nt"))
+    save_service_config(ServiceConfig(auto_start=auto_start, tray_enabled=tray_enabled), tmp_path)
+    if auto_start:
+        set_autostart(True, tmp_path, platform_is_windows=True, registry=fake_reg)
+    cfg = initialize_first_use_preferences(tmp_path, registry=fake_reg)
+    assert cfg.auto_start is auto_start and cfg.tray_enabled is tray_enabled
+    assert load_service_config(tmp_path).auto_start is auto_start
+    assert load_service_config(tmp_path).tray_enabled is tray_enabled
+    # Reinitialization after another switch write leaves this saved value alone.
+    other = not tray_enabled
+    save_service_config(ServiceConfig(auto_start=auto_start, tray_enabled=other), tmp_path)
+    after = load_service_config(tmp_path)
+    assert after.auto_start is auto_start and after.tray_enabled is other
+    # Writing the other switch through the real HTTP handler leaves this switch's registry state alone.
+    seen = []
+    monkeypatch.setattr(dashboard_server, "get_autostart_status", lambda *a, **kw: {"occupied": False})
+    monkeypatch.setattr(dashboard_server, "set_autostart", lambda enabled, home=None, **kw: seen.append(enabled))
+    monkeypatch.setattr(dashboard_server, "start_tray", lambda *a, **kw: {"message": "tray"})
+    monkeypatch.setattr(dashboard_server, "stop_tray", lambda *a, **kw: {"message": "stop"})
+    handler = types.SimpleNamespace(
+        server=types.SimpleNamespace(home=tmp_path, bound_host="127.0.0.1", bound_port=8765, started_monotonic=1),
+        _send_json=lambda value: None,
+    )
+    dashboard_server.DashboardRequestHandler._handle_put_service(handler, {"tray_enabled": not other})
+    assert seen == []
+    assert load_service_config(tmp_path).auto_start is auto_start
+
+
+def _unexpected_popen(*_args, **_kwargs):
+    pytest.fail("first-use preference setup must not launch a process")
+
+
+def _first_use_start_fixture(tmp_path: Path, monkeypatch):
+    """Wire a fake Windows first run through start_background_service's real launch path."""
+    fake_reg = _FakeRegistry()
+    script = tmp_path / "dashboard-tray.ps1"
+    script.write_text("# stub", encoding="utf-8")
+    tray_state = {"running": False, "calls": 0}
+    pid, creation = 6541, 1234.5
+    spawned = []
+    registry_writes = []
+    original_write = fake_reg.write_value
+
+    def write_value(key_path, name, value):
+        registry_writes.append((key_path, name, value))
+        original_write(key_path, name, value)
+
+    fake_reg.write_value = write_value
+    monkeypatch.setattr(dashboard_service, "os", _OsNameProxy("nt"))
+    monkeypatch.setattr(dashboard_service, "process_create_time", lambda _pid: creation)
+    monkeypatch.setattr(
+        dashboard_service.psutil,
+        "Process",
+        lambda _pid: types.SimpleNamespace(
+            is_running=lambda: True, status=lambda: "running", create_time=lambda: creation
+        ),
+    )
+    monkeypatch.setattr(dashboard_service, "resolve_bridge_command", lambda: ("agent-bridge.exe", []))
+    monkeypatch.setattr(dashboard_service, "_powershell_executable", lambda: "powershell.exe")
+    monkeypatch.setattr(dashboard_service, "bundled_tray_script", lambda: script)
+
+    def is_tray_running(_home):
+        return tray_state["running"]
+
+    def start(command, *, env, **kwargs):
+        spawned.append((command, kwargs))
+        write_pid_record(
+            tmp_path,
+            host="127.0.0.1",
+            port=8765,
+            pid=pid,
+            instance_id=env[dashboard_service.DASHBOARD_LAUNCH_ID_ENV],
+        )
+        return types.SimpleNamespace(pid=9870, poll=lambda: 0)
+
+    def health(host, port, **kwargs):
+        record = read_pid_record(tmp_path)
+        return {"ok": True, "host": host, "port": port, "pid": pid, "instance_id": record.instance_id}
+
+    def tray_popen(command, **kwargs):
+        tray_state["calls"] += 1
+        tray_state["running"] = True
+        spawned.append((command, kwargs))
+        return types.SimpleNamespace(pid=4567)
+
+    def dispatch_popen(command, **kwargs):
+        return tray_popen(command, **kwargs) if command[0] == "powershell.exe" else start(command, **kwargs)
+
+    monkeypatch.setattr(dashboard_service, "is_tray_running", is_tray_running)
+    monkeypatch.setattr(dashboard_service, "probe_health", health)
+    monkeypatch.setattr(dashboard_service.subprocess, "Popen", dispatch_popen)
+    real_set_autostart = dashboard_service.set_autostart
+    monkeypatch.setattr(
+        dashboard_service,
+        "set_autostart",
+        lambda enabled, home=None, **kw: real_set_autostart(enabled, home, platform_is_windows=True, registry=fake_reg),
+    )
+    real_get_autostart = dashboard_service.get_autostart_status
+    monkeypatch.setattr(
+        dashboard_service,
+        "get_autostart_status",
+        lambda home=None, **kw: real_get_autostart(home, platform_is_windows=True, registry=fake_reg),
+    )
+    return fake_reg, tray_state, spawned, registry_writes
+
+
+def test_first_use_start_writes_autostart_and_starts_tray_once(tmp_path: Path, monkeypatch):
+    fake_reg, tray_state, spawned, registry_writes = _first_use_start_fixture(tmp_path, monkeypatch)
+    from agent_bridge.cli import main
+
+    monkeypatch.setenv("AGENT_BRIDGE_HOME", str(tmp_path))
+    main(["dashboard", "start"])
+    assert tray_state["calls"] == 1 and tray_state["running"] is True
+    assert len(registry_writes) == 1
+    assert fake_reg.read_value(AUTOSTART_REG_PATH, AUTOSTART_VALUE_NAME) is not None
+    assert (tmp_path / "billing" / "dashboard-autostart.vbs").is_file()
+    tray_calls = [kwargs for command, kwargs in spawned if command[0] == "powershell.exe"]
+    assert tray_calls and tray_calls[0]["creationflags"] == 0x08000000
+    assert load_service_config(tmp_path).model_dump()["auto_start"] is True
+    assert load_service_config(tmp_path).model_dump()["tray_enabled"] is True
+
+
+def test_read_only_paths_do_not_touch_registry_or_spawn(tmp_path: Path, monkeypatch):
+    fake_reg = _FakeRegistry()
+    fake_reg.write_value = lambda *_args, **_kwargs: pytest.fail("read-only path wrote the registry")
+    monkeypatch.setattr(dashboard_service.subprocess, "Popen", _unexpected_popen)
+    monkeypatch.setattr(dashboard_service.subprocess, "run", _unexpected_popen)
+    monkeypatch.setattr(dashboard_service, "set_autostart", _unexpected_popen)
+    monkeypatch.setattr(dashboard_service, "start_tray", _unexpected_popen)
+    monkeypatch.setattr(dashboard_service, "stop_tray", _unexpected_popen)
+    monkeypatch.setattr("agent_bridge.dashboard_server.set_autostart", _unexpected_popen)
+    monkeypatch.setattr("agent_bridge.dashboard_server.start_tray", _unexpected_popen)
+    monkeypatch.setattr("agent_bridge.dashboard_server.stop_tray", _unexpected_popen)
+    monkeypatch.setattr(dashboard_service.psutil, "Process", lambda _pid: pytest.fail("read-only path inspected a PID"))
+    status = dashboard_service.service_status(tmp_path, registry=fake_reg)
+    assert status["config"]["auto_start"] is False and status["config"]["tray_enabled"] is False
+    assert not (tmp_path / "billing" / "dashboard-autostart.vbs").exists()
+
+
+def test_read_only_cli_status_and_version_leave_first_use_uncreated(tmp_path: Path, monkeypatch):
+    from agent_bridge.cli import main
+
+    fake_reg = _FakeRegistry()
+    fake_reg.write_value = lambda *_args, **_kwargs: pytest.fail("read-only CLI wrote the registry")
+    monkeypatch.setenv("AGENT_BRIDGE_HOME", str(tmp_path))
+    monkeypatch.setattr(dashboard_service, "get_autostart_status", lambda *a, **kw: {"occupied": False})
+    monkeypatch.setattr(dashboard_service.subprocess, "Popen", _unexpected_popen)
+    monkeypatch.setattr(dashboard_service.subprocess, "run", _unexpected_popen)
+    main(["dashboard", "status"])
+    assert has_service_config(tmp_path) is False
+    assert not (tmp_path / "billing" / "dashboard-autostart.vbs").exists()
+
+
+@pytest.mark.asyncio
+async def test_mcp_handshake_and_tool_list_leave_first_use_uncreated(tmp_path: Path, monkeypatch):
+    from mcp.client import Client
+
+    from agent_bridge.server import mcp
+
+    monkeypatch.setenv("AGENT_BRIDGE_HOME", str(tmp_path))
+    monkeypatch.setattr(dashboard_service, "set_autostart", lambda *a, **kw: pytest.fail("handshake wrote autostart"))
+    monkeypatch.setattr(dashboard_service.subprocess, "Popen", _unexpected_popen)
+    async with Client(mcp) as client:
+        tools = await client.list_tools()
+    assert tools.tools
+    assert has_service_config(tmp_path) is False
+    assert not (tmp_path / "billing" / "dashboard-autostart.vbs").exists()
+
+
+def test_saved_explicit_false_survives_start_and_reload(tmp_path: Path, monkeypatch):
+    fake_reg, tray_state, _spawned, _registry_writes = _first_use_start_fixture(tmp_path, monkeypatch)
+    save_service_config(ServiceConfig(auto_start=False, tray_enabled=False), tmp_path)
+    result = dashboard_service.start_background_service(tmp_path, with_tray=None)
+    assert result["started"] is True
+    assert tray_state["calls"] == 0
+    assert fake_reg.read_value(AUTOSTART_REG_PATH, AUTOSTART_VALUE_NAME) is None
+    assert load_service_config(tmp_path).auto_start is False
+    assert load_service_config(tmp_path).tray_enabled is False
+    assert not (tmp_path / "billing" / "dashboard-autostart.vbs").exists()
+
+
+def test_saved_tray_true_starts_tray_without_rewriting_autostart(tmp_path: Path, monkeypatch):
+    _fake_reg, tray_state, _spawned, registry_writes = _first_use_start_fixture(tmp_path, monkeypatch)
+    save_service_config(ServiceConfig(auto_start=False, tray_enabled=True), tmp_path)
+    result = dashboard_service.start_background_service(tmp_path)
+    assert result["started"] is True and tray_state["calls"] == 1
+    assert registry_writes == []
+    assert not (tmp_path / "billing" / "dashboard-autostart.vbs").exists()
+
+
+def test_cli_dashboard_start_initializes_first_use_once(tmp_path: Path, monkeypatch):
+    from agent_bridge.cli import main
+
+    seen = []
+    monkeypatch.setenv("AGENT_BRIDGE_HOME", str(tmp_path))
+    monkeypatch.setattr(dashboard_service, "os", _OsNameProxy("nt"))
+    monkeypatch.setattr(dashboard_service, "set_autostart", lambda enabled, home=None, **kw: seen.append(enabled))
+    monkeypatch.setattr(dashboard_service, "start_background_service", lambda **kw: {"message": "ok"})
+    monkeypatch.setattr(dashboard_service, "stop_tray", lambda *a, **kw: {"message": "not called"})
+    monkeypatch.setattr(dashboard_service, "start_tray", lambda *a, **kw: {"message": "tray"})
+    main(["dashboard", "start"])
+    main(["dashboard", "start"])
+    assert seen == [True]
+    assert load_service_config(tmp_path).model_dump()["auto_start"] is True
+
+
+def test_put_service_preserves_unsubmitted_switch_after_first_use(tmp_path: Path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(dashboard_service, "set_autostart", lambda enabled, home=None, **kw: seen.append(enabled))
+    monkeypatch.setattr(dashboard_service, "get_autostart_status", lambda *a, **kw: {"occupied": False})
+    monkeypatch.setattr(dashboard_server, "get_autostart_status", lambda *a, **kw: {"occupied": False})
+    monkeypatch.setattr(dashboard_server, "set_autostart", lambda enabled, home=None, **kw: seen.append(enabled))
+    monkeypatch.setattr(dashboard_server, "start_tray", lambda *a, **kw: {"message": "tray"})
+    monkeypatch.setattr(dashboard_server, "stop_tray", lambda *a, **kw: {"message": "stop"})
+    handler = types.SimpleNamespace(
+        server=types.SimpleNamespace(home=tmp_path, bound_host="127.0.0.1", bound_port=8765, started_monotonic=1),
+        _send_json=lambda value: None,
+    )
+    save_service_config(ServiceConfig(auto_start=True, tray_enabled=True), tmp_path)
+    dashboard_server.DashboardRequestHandler._handle_put_service(handler, {"tray_enabled": False})
+    saved = load_service_config(tmp_path)
+    assert saved.auto_start is True and saved.tray_enabled is False
+    assert seen == []
 
 
 def test_pid_record_lifecycle(tmp_path: Path):
@@ -226,6 +512,82 @@ def test_start_uses_the_recorded_child_identity_and_reuses_it(tmp_path, monkeypa
     monkeypatch.setattr(dashboard_service, "probe_health", lambda *a, **kw: {"ok": True, "pid": 555})
     assert dashboard_service.start_background_service(tmp_path)["running"] is None
     assert len(spawned) == 1
+
+
+def test_tray_start_uses_only_create_no_window_flags(tmp_path: Path, monkeypatch):
+    home = tmp_path / "home"
+    script = tmp_path / "dashboard-tray.ps1"
+    script.write_text("# stub", encoding="utf-8")
+    calls = []
+    tray_state = {"running": False}
+    monkeypatch.setattr(dashboard_service, "os", _OsNameProxy("nt"))
+    monkeypatch.setattr(dashboard_service, "is_tray_running", lambda _home: tray_state["running"])
+    monkeypatch.setattr(dashboard_service, "_powershell_executable", lambda: "powershell.exe")
+    monkeypatch.setattr(dashboard_service, "bundled_tray_script", lambda: script)
+    monkeypatch.setattr(dashboard_service, "resolve_bridge_command", lambda: ("agent-bridge.exe", []))
+
+    def popen(_cmd, **kwargs):
+        calls.append(kwargs)
+        tray_state["running"] = True
+        return types.SimpleNamespace(pid=4567)
+
+    monkeypatch.setattr(dashboard_service.subprocess, "Popen", popen)
+    result = dashboard_service.start_tray(home)
+    assert result == {"ok": True, "supported": True, "running": True, "message": "系统托盘已启动"}
+    assert len(calls) == 1
+    creationflags = calls[0]["creationflags"]
+    assert creationflags == 0x08000000
+    assert not creationflags & 0x00000008
+    assert not creationflags & 0x00000200
+    assert calls[0]["close_fds"] is True
+    assert "start_new_session" not in calls[0]
+
+
+def test_tray_start_does_not_spawn_when_already_running(tmp_path: Path, monkeypatch):
+    script = tmp_path / "dashboard-tray.ps1"
+    script.write_text("# stub", encoding="utf-8")
+    monkeypatch.setattr(dashboard_service, "os", _OsNameProxy("nt"))
+    monkeypatch.setattr(dashboard_service, "is_tray_running", lambda _home: True)
+    monkeypatch.setattr(dashboard_service, "_powershell_executable", lambda: "powershell.exe")
+    monkeypatch.setattr(dashboard_service, "bundled_tray_script", lambda: script)
+    monkeypatch.setattr(dashboard_service.subprocess, "Popen", lambda *a, **kw: pytest.fail("unexpected spawn"))
+    assert dashboard_service.start_tray(tmp_path) == {
+        "ok": True,
+        "supported": True,
+        "running": True,
+        "message": "系统托盘已在运行",
+    }
+
+
+def test_detached_kwargs_keeps_original_flags_for_non_tray_children(monkeypatch):
+    monkeypatch.setattr(dashboard_service, "os", _OsNameProxy("nt"))
+    expected = 0x08000000 | 0x00000008 | 0x00000200
+    assert dashboard_service._detached_kwargs() == {"creationflags": expected, "close_fds": True}
+    monkeypatch.setattr(dashboard_service, "os", _OsNameProxy("posix"))
+    assert dashboard_service._detached_kwargs() == {"start_new_session": True, "close_fds": True}
+
+
+def test_non_tray_launch_paths_still_use_detached_kwargs(tmp_path: Path, monkeypatch):
+    sentinel = {"creationflags": 0x12345678, "close_fds": True}
+    calls = []
+    monkeypatch.setattr(dashboard_service, "_detached_kwargs", lambda: dict(sentinel))
+    monkeypatch.setattr(dashboard_service, "os", _OsNameProxy("nt"))
+    monkeypatch.setattr(dashboard_service, "process_create_time", lambda _pid: 1.0)
+    monkeypatch.setattr(dashboard_service, "resolve_bridge_command", lambda: ("agent-bridge.exe", []))
+    monkeypatch.setattr(dashboard_service, "read_pid_record", lambda _home: None)
+
+    def popen(_cmd, **kwargs):
+        calls.append(kwargs)
+        return types.SimpleNamespace(pid=4567, poll=lambda: 1)
+
+    monkeypatch.setattr(dashboard_service.subprocess, "Popen", popen)
+    dashboard_service.open_billing_folder(tmp_path)
+    dashboard_service._spawn_restart_helper(tmp_path, ("127.0.0.1", 8765), log_path=tmp_path / "dashboard.log")
+    dashboard_service.start_background_service(tmp_path, with_tray=False)
+    assert len(calls) == 3
+    for kwargs in calls:
+        assert kwargs["creationflags"] == sentinel["creationflags"]
+        assert kwargs["close_fds"] is True
 
 
 def test_unrecorded_health_cannot_report_launch_success(tmp_path, monkeypatch):
