@@ -421,7 +421,7 @@
           <div class="section-head">
             <div>
               <h2 class="section-title">服务与系统设置 <span class="badge badge-ok" id="svc-state-badge">检测中</span></h2>
-              <div class="section-sub">管理本地后台看板服务、Windows 系统托盘、用户级开机自启与按需更新（默认均关闭，仅在手动启用后生效）。</div>
+              <div class="section-sub">管理本地后台看板服务、Windows 系统托盘和用户级开机自启。</div>
             </div>
             <div class="inline-actions" id="svc-meta-badges"></div>
           </div>
@@ -443,7 +443,7 @@
                   <input type="checkbox" id="svc-tray" />
                   开启 Windows 系统托盘控件 <span class="badge" id="svc-tray-badge">未运行</span>
                 </label>
-                <div class="muted small-note">托盘支持一键打开面板、启动/停止/重启服务、重启并更新及打开日志目录。</div>
+                <div class="muted small-note">托盘支持一键打开面板、启动/停止/重启服务及打开日志目录。</div>
               </div>
 
               <div class="storage-field" style="max-width:220px">
@@ -456,7 +456,7 @@
             <div class="storage-actions">
               <button type="submit" class="btn btn-primary">保存服务设置</button>
               <button type="button" class="btn btn-ghost" id="btn-svc-restart">重启服务</button>
-              <button type="button" class="btn btn-ghost" id="btn-svc-update">重启并更新</button>
+              <button type="button" class="btn btn-ghost" id="btn-svc-update">更新提示</button>
               <button type="button" class="btn btn-ghost" id="btn-svc-folder">打开日志文件夹</button>
               <button type="button" class="btn btn-danger" id="btn-svc-stop">停止服务</button>
             </div>

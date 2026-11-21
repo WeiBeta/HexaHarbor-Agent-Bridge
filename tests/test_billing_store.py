@@ -4,6 +4,8 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from agent_bridge.billing_pricing import ModelRate, PricingConfig
 from agent_bridge.billing_store import (
     MIN_LEDGER_MAX_BYTES,
@@ -90,6 +92,100 @@ def test_backfill_computes_agy_conversation_delta_and_is_idempotent(tmp_path: Pa
     second = backfill_from_bridge_home(tmp_path)
     assert second["imported"] == 0
     assert second["skipped_existing"] == 2
+
+
+def test_late_turn_repairs_only_affected_cumulative_usage(tmp_path):
+    now = datetime.now(UTC)
+    turns = [
+        {
+            "task_id": f"turn-{turn}",
+            "session_id": "resumed",
+            "agent": "antigravity",
+            "status": "completed",
+            "usage": {
+                "scope": "turn" if turn == 1 else "conversation",
+                "inputTokens": 100 * turn,
+                "cacheReadTokens": 25 * turn,
+            },
+            "created_at": (now + timedelta(seconds=turn)).isoformat(),
+        }
+        for turn in range(1, 5)
+    ]
+    append_receipt_record(tmp_path, {**turns[0], "task_id": "other", "session_id": "other"})
+    unrelated = usage_ledger_path(tmp_path).read_bytes()
+    append_receipt_record(tmp_path, turns[0])
+    append_receipt_record(tmp_path, turns[2])
+    _write_receipt(tmp_path, turns[1])
+    assert backfill_from_bridge_home(tmp_path)["imported"] == 1
+    assert backfill_from_bridge_home(tmp_path)["imported"] == 0
+    append_receipt_record(tmp_path, turns[3])
+    items, corrupt = load_ledger(tmp_path)
+    assert corrupt == 0
+    assert usage_ledger_path(tmp_path).read_bytes().startswith(unrelated)
+    measured = {record.task_id: record.tokens for record in items if record.session_id == "resumed"}
+    assert len(measured) == 4
+    assert all(tokens.uncached_input_tokens == 100 and tokens.cache_read_tokens == 25 for tokens in measured.values())
+
+
+@pytest.mark.parametrize("use_backfill", [False, True])
+def test_append_recovers_an_interrupted_jsonl_tail(tmp_path, use_backfill):
+    now = datetime.now(UTC).isoformat()
+    first = {"task_id": "first", "agent": "codex", "status": "completed", "created_at": now}
+    second = {**first, "task_id": "second"}
+    append_receipt_record(tmp_path, first)
+    path = usage_ledger_path(tmp_path)
+    committed = path.read_bytes()
+    with path.open("ab") as handle:
+        handle.write(b'{"task_id":"interrupted')
+    if use_backfill:
+        _write_receipt(tmp_path, second)
+        assert backfill_from_bridge_home(tmp_path)["imported"] == 1
+        assert backfill_from_bridge_home(tmp_path)["imported"] == 0
+    else:
+        append_receipt_record(tmp_path, second)
+        assert append_receipt_record(tmp_path, second) is None
+    rows, corrupt = load_ledger(tmp_path)
+    assert corrupt == 0
+    assert [row.task_id for row in rows] == ["first", "second"]
+    assert path.read_bytes().startswith(committed)
+
+
+def test_size_retention_keeps_newer_usage_when_old_receipt_arrives_last(tmp_path):
+    now = datetime.now(UTC)
+    save_storage_policy(StoragePolicy(max_bytes=MIN_LEDGER_MAX_BYTES, max_age_days=None), home=tmp_path)
+    for task_id, days in [("middle", 2), ("newest", 1), ("old", 3)]:
+        row = {
+            "task_id": task_id,
+            "agent": "codex",
+            "status": "completed",
+            "title": "a" * 400_000,
+            "created_at": (now - timedelta(days=days)).isoformat(),
+        }
+        if task_id == "old":
+            _write_receipt(tmp_path, row)
+        else:
+            append_receipt_record(tmp_path, row)
+    assert backfill_from_bridge_home(tmp_path)["retention"]["removed_by_size"] == 1
+    rows, corrupt = load_ledger(tmp_path)
+    assert corrupt == 0
+    assert [row.task_id for row in rows] == ["middle", "newest"]
+
+
+@pytest.mark.parametrize("auto_rotate", [False, True])
+def test_age_only_policy_applies_on_append_when_auto_rotate_is_enabled(tmp_path, auto_rotate):
+    now = datetime.now(UTC)
+    save_storage_policy(StoragePolicy(max_bytes=None, max_age_days=10, auto_rotate=auto_rotate), home=tmp_path)
+    old = {
+        "agent": "codex",
+        "status": "completed",
+        "task_id": "old",
+        "created_at": (now - timedelta(days=20)).isoformat(),
+    }
+    append_receipt_record(tmp_path, old, enforce_policy=False)
+    append_receipt_record(tmp_path, {**old, "task_id": "new", "created_at": now.isoformat()})
+    rows, corrupt = load_ledger(tmp_path)
+    assert corrupt == 0
+    assert [row.task_id for row in rows] == (["new"] if auto_rotate else ["old", "new"])
 
 
 def test_retention_by_age_and_size_and_clear(tmp_path: Path):

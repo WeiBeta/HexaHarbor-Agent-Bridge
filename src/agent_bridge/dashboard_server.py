@@ -56,8 +56,11 @@ from agent_bridge.billing_store import (
 )
 from agent_bridge.config import load_config
 from agent_bridge.dashboard_service import (
+    DASHBOARD_LAUNCH_ID_ENV,
+    LOOPBACK_HOSTS,
     ServiceConfig,
     clear_pid_record,
+    dashboard_update_response,
     get_autostart_status,
     is_tray_running,
     load_service_config,
@@ -65,7 +68,6 @@ from agent_bridge.dashboard_service import (
     save_service_config,
     schedule_server_restart,
     schedule_server_stop,
-    schedule_update_and_restart,
     service_status,
     set_autostart,
     start_tray,
@@ -83,7 +85,6 @@ from agent_bridge.paths import (
 
 log = logging.getLogger(__name__)
 
-LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 DEFAULT_DASHBOARD_HOST = "127.0.0.1"
 DEFAULT_DASHBOARD_PORT = 8765
 MAX_REQUEST_BODY_BYTES = 1024 * 1024  # 1 MiB
@@ -106,17 +107,17 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         auto_backfill: bool = True,
     ) -> None:
         host, _port = server_address
-        if host.strip().lower() not in LOOPBACK_HOSTS:
-            raise ValueError(
-                f"dashboard only binds to loopback addresses ({', '.join(sorted(LOOPBACK_HOSTS))}); got {host!r}"
-            )
+        host = host.strip().lower()
+        if host not in LOOPBACK_HOSTS:
+            raise ValueError(f"dashboard requires IPv4 loopback (127.0.0.1 or localhost); got {host!r}")
         self.home = home
         self.csrf_token = csrf_token or secrets.token_urlsafe(24)
+        self.instance_id = os.environ.get(DASHBOARD_LAUNCH_ID_ENV) or secrets.token_urlsafe(24)
         self.started_monotonic = time.monotonic()
         self.auto_backfill = auto_backfill
         self._receipts_watermark: tuple[int, int] = (-1, -1)
         self._backfill_lock = threading.Lock()
-        super().__init__(server_address, DashboardRequestHandler)
+        super().__init__(("127.0.0.1", _port), DashboardRequestHandler)
 
     @property
     def bound_host(self) -> str:
@@ -163,7 +164,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
                 imported = int(result.get("imported", 0))
             except Exception:
                 log.debug("incremental receipts backfill failed", exc_info=True)
-                imported = 0
+                return 0
             self._receipts_watermark = watermark
             return imported
 
@@ -308,10 +309,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         return {
             f"127.0.0.1:{port}",
             f"localhost:{port}",
-            f"[::1]:{port}",
             "127.0.0.1",
             "localhost",
-            "[::1]",
         }
 
     def _check_host(self) -> bool:
@@ -441,6 +440,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     {
                         "ok": True,
                         "pid": os.getpid(),
+                        "instance_id": self.server.instance_id,
                         "host": self.server.bound_host,
                         "port": self.server.bound_port,
                         "uptime_sec": int(max(0.0, time.monotonic() - self.server.started_monotonic)),
@@ -495,8 +495,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 return
 
             if path == "/api/storage/export":
-                lpath = usage_ledger_path(self.server.home)
-                data = lpath.read_bytes() if lpath.is_file() else b""
+                records, _ = load_ledger(self.server.home)
+                data = "".join(record.model_dump_json() + "\n" for record in records).encode("utf-8")
                 self._send_bytes(
                     data,
                     "application/x-ndjson; charset=utf-8",
@@ -586,14 +586,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "status": "stopping", "message": "看板服务正在停止"})
                 return
             if path == "/api/service/update":
-                cfg = load_service_config(self.server.home)
-                result = schedule_update_and_restart(
-                    self.server.home,
-                    self.server,
-                    host=cfg.host,
-                    port=cfg.port,
-                )
-                self._send_json({"ok": True, **result})
+                self._send_json({"ok": True, **dashboard_update_response()})
                 return
             if path == "/api/service/open-folder":
                 result = open_billing_folder(self.server.home)
@@ -808,32 +801,25 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             auto_start=auto_start,
             tray_enabled=tray_enabled,
         )
-        save_service_config(updated, home=self.server.home)
-
         notes: list[str] = []
-        if os.name == "nt":
-            if "auto_start" in body:
-                cur_as = get_autostart_status(self.server.home)
-                need_as_sync = (
-                    updated.auto_start != current.auto_start
-                    or (updated.auto_start and not cur_as.get("matches_current"))
-                    or (not updated.auto_start and bool(cur_as.get("enabled")))
-                )
-                if need_as_sync:
-                    set_autostart(updated.auto_start, home=self.server.home)
-                    notes.append("已开启开机自启" if updated.auto_start else "已关闭开机自启")
-            if "tray_enabled" in body:
-                tray_alive = is_tray_running(self.server.home)
-                if updated.tray_enabled and not tray_alive:
-                    tray_res = start_tray(self.server.home, host=updated.host, port=updated.port)
-                    if tray_res.get("message"):
-                        notes.append(str(tray_res["message"]))
-                elif not updated.tray_enabled and tray_alive:
-                    tray_res = stop_tray(self.server.home)
-                    if tray_res.get("message"):
-                        notes.append(str(tray_res["message"]))
+        if os.name == "nt" and "auto_start" in body:
+            autostart = get_autostart_status(self.server.home)
+            if updated.auto_start != autostart.get("enabled") or updated.auto_start != current.auto_start:
+                set_autostart(updated.auto_start, home=self.server.home)
+                notes.append("已开启开机自启" if updated.auto_start else "已关闭开机自启")
+        save_service_config(updated, home=self.server.home)
+        if os.name == "nt" and "tray_enabled" in body:
+            tray_alive = is_tray_running(self.server.home)
+            if updated.tray_enabled and not tray_alive:
+                tray_res = start_tray(self.server.home, host=updated.host, port=updated.port)
+                if tray_res.get("message"):
+                    notes.append(str(tray_res["message"]))
+            elif not updated.tray_enabled and tray_alive:
+                tray_res = stop_tray(self.server.home)
+                if tray_res.get("message"):
+                    notes.append(str(tray_res["message"]))
 
-        port_changed = updated.port != self.server.bound_port or updated.host != self.server.bound_host
+        port_changed = updated.port != self.server.bound_port
         if port_changed:
             notes.append(f"端口已保存为 {updated.port}，点击「重启服务」后生效")  # noqa: RUF001
 
@@ -861,12 +847,13 @@ def create_dashboard_server(
     backfill: bool = True,
 ) -> DashboardHTTPServer:
     resolved = home or bridge_home()
+    server = DashboardHTTPServer((host, port), home=resolved, auto_backfill=backfill)
     if backfill:
         try:
             backfill_from_bridge_home(resolved)
         except Exception:
             log.warning("initial billing backfill failed", exc_info=True)
-    return DashboardHTTPServer((host, port), home=resolved, auto_backfill=backfill)
+    return server
 
 
 def run_dashboard(
@@ -881,7 +868,9 @@ def run_dashboard(
     eff_host = host or cfg.host
     eff_port = cfg.port if port is None else port
     server = create_dashboard_server(home=resolved, host=eff_host, port=eff_port, backfill=True)
-    write_pid_record(resolved, host=server.bound_host, port=server.bound_port)
+    pid_record = write_pid_record(
+        resolved, host=server.bound_host, port=server.bound_port, instance_id=server.instance_id
+    )
     url = server.url
     print(f"HexaHarbor Agent Bridge billing dashboard listening on {url}", flush=True)
     print("Press Ctrl+C to stop.", flush=True)
@@ -896,4 +885,4 @@ def run_dashboard(
         pass
     finally:
         server.server_close()
-        clear_pid_record(resolved, expected_pid=os.getpid())
+        clear_pid_record(resolved, expected_record=pid_record)

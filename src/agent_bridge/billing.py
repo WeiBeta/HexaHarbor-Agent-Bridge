@@ -10,7 +10,7 @@ from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from agent_bridge.billing_pricing import (
     DEFAULT_MODEL_BUCKET,
@@ -22,9 +22,42 @@ from agent_bridge.billing_pricing import (
 
 UsageScope = Literal["turn", "conversation", "unknown"]
 
-_MAX_ERROR_CHARS = 500
-_MAX_WARNING_CHARS = 300
 _MAX_WARNINGS = 10
+_INPUT_KEYS = ("input_tokens", "inputTokens", "prompt_tokens", "promptTokens")
+_OUTPUT_KEYS = ("output_tokens", "outputTokens", "completion_tokens", "completionTokens")
+_TOTAL_KEYS = ("total_tokens", "totalTokens")
+_REASONING_KEYS = (
+    "thinking_tokens",
+    "thinkingTokens",
+    "reasoning_output_tokens",
+    "reasoningOutputTokens",
+    "reasoning_tokens",
+    "reasoningTokens",
+)
+_AGY_CACHE_KEYS = ("cache_read_tokens", "cacheReadTokens")
+_OPENAI_CACHE_KEYS = ("cached_input_tokens", "cachedInputTokens", "cached_tokens")
+_ANTHROPIC_CACHE_KEYS = ("cache_read_input_tokens", "cacheReadInputTokens")
+_CACHE_WRITE_KEYS = (
+    "cache_write_input_tokens",
+    "cacheWriteInputTokens",
+    "cache_creation_input_tokens",
+    "cacheCreationInputTokens",
+    "cache_write_tokens",
+    "cacheWriteTokens",
+)
+_USAGE_COUNT_KEYS = (
+    *_INPUT_KEYS,
+    *_OUTPUT_KEYS,
+    *_TOTAL_KEYS,
+    *_REASONING_KEYS,
+    *_AGY_CACHE_KEYS,
+    *_OPENAI_CACHE_KEYS,
+    *_ANTHROPIC_CACHE_KEYS,
+    *_CACHE_WRITE_KEYS,
+)
+_STOP_REASONS = frozenset(
+    {"end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled", "error", "stalled", "timed_out"}
+)
 
 
 def _nonneg_int(value: Any) -> int | None:
@@ -44,6 +77,18 @@ def _pick_int(raw: dict[str, Any], *keys: str) -> int | None:
             if parsed is not None:
                 return parsed
     return None
+
+
+def _metering_usage(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    counters: dict[str, Any] = {
+        key: count for key in _USAGE_COUNT_KEYS if (count := _nonneg_int(raw.get(key))) is not None
+    }
+    scope = raw.get("scope")
+    if isinstance(scope, str) and (scope := scope.strip().lower()) in {"turn", "conversation", "unknown"}:
+        counters["scope"] = scope
+    return counters
 
 
 def _parse_iso(ts: str | None) -> datetime | None:
@@ -84,7 +129,7 @@ class NormalizedTokens(BaseModel):
 
 
 class LedgerRecord(BaseModel):
-    """One append-only billing record for a terminal Bridge task (metadata only)."""
+    """One metering record for a terminal Bridge task."""
 
     schema_version: int = 1
     task_id: str
@@ -112,6 +157,30 @@ class LedgerRecord(BaseModel):
     usage_scope: UsageScope = "unknown"
     usage_raw: dict[str, Any] = Field(default_factory=dict)
     tokens: NormalizedTokens = Field(default_factory=NormalizedTokens)
+
+    @field_validator("usage_raw", mode="before")
+    @classmethod
+    def _project_usage(cls, value: Any) -> dict[str, Any]:
+        return _metering_usage(value)
+
+    @field_validator("error", mode="before")
+    @classmethod
+    def _error_marker(cls, value: Any) -> str | None:
+        return "recorded_in_receipt" if isinstance(value, str) and value.strip() else None
+
+    @field_validator("warnings", mode="before")
+    @classmethod
+    def _warning_markers(cls, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [
+            "recorded_in_receipt" for warning in value[:_MAX_WARNINGS] if isinstance(warning, str) and warning.strip()
+        ]
+
+    @field_validator("stop_reason", mode="before")
+    @classmethod
+    def _stop_code(cls, value: Any) -> str | None:
+        return value if isinstance(value, str) and value in _STOP_REASONS else None
 
 
 class CostBreakdown(BaseModel):
@@ -155,33 +224,16 @@ def _extract_raw_snapshot(agent: str, usage_raw: dict[str, Any]) -> NormalizedTo
         return NormalizedTokens(measured=False)
 
     agent_l = agent.strip().lower()
-    raw_input = _pick_int(usage_raw, "input_tokens", "inputTokens", "prompt_tokens", "promptTokens")
-    raw_output = _pick_int(usage_raw, "output_tokens", "outputTokens", "completion_tokens", "completionTokens")
-    raw_total = _pick_int(usage_raw, "total_tokens", "totalTokens")
-    reasoning = _pick_int(
-        usage_raw,
-        "thinking_tokens",
-        "thinkingTokens",
-        "reasoning_output_tokens",
-        "reasoningOutputTokens",
-        "reasoning_tokens",
-        "reasoningTokens",
-    )
+    raw_input = _pick_int(usage_raw, *_INPUT_KEYS)
+    raw_output = _pick_int(usage_raw, *_OUTPUT_KEYS)
+    raw_total = _pick_int(usage_raw, *_TOTAL_KEYS)
+    reasoning = _pick_int(usage_raw, *_REASONING_KEYS)
 
     # Cache keys by schema family
-    agy_cache_read = _pick_int(usage_raw, "cache_read_tokens", "cacheReadTokens")
-    openai_cache_read = _pick_int(usage_raw, "cached_input_tokens", "cachedInputTokens", "cached_tokens")
-    anth_cache_read = _pick_int(usage_raw, "cache_read_input_tokens", "cacheReadInputTokens")
-
-    cache_write = _pick_int(
-        usage_raw,
-        "cache_write_input_tokens",
-        "cacheWriteInputTokens",
-        "cache_creation_input_tokens",
-        "cacheCreationInputTokens",
-        "cache_write_tokens",
-        "cacheWriteTokens",
-    )
+    agy_cache_read = _pick_int(usage_raw, *_AGY_CACHE_KEYS)
+    openai_cache_read = _pick_int(usage_raw, *_OPENAI_CACHE_KEYS)
+    anth_cache_read = _pick_int(usage_raw, *_ANTHROPIC_CACHE_KEYS)
+    cache_write = _pick_int(usage_raw, *_CACHE_WRITE_KEYS)
 
     if raw_input is None and raw_output is None and raw_total is None and agy_cache_read is None and openai_cache_read is None and anth_cache_read is None:
         return NormalizedTokens(measured=False)
@@ -356,19 +408,9 @@ def build_ledger_record(
         else None
     )
 
-    raw_usage = payload.get("usage")
-    usage_dict: dict[str, Any] = dict(raw_usage) if isinstance(raw_usage, dict) else {}
+    usage_dict = _metering_usage(payload.get("usage"))
     scope, tokens, next_cum = normalize_usage(agent, usage_dict, previous_cumulative=previous_cumulative)
-
-    raw_error = payload.get("error")
-    error_text = str(raw_error)[:_MAX_ERROR_CHARS] if isinstance(raw_error, str) and raw_error.strip() else None
-
     raw_warnings = payload.get("warnings")
-    warnings: list[str] = []
-    if isinstance(raw_warnings, list):
-        for item in raw_warnings[:_MAX_WARNINGS]:
-            if isinstance(item, str) and item.strip():
-                warnings.append(item[:_MAX_WARNING_CHARS])
 
     started_at = payload.get("started_at") if isinstance(payload.get("started_at"), str) else None
     finished_at = payload.get("finished_at") if isinstance(payload.get("finished_at"), str) else None
@@ -407,8 +449,8 @@ def build_ledger_record(
         observed_permission_mode=observed_pm,
         status=str(payload.get("status") or "completed"),
         stop_reason=str(payload["stop_reason"]) if isinstance(payload.get("stop_reason"), str) else None,
-        error=error_text,
-        warnings=warnings,
+        error=payload.get("error"),
+        warnings=raw_warnings if isinstance(raw_warnings, list) else [],
         files_changed_total=files_changed_total,
         files_outside_cwd_total=files_outside_total,
         created_at=created_at,

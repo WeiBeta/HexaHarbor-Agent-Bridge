@@ -221,7 +221,7 @@ $itemOpen.Font = New-Object System.Drawing.Font($itemOpen.Font, [System.Drawing.
 $itemStart = New-Object System.Windows.Forms.ToolStripMenuItem("启动服务")
 $itemStop = New-Object System.Windows.Forms.ToolStripMenuItem("停止服务")
 $itemRestart = New-Object System.Windows.Forms.ToolStripMenuItem("重启服务")
-$itemUpdate = New-Object System.Windows.Forms.ToolStripMenuItem("重启并更新")
+$itemUpdate = New-Object System.Windows.Forms.ToolStripMenuItem("更新提示")
 $sep1 = New-Object System.Windows.Forms.ToolStripSeparator
 $itemStatus = New-Object System.Windows.Forms.ToolStripMenuItem("服务: 检测中...")
 $itemStatus.Enabled = $false
@@ -282,26 +282,12 @@ $itemRestart.Add_Click({
 })
 
 $itemUpdate.Add_Click({
-  $res = Invoke-BridgeSubcommand @("dashboard", "update", "--json") -CaptureOutput
-  $msg = "更新检查已完成"
-  $boxIcon = [System.Windows.Forms.MessageBoxIcon]::Information
-  try {
-    $parsed = $res.Output | ConvertFrom-Json
-    if ($parsed.message) { $msg = [string]$parsed.message }
-    if ($parsed.status -eq "blocked" -or $parsed.status -eq "error") {
-      $boxIcon = [System.Windows.Forms.MessageBoxIcon]::Warning
-    }
-  } catch {
-    if ($res.Output) { $msg = $res.Output.Substring(0, [Math]::Min(240, $res.Output.Length)) }
-    $boxIcon = [System.Windows.Forms.MessageBoxIcon]::Warning
-  }
   [void][System.Windows.Forms.MessageBox]::Show(
-    $msg,
+    "最新，别搞",
     "六库仙贼/HexaHarbor 看板",
     [System.Windows.Forms.MessageBoxButtons]::OK,
-    $boxIcon
+    [System.Windows.Forms.MessageBoxIcon]::Information
   )
-  Refresh-TrayStatus
 })
 
 $itemFolder.Add_Click({

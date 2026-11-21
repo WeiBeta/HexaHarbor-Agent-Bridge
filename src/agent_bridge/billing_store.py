@@ -1,4 +1,4 @@
-"""Independent append-only billing ledger, pricing store, and disk retention.
+"""Independent billing ledger, pricing store, and disk retention.
 
 Inspired by ``@bitkyc08/opencodex``'s ``usage.jsonl`` ledger & retention model
 (MIT License): rows are stored independently of ``state.json`` / ``receipts/``
@@ -13,7 +13,10 @@ import json
 import logging
 import os
 import uuid
+from collections import defaultdict
+from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +26,9 @@ from agent_bridge.billing import (
     LedgerRecord,
     NormalizedTokens,
     _extract_raw_snapshot,
+    _parse_iso,
     build_ledger_record,
+    normalize_usage,
     record_timestamp,
 )
 from agent_bridge.billing_pricing import PricingConfig, default_pricing_config
@@ -38,6 +43,7 @@ from agent_bridge.paths import (
 from agent_bridge.persist import atomic_write_json, file_lock, read_json
 
 log = logging.getLogger(__name__)
+EARLIEST_TIMESTAMP = datetime.min.replace(tzinfo=UTC)
 
 MIN_LEDGER_MAX_BYTES = 1024 * 1024  # 1 MiB minimum ceiling
 DEFAULT_LEDGER_MAX_BYTES = 100 * 1024 * 1024  # 100 MiB default ceiling
@@ -184,21 +190,85 @@ def load_ledger(home: Path | None = None) -> tuple[list[LedgerRecord], int]:
     return records, corrupt
 
 
-def _last_cumulative_by_session(records: list[LedgerRecord]) -> dict[str, NormalizedTokens]:
-    """Reconstruct the latest raw cumulative snapshot per Antigravity session."""
-    latest: dict[str, NormalizedTokens] = {}
-    for rec in records:
-        if rec.agent.strip().lower() != "antigravity" or not rec.session_id:
-            continue
-        snap = _extract_raw_snapshot(rec.agent, rec.usage_raw)
-        if snap.measured:
-            latest[rec.session_id] = snap
-    return latest
+def _turn_order(record: LedgerRecord) -> tuple[datetime, str]:
+    start = _parse_iso(record.created_at) or _parse_iso(record.started_at) or _parse_iso(record.finished_at)
+    return start or EARLIEST_TIMESTAMP, record.task_id
+
+
+def _reconcile_cumulative_usage(existing: list[LedgerRecord], additions: list[LedgerRecord]) -> dict[str, LedgerRecord]:
+    """Apply measured turns in session order and update the known deltas they change."""
+    new_ids = {record.task_id for record in additions}
+    affected = {
+        record.session_id
+        for record in additions
+        if record.agent.strip().lower() == "antigravity" and record.session_id and record.tokens.measured
+    }
+    sessions: dict[str, list[LedgerRecord]] = defaultdict(list)
+    for record in chain(existing, additions):
+        if record.session_id in affected and record.agent.strip().lower() == "antigravity":
+            sessions[record.session_id].append(record)
+
+    corrections: dict[str, LedgerRecord] = {}
+    for records in sessions.values():
+        previous: NormalizedTokens | None = None
+        previous_on_disk: NormalizedTokens | None = None
+        previous_is_new = False
+        for record in sorted(records, key=_turn_order):
+            snapshot = _extract_raw_snapshot(record.agent, record.usage_raw)
+            if not snapshot.measured:
+                continue
+            is_new = record.task_id in new_ids
+            if is_new or previous_is_new:
+                _, updated, _ = normalize_usage(record.agent, record.usage_raw, previous_cumulative=previous)
+                if is_new:
+                    record.tokens = updated
+                elif record.tokens != updated:
+                    _, old, _ = normalize_usage(record.agent, record.usage_raw, previous_cumulative=previous_on_disk)
+                    # Retention may have removed the baseline for an already measured row.
+                    # Preserve that delta when the surviving rows cannot account for it.
+                    if record.tokens == old:
+                        corrections[record.task_id] = record.model_copy(update={"tokens": updated})
+            previous = snapshot
+            previous_is_new = is_new
+            if not is_new:
+                previous_on_disk = snapshot
+    return corrections
 
 
 def _encode_record(record: LedgerRecord) -> bytes:
     line = json.dumps(record.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":"))
     return (line + "\n").encode("utf-8")
+
+
+def _append_records_locked(path: Path, existing: list[LedgerRecord], additions: list[LedgerRecord]) -> None:
+    corrections = _reconcile_cumulative_usage(existing, additions)
+    appended = b"".join(_encode_record(record) for record in additions)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if corrections:
+        lines = _read_raw_lines(path)
+        for index, line in enumerate(lines):
+            try:
+                payload = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            task_id = payload.get("task_id") if isinstance(payload, dict) else None
+            if isinstance(task_id, str) and task_id in corrections:
+                lines[index] = _encode_record(corrections[task_id])
+        # Publish the late turn and its changed successor deltas together.
+        _atomic_write_bytes(path, b"".join(lines) + appended)
+        return
+
+    with path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell():
+            handle.seek(-1, os.SEEK_END)
+            if handle.read(1) != b"\n":
+                # Readers already ignore an interrupted append's unfinished line.
+                # Drop that suffix before it can consume the next committed record.
+                handle.seek(0)
+                handle.truncate(handle.read().rfind(b"\n") + 1)
+        handle.write(appended)
+        handle.flush()
 
 
 def _enforce_retention_locked(
@@ -234,52 +304,43 @@ def _enforce_retention_locked(
     if current_time.tzinfo is None:
         current_time = current_time.replace(tzinfo=UTC)
 
-    removed_by_age = 0
-    kept_after_age: list[bytes] = []
-    if policy.max_age_days is not None:
-        cutoff = current_time - timedelta(days=policy.max_age_days)
-        for raw_line in lines:
-            try:
-                rec = LedgerRecord.model_validate(json.loads(raw_line.decode("utf-8")))
-                ts = record_timestamp(rec)
-            except Exception:
-                # Preserve unreadable lines? Drop only clearly expired valid rows; keep unparseable
-                # out of age eviction unless size limit removes them.
-                kept_after_age.append(raw_line)
-                continue
-            if ts is not None and ts < cutoff:
-                removed_by_age += 1
-            else:
-                kept_after_age.append(raw_line)
-    else:
-        kept_after_age = list(lines)
+    cutoff = current_time - timedelta(days=policy.max_age_days) if policy.max_age_days is not None else None
+    kept: list[tuple[bytes, datetime | None]] = []
+    for raw_line in lines:
+        try:
+            ts = record_timestamp(LedgerRecord.model_validate(json.loads(raw_line.decode("utf-8"))))
+        except ValueError:
+            ts = None
+        if cutoff is None or ts is None or ts >= cutoff:
+            kept.append((raw_line, ts))
 
-    removed_by_size = 0
-    kept = kept_after_age
-    size_after_age = sum(len(line) for line in kept)
-    if policy.max_bytes is not None and size_after_age > policy.max_bytes and len(kept) > 1:
+    removed_by_age = len(lines) - len(kept)
+    dropped_for_size: set[int] = set()
+    remaining_bytes = sum(len(line) for line, _ in kept)
+    if policy.max_bytes is not None and remaining_bytes > policy.max_bytes and len(kept) > 1:
         target = max(1, int(policy.max_bytes * RETENTION_TARGET_RATIO))
-        running = size_after_age
-        drop_idx = 0
-        # Trim oldest whole rows until remaining size <= target, preserving at least 1 newest row.
-        while drop_idx < len(kept) - 1 and running > target:
-            running -= len(kept[drop_idx])
-            drop_idx += 1
-        if drop_idx > 0:
-            removed_by_size = drop_idx
-            kept = kept[drop_idx:]
+        # Backfill can append an old turn after newer rows. Evict by record
+        # time and keep file order for the surviving rows and equal times.
+        by_age = sorted(range(len(kept)), key=lambda index: kept[index][1] or EARLIEST_TIMESTAMP)
+        for index in by_age[:-1]:
+            if remaining_bytes <= target:
+                break
+            dropped_for_size.add(index)
+            remaining_bytes -= len(kept[index][0])
 
-    remaining_bytes = sum(len(line) for line in kept)
-    changed = (removed_by_age > 0) or (removed_by_size > 0)
+    removed_by_size = len(dropped_for_size)
+    changed = bool(removed_by_age or removed_by_size)
     if changed:
-        _atomic_write_bytes(path, b"".join(kept))
+        _atomic_write_bytes(
+            path, b"".join(line for index, (line, _) in enumerate(kept) if index not in dropped_for_size)
+        )
 
     return {
         "changed": changed,
         "removed_by_age": removed_by_age,
         "removed_by_size": removed_by_size,
         "removed_bytes": max(0, original_bytes - remaining_bytes),
-        "remaining_records": len(kept),
+        "remaining_records": len(kept) - removed_by_size,
         "remaining_bytes": remaining_bytes,
     }
 
@@ -294,6 +355,17 @@ def enforce_retention(
     active_policy = policy or load_storage_policy(resolved)
     with file_lock(_ledger_lock(resolved), timeout_sec=LOCK_TIMEOUT_SEC):
         return _enforce_retention_locked(resolved, active_policy, now=now)
+
+
+def _retention_due(path: Path, policy: StoragePolicy, records: Iterable[LedgerRecord]) -> bool:
+    if not policy.auto_rotate:
+        return False
+    if policy.max_bytes is not None and path.stat().st_size > policy.max_bytes:
+        return True
+    if policy.max_age_days is None:
+        return False
+    cutoff = datetime.now(UTC) - timedelta(days=policy.max_age_days)
+    return any((ts := record_timestamp(record)) is not None and ts < cutoff for record in records)
 
 
 def append_receipt_record(
@@ -315,25 +387,17 @@ def append_receipt_record(
         existing, _ = load_ledger(home)
         if any(rec.task_id == task_id for rec in existing):
             return None
-        cum_map = _last_cumulative_by_session(existing)
-        session_id = str(payload.get("session_id") or "")
-        prev_cum = cum_map.get(session_id)
-        record, _ = build_ledger_record(payload, previous_cumulative=prev_cum)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("ab") as handle:
-            handle.write(_encode_record(record))
-            handle.flush()
+        record, _ = build_ledger_record(payload)
+        _append_records_locked(path, existing, [record])
         if enforce_policy:
             policy = load_storage_policy(home)
-            if policy.auto_rotate:
-                current_size = path.stat().st_size if path.is_file() else 0
-                if policy.max_bytes is not None and current_size > policy.max_bytes:
-                    _enforce_retention_locked(home, policy)
+            if _retention_due(path, policy, chain(existing, [record])):
+                _enforce_retention_locked(home, policy)
     return record
 
 
 def record_receipt_to_ledger(home: Path, payload: dict[str, Any]) -> None:
-    """Fail-open wrapper called by ``Registry._persist_receipt``."""
+    """Fail-open wrapper used by the Registry's background ledger writer."""
     try:
         append_receipt_record(home, payload, enforce_policy=True)
     except Exception:
@@ -345,7 +409,7 @@ def record_receipt_to_ledger(home: Path, payload: dict[str, Any]) -> None:
 
 
 def _collect_bridge_candidates(home: Path) -> list[dict[str, Any]]:
-    """Collect terminal task metadata from ``receipts/*.json`` and ``state.json`` without reading bodies."""
+    """Select terminal task metadata while parsing receipt and state JSON."""
     by_id: dict[str, dict[str, Any]] = {}
 
     # 1. Load terminal rows from state.json as fallback
@@ -442,35 +506,26 @@ def backfill_from_bridge_home(home: Path | None = None) -> dict[str, Any]:
     with file_lock(_ledger_lock(resolved), timeout_sec=LOCK_TIMEOUT_SEC):
         existing, _ = load_ledger(resolved)
         known_ids = {rec.task_id for rec in existing}
-        cum_map = _last_cumulative_by_session(existing)
 
-        to_write: list[bytes] = []
-        imported = 0
+        additions: list[LedgerRecord] = []
         for item in candidates:
             tid = str(item.get("task_id") or "")
             if not tid or tid in known_ids:
                 continue
-            sid = str(item.get("session_id") or "")
-            rec, next_cum = build_ledger_record(item, previous_cumulative=cum_map.get(sid))
-            if next_cum is not None and sid:
-                cum_map[sid] = next_cum
-            to_write.append(_encode_record(rec))
+            record, _ = build_ledger_record(item)
+            additions.append(record)
             known_ids.add(tid)
-            imported += 1
 
-        if to_write:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("ab") as handle:
-                handle.write(b"".join(to_write))
-                handle.flush()
+        if additions:
+            _append_records_locked(path, existing, additions)
 
         policy = load_storage_policy(resolved)
-        retention = _enforce_retention_locked(resolved, policy) if (to_write and policy.auto_rotate) else None
+        retention = _enforce_retention_locked(resolved, policy) if (additions and policy.auto_rotate) else None
 
     return {
         "scanned": len(candidates),
-        "imported": imported,
-        "skipped_existing": len(candidates) - imported,
+        "imported": len(additions),
+        "skipped_existing": len(candidates) - len(additions),
         "retention": retention,
     }
 

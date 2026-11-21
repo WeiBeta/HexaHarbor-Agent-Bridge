@@ -1,4 +1,4 @@
-"""Background daemon lifecycle, Windows autostart, system tray, and on-demand update.
+"""Background daemon lifecycle, Windows autostart, and system tray.
 
 Zero extra third-party dependencies:
 - Background process management uses stdlib ``subprocess`` + existing ``psutil``.
@@ -21,16 +21,15 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
 from datetime import UTC, datetime
-from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 from typing import Any, Protocol
+from uuid import uuid4
 
 import psutil
 from pydantic import BaseModel, Field, field_validator
 
-from agent_bridge.cli import GIT_SOURCE, PACKAGE, checkout_root, detect_install
+from agent_bridge.cli import detect_install
 from agent_bridge.paths import (
     billing_dir,
     bridge_home,
@@ -40,11 +39,12 @@ from agent_bridge.paths import (
     service_config_path,
 )
 from agent_bridge.persist import atomic_write_json, atomic_write_text, file_lock, read_json
-from agent_bridge.processes import count_sibling_servers, process_create_time
+from agent_bridge.processes import process_create_time
 
 log = logging.getLogger(__name__)
 
-LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
+DASHBOARD_LAUNCH_ID_ENV = "AGENT_BRIDGE_DASHBOARD_LAUNCH_ID"
 DEFAULT_SERVICE_HOST = "127.0.0.1"
 DEFAULT_SERVICE_PORT = 8765
 AUTOSTART_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -66,7 +66,7 @@ class ServiceConfig(BaseModel):
     def _validate_loopback(cls, v: str) -> str:
         cleaned = v.strip().lower()
         if cleaned not in LOOPBACK_HOSTS:
-            raise ValueError(f"host must be a loopback address ({', '.join(sorted(LOOPBACK_HOSTS))}); got {v!r}")
+            raise ValueError(f"dashboard requires IPv4 loopback (127.0.0.1 or localhost); got {v!r}")
         return cleaned
 
 
@@ -78,6 +78,7 @@ class DashboardPidRecord(BaseModel):
     started_at: str = ""
     executable: str = ""
     install_kind: str = "unknown"
+    instance_id: str | None = None
 
 
 class RegistryBackend(Protocol):
@@ -159,6 +160,7 @@ def write_pid_record(
     host: str,
     port: int,
     pid: int | None = None,
+    instance_id: str | None = None,
 ) -> DashboardPidRecord:
     actual_pid = os.getpid() if pid is None else pid
     exe, _prefix = resolve_bridge_command()
@@ -170,6 +172,7 @@ def write_pid_record(
         started_at=datetime.now(UTC).isoformat(),
         executable=exe,
         install_kind=detect_install(),
+        instance_id=instance_id,
     )
     atomic_write_json(dashboard_pid_path(home), record.model_dump(mode="json"))
     return record
@@ -189,32 +192,54 @@ def read_pid_record(home: Path | None = None) -> DashboardPidRecord | None:
         return None
 
 
-def clear_pid_record(home: Path | None = None, *, expected_pid: int | None = None) -> None:
+def clear_pid_record(
+    home: Path | None = None,
+    *,
+    expected_pid: int | None = None,
+    expected_record: DashboardPidRecord | None = None,
+) -> None:
     resolved = home or bridge_home()
     path = dashboard_pid_path(resolved)
     if not path.is_file():
         return
-    if expected_pid is not None:
+    if expected_record is not None:
+        if read_pid_record(resolved) != expected_record:
+            return
+    elif expected_pid is not None:
         existing = read_pid_record(resolved)
-        if existing is not None and existing.pid != expected_pid:
+        if existing is None or existing.pid != expected_pid:
             return
     with contextlib.suppress(OSError):
         path.unlink(missing_ok=True)
 
 
-def is_pid_record_alive(record: DashboardPidRecord | None) -> bool:
-    if record is None or record.pid <= 0:
-        return False
+def _tracked_record(home: Path) -> DashboardPidRecord | None:
+    record = read_pid_record(home)
+    if record is None and dashboard_pid_path(home).exists():
+        raise ValueError("看板 PID 记录无法读取。请检查服务状态。")
+    return record
+
+
+def _recorded_process(record: DashboardPidRecord | None) -> psutil.Process | None:
+    if record is None:
+        return None
+    if record.pid <= 0:
+        raise ValueError("看板 PID 记录无效")
     try:
         proc = psutil.Process(record.pid)
         if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
-            return False
-        if record.create_time is not None:
-            actual_ct = proc.create_time()
-            if abs(actual_ct - record.create_time) > 2.0:
-                return False
-        return True
-    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return None
+        if record.create_time is None:
+            raise ValueError("看板 PID 记录缺少创建时间")
+        return proc if proc.create_time() == record.create_time else None
+    except psutil.NoSuchProcess:
+        return None
+
+
+def is_pid_record_alive(record: DashboardPidRecord | None) -> bool:
+    try:
+        return _recorded_process(record) is not None
+    except (psutil.Error, OSError, ValueError):
         return False
 
 
@@ -232,6 +257,20 @@ def probe_health(host: str, port: int, *, timeout_sec: float = 1.0) -> dict[str,
             conn.close()
     except Exception:
         return None
+
+
+def _health_matches(record: DashboardPidRecord, *, timeout_sec: float = 1.0) -> bool:
+    if record.host not in LOOPBACK_HOSTS:
+        return False
+    health = probe_health(record.host, record.port, timeout_sec=timeout_sec)
+    return bool(
+        health
+        and health.get("ok") is True
+        and health.get("pid") == record.pid
+        and health.get("host") == record.host
+        and health.get("port") == record.port
+        and (record.instance_id is None or health.get("instance_id") == record.instance_id)
+    )
 
 
 def _tray_pid_path(home: Path) -> Path:
@@ -427,12 +466,14 @@ def get_autostart_status(
     backend = registry or _WinRegBackend()
     existing = backend.read_value(AUTOSTART_REG_PATH, AUTOSTART_VALUE_NAME)
     _vbs_path, _vbs, expected_cmd = build_autostart_command(resolved)
+    matches = bool(existing and existing.strip().casefold() == expected_cmd.casefold())
     return {
         "supported": True,
-        "enabled": bool(existing),
-        "command": existing,
+        "enabled": matches,
+        "command": existing if matches else None,
         "expected_command": expected_cmd,
-        "matches_current": bool(existing and existing.strip().lower() == expected_cmd.strip().lower()),
+        "matches_current": matches,
+        "occupied": bool(existing and not matches),
     }
 
 
@@ -449,10 +490,13 @@ def set_autostart(
     resolved = home or bridge_home()
     backend = registry or _WinRegBackend()
     vbs_path, vbs_content, reg_cmd = build_autostart_command(resolved)
+    current = get_autostart_status(resolved, platform_is_windows=is_win, registry=backend)
     if enabled:
+        if current["occupied"]:
+            raise ValueError("开机自启已被另一个工作目录占用")
         atomic_write_text(vbs_path, vbs_content)
         backend.write_value(AUTOSTART_REG_PATH, AUTOSTART_VALUE_NAME, reg_cmd)
-    else:
+    elif current["matches_current"]:
         backend.delete_value(AUTOSTART_REG_PATH, AUTOSTART_VALUE_NAME)
         with contextlib.suppress(OSError):
             vbs_path.unlink(missing_ok=True)
@@ -466,19 +510,20 @@ def start_background_service(
     port: int | None = None,
     open_browser: bool = False,
     with_tray: bool | None = None,
+    command: tuple[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     resolved = home or bridge_home()
     cfg = load_service_config(resolved)
     eff_host = (host or cfg.host).strip().lower()
     if eff_host not in LOOPBACK_HOSTS:
-        raise ValueError(f"host must be loopback; got {eff_host!r}")
+        raise ValueError(f"dashboard requires IPv4 loopback (127.0.0.1 or localhost); got {eff_host!r}")
     eff_port = cfg.port if port is None else int(port)
 
-    # Already alive? Reuse cleanly.
-    existing = read_pid_record(resolved)
-    if is_pid_record_alive(existing) and existing is not None:
-        health = probe_health(existing.host, existing.port)
-        if health is not None:
+    try:
+        existing = _tracked_record(resolved)
+        if existing is not None and _recorded_process(existing) is not None:
+            if not _health_matches(existing):
+                return {"started": False, "running": None, "message": "无法确认已记录看板的健康响应。已保留进程记录。"}
             want_tray = cfg.tray_enabled if with_tray is None else with_tray
             if want_tray and os.name == "nt":
                 start_tray(resolved, host=existing.host, port=existing.port)
@@ -489,8 +534,10 @@ def start_background_service(
                 "url": f"http://{existing.host}:{existing.port}",
                 "message": "看板服务已在运行",
             }
+    except (psutil.Error, OSError, ValueError) as exc:
+        return {"started": False, "running": None, "message": f"无法核实已记录看板进程 ({type(exc).__name__})"}
 
-    exe, prefix = resolve_bridge_command()
+    exe, prefix = command or resolve_bridge_command()
     cmd = [
         exe,
         *prefix,
@@ -504,70 +551,95 @@ def start_background_service(
     ]
     env = os.environ.copy()
     env["AGENT_BRIDGE_HOME"] = str(resolved)
+    launch_id = uuid4().hex
+    env[DASHBOARD_LAUNCH_ID_ENV] = launch_id
     log_file = dashboard_log_path(resolved)
     log_file.parent.mkdir(parents=True, exist_ok=True)
-    with log_file.open("ab") as sink:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=sink,
-            stderr=sink,
-            env=env,
-            **_detached_kwargs(),
-        )
+    try:
+        with log_file.open("ab") as sink:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=sink,
+                stderr=sink,
+                env=env,
+                **_detached_kwargs(),
+            )
+    except OSError as exc:
+        return {"started": False, "running": False, "message": f"无法启动看板命令 ({type(exc).__name__})"}
 
     url = f"http://{eff_host}:{eff_port}"
     deadline = time.monotonic() + 6.0
-    healthy = False
+    started: DashboardPidRecord | None = None
     while time.monotonic() < deadline:
-        if probe_health(eff_host, eff_port, timeout_sec=0.5) is not None:
-            healthy = True
+        record = read_pid_record(resolved)
+        if (
+            record is not None
+            and record.instance_id == launch_id
+            and eff_port in (0, record.port)
+            and is_pid_record_alive(record)
+            and _health_matches(record, timeout_sec=0.5)
+        ):
+            started = record
             break
-        if proc.poll() is not None:
+        if proc.poll() not in (None, 0):
             break
         time.sleep(0.15)
 
     want_tray = cfg.tray_enabled if with_tray is None else with_tray
-    if healthy and want_tray and os.name == "nt":
-        start_tray(resolved, host=eff_host, port=eff_port)
+    if started is not None:
+        url = f"http://{started.host}:{started.port}"
+        if want_tray and os.name == "nt":
+            start_tray(resolved, host=started.host, port=started.port)
 
-    if healthy and open_browser:
+    if started is not None and open_browser:
         import webbrowser
 
         with contextlib.suppress(Exception):
             webbrowser.open(url)
 
     return {
-        "started": healthy,
-        "running": healthy,
-        "pid": proc.pid if healthy else None,
+        "started": started is not None,
+        "running": started is not None,
+        "pid": started.pid if started is not None else None,
         "url": url,
         "message": (
-            f"看板服务已启动 ({url})"
-            if healthy
-            else f"看板服务未能启动，请查看日志 {log_file}"  # noqa: RUF001
+            f"看板服务已启动 ({url})" if started is not None else f"看板服务未能启动，请查看日志 {log_file}"  # noqa: RUF001
         ),
     }
 
 
 def stop_background_service(home: Path | None = None) -> dict[str, Any]:
     resolved = home or bridge_home()
-    rec = read_pid_record(resolved)
-    if rec is None or not is_pid_record_alive(rec):
-        clear_pid_record(resolved)
-        return {"stopped": False, "running": False, "message": "看板服务当前未运行"}
     try:
-        proc = psutil.Process(rec.pid)
+        rec = _tracked_record(resolved)
+        proc = _recorded_process(rec)
+        if rec is None or proc is None:
+            if rec is not None:
+                clear_pid_record(resolved, expected_record=rec)
+            return {"stopped": False, "running": False, "message": "看板服务当前未运行"}
+    except (psutil.Error, OSError, ValueError) as exc:
+        return {
+            "stopped": False,
+            "running": None,
+            "message": f"无法核实看板进程 ({type(exc).__name__})。已保留进程记录。",
+        }
+    try:
         proc.terminate()
         try:
             proc.wait(timeout=4.0)
         except psutil.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=2.0)
-    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+    except psutil.NoSuchProcess:
         pass
-    finally:
-        clear_pid_record(resolved, expected_pid=rec.pid)
+    except (psutil.Error, OSError) as exc:
+        return {
+            "stopped": False,
+            "running": None,
+            "message": f"无法确认看板已停止 ({type(exc).__name__})。已保留进程记录。",
+        }
+    clear_pid_record(resolved, expected_record=rec)
     return {"stopped": True, "running": False, "pid": rec.pid, "message": "看板服务已停止"}
 
 
@@ -578,54 +650,70 @@ def restart_background_service(
     port: int | None = None,
 ) -> dict[str, Any]:
     resolved = home or bridge_home()
-    stop_background_service(resolved)
+    stopped = stop_background_service(resolved)
+    if stopped["running"] is not False:
+        return stopped
     return start_background_service(resolved, host=host, port=port, open_browser=False)
 
 
-def _spawn_wait_then_run_helper(wait_pid: int, commands: list[list[str]], *, cwd: str | None, env: dict[str, str], log_path: Path) -> None:
-    """Spawn a tiny detached Python helper that waits for ``wait_pid`` to exit before running fixed commands."""
-    helper_code = (
-        "import json, pathlib, subprocess, sys, time, psutil\n"
-        "wait_pid = int(sys.argv[1])\n"
-        "log_file = pathlib.Path(sys.argv[2])\n"
-        "cwd = sys.argv[3] or None\n"
-        "cmds = json.loads(sys.argv[4])\n"
-        "deadline = time.monotonic() + 15.0\n"
-        "while time.monotonic() < deadline:\n"
-        "    if not psutil.pid_exists(wait_pid):\n"
-        "        break\n"
-        "    time.sleep(0.15)\n"
-        "time.sleep(0.2)\n"
-        "log_file.parent.mkdir(parents=True, exist_ok=True)\n"
-        "with log_file.open('ab') as sink:\n"
-        "    for idx, cmd in enumerate(cmds):\n"
-        "        is_last = idx == len(cmds) - 1\n"
-        "        sink.write(f'\\n=== run {cmd!r} ===\\n'.encode('utf-8'))\n"
-        "        sink.flush()\n"
-        "        if is_last:\n"
-        "            subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=sink, stderr=sink, cwd=cwd)\n"
-        "        else:\n"
-        "            rc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=sink, stderr=sink, cwd=cwd, check=False).returncode\n"
-        "            if rc != 0:\n"
-        "                sink.write(f'step failed rc={rc}\\n'.encode('utf-8'))\n"
-        "                break\n"
+def _relaunch_dashboard(home: Path, address: tuple[str, int], command: tuple[str, list[str]]) -> str | None:
+    host, port = address
+    try:
+        started = start_background_service(home, host=host, port=port, with_tray=False, command=command)
+    except (OSError, ValueError) as exc:
+        return f"看板启动失败 ({type(exc).__name__})"
+    return None if started.get("running") is True else str(started.get("message") or "无法确认看板已启动")
+
+
+def _run_detached_dashboard_restart(spec: dict[str, Any]) -> None:
+    home = Path(spec["home"])
+    with Path(spec["log_path"]).open("a", encoding="utf-8") as sink:
+        try:
+            process = _recorded_process(DashboardPidRecord(pid=spec["pid"], create_time=spec["create_time"]))
+            if process is not None:
+                process.wait(timeout=15)
+        except psutil.NoSuchProcess:
+            pass
+        except (psutil.Error, OSError, ValueError) as exc:
+            sink.write(f"无法确认原看板已停止 ({type(exc).__name__})\n")
+            return
+        restart_error = _relaunch_dashboard(home, spec["target_address"], spec["command"])
+        if restart_error:
+            sink.write(f"看板未恢复运行：{restart_error}\n")  # noqa: RUF001
+        else:
+            sink.write("看板已启动。\n")
+
+
+def _spawn_restart_helper(
+    home: Path,
+    target_address: tuple[str, int],
+    *,
+    log_path: Path,
+) -> None:
+    create_time = process_create_time(os.getpid())
+    if create_time is None:
+        raise OSError("看板进程创建时间无法核实")
+    spec = {
+        "home": str(home),
+        "pid": os.getpid(),
+        "create_time": create_time,
+        "log_path": str(log_path),
+        "target_address": target_address,
+        "command": resolve_bridge_command(),
+    }
+    helper = (
+        "import json, sys; from agent_bridge.dashboard_service import _run_detached_dashboard_restart; "
+        "_run_detached_dashboard_restart(json.loads(sys.argv[1]))"
     )
-    subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            helper_code,
-            str(wait_pid),
-            str(log_path),
-            cwd or "",
-            json.dumps(commands),
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=env,
-        **_detached_kwargs(),
-    )
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("ab") as sink:
+        subprocess.Popen(
+            [sys.executable, "-c", helper, json.dumps(spec)],
+            stdin=subprocess.DEVNULL,
+            stdout=sink,
+            stderr=sink,
+            **_detached_kwargs(),
+        )
 
 
 def schedule_server_stop(server: Any, *, delay_sec: float = 0.25) -> None:
@@ -645,302 +733,13 @@ def schedule_server_restart(
     port: int,
     delay_sec: float = 0.25,
 ) -> None:
-    exe, prefix = resolve_bridge_command()
-    relaunch = [exe, *prefix, "dashboard", "serve", "--host", host, "--port", str(port), "--no-open"]
-    env = os.environ.copy()
-    env["AGENT_BRIDGE_HOME"] = str(home)
-    _spawn_wait_then_run_helper(
-        os.getpid(),
-        [relaunch],
-        cwd=None,
-        env=env,
-        log_path=dashboard_log_path(home),
-    )
+    _spawn_restart_helper(home, (host, port), log_path=dashboard_log_path(home))
     schedule_server_stop(server, delay_sec=delay_sec)
 
 
-def _installed_direct_url() -> tuple[str | None, str | None]:
-    """Read ``(repo_url, commit_id)`` from ``direct_url.json`` for ``uv tool`` installs."""
-    try:
-        dist = distribution(PACKAGE)
-        raw = dist.read_text("direct_url.json")
-    except (PackageNotFoundError, OSError):
-        return None, None
-    if not raw:
-        return None, None
-    try:
-        obj = json.loads(raw)
-    except json.JSONDecodeError:
-        return None, None
-    if not isinstance(obj, dict):
-        return None, None
-    url = obj.get("url") if isinstance(obj.get("url"), str) else None
-    raw_vcs = obj.get("vcs_info")
-    vcs: dict[str, Any] = raw_vcs if isinstance(raw_vcs, dict) else {}
-    commit_id = vcs.get("commit_id") if isinstance(vcs.get("commit_id"), str) else None
-    return url, commit_id
-
-
-def _parse_ls_remote_sha(stdout: str) -> str | None:
-    for line in stdout.splitlines():
-        parts = line.strip().split()
-        if parts and len(parts[0]) >= 7:
-            return parts[0]
-    return None
-
-
-def check_update_available(
-    *,
-    kind: str | None = None,
-    run: Callable[..., Any] | None = None,
-    siblings: int | None = None,
-) -> dict[str, Any]:
-    """On-demand check whether the remote repository has a newer commit.
-
-    Never called automatically on a timer — runs only when the user clicks
-    "重启并更新" or runs ``agent-bridge dashboard update``.
-    """
-    detected = kind or detect_install()
-    runner = run or subprocess.run
-    git = shutil.which("git")
-    if not git:
-        return {
-            "status": "error",
-            "up_to_date": False,
-            "install_kind": detected,
-            "message": "本机未找到 git，无法检查远端更新",  # noqa: RUF001
-        }
-
-    if detected == "checkout":
-        root = checkout_root()
-        if root is None:
-            return {
-                "status": "error",
-                "up_to_date": False,
-                "install_kind": detected,
-                "message": "未定位到源码 Git 根目录",
-            }
-        local_res = runner(
-            [git, "rev-parse", "HEAD"],
-            cwd=str(root),
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        local_sha = (getattr(local_res, "stdout", "") or "").strip()
-        if getattr(local_res, "returncode", 1) != 0 or not local_sha:
-            return {
-                "status": "error",
-                "up_to_date": False,
-                "install_kind": detected,
-                "message": "无法读取当前 Git 提交哈希",
-            }
-        # Resolve tracking remote/branch if configured; else fall back to origin HEAD.
-        up_res = runner(
-            [git, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-            cwd=str(root),
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        remote_name = "origin"
-        ref_spec = "HEAD"
-        if getattr(up_res, "returncode", 1) == 0:
-            upstream_ref = (getattr(up_res, "stdout", "") or "").strip()
-            if "/" in upstream_ref:
-                remote_name, branch_name = upstream_ref.split("/", 1)
-                ref_spec = f"refs/heads/{branch_name}"
-        ls_res = runner(
-            [git, "ls-remote", remote_name, ref_spec],
-            cwd=str(root),
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-        remote_sha = _parse_ls_remote_sha(getattr(ls_res, "stdout", "") or "")
-        if getattr(ls_res, "returncode", 1) != 0 or not remote_sha:
-            return {
-                "status": "error",
-                "up_to_date": False,
-                "install_kind": detected,
-                "current_commit": local_sha[:8],
-                "message": "检查远端更新失败（请确认网络或 Git 远端可达）",  # noqa: RUF001
-            }
-        if remote_sha == local_sha:
-            return {
-                "status": "up_to_date",
-                "up_to_date": True,
-                "install_kind": detected,
-                "current_commit": local_sha[:8],
-                "remote_commit": remote_sha[:8],
-                "message": f"最新，别搞（当前已对齐远端 {local_sha[:8]}）",  # noqa: RUF001
-            }
-        dirty_res = runner(
-            [git, "status", "--porcelain"],
-            cwd=str(root),
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        if (getattr(dirty_res, "stdout", "") or "").strip():
-            return {
-                "status": "blocked",
-                "up_to_date": False,
-                "install_kind": detected,
-                "current_commit": local_sha[:8],
-                "remote_commit": remote_sha[:8],
-                "message": "远端有新提交，但当前源码目录存在未提交修改，已阻止自动覆盖",  # noqa: RUF001
-            }
-    elif detected == "uv-tool":
-        url, local_sha = _installed_direct_url()
-        repo_url = url or GIT_SOURCE.removeprefix("git+")
-        if not local_sha:
-            return {
-                "status": "error",
-                "up_to_date": False,
-                "install_kind": detected,
-                "message": "未能读取当前安装提交号（direct_url.json 缺失），请手动运行 agent-bridge upgrade",  # noqa: RUF001
-            }
-        ls_res = runner(
-            [git, "ls-remote", repo_url, "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-        remote_sha = _parse_ls_remote_sha(getattr(ls_res, "stdout", "") or "")
-        if getattr(ls_res, "returncode", 1) != 0 or not remote_sha:
-            return {
-                "status": "error",
-                "up_to_date": False,
-                "install_kind": detected,
-                "current_commit": local_sha[:8],
-                "message": "检查远端更新失败（请确认网络可达）",  # noqa: RUF001
-            }
-        if remote_sha == local_sha:
-            return {
-                "status": "up_to_date",
-                "up_to_date": True,
-                "install_kind": detected,
-                "current_commit": local_sha[:8],
-                "remote_commit": remote_sha[:8],
-                "message": f"最新，别搞（当前已对齐远端 {local_sha[:8]}）",  # noqa: RUF001
-            }
-    else:
-        return {
-            "status": "unsupported",
-            "up_to_date": False,
-            "install_kind": detected,
-            "message": "当前运行方式既非 uv tool 也非 git checkout，不支持自动更新",  # noqa: RUF001
-        }
-
-    # Check if other live Agent Bridge MCP instances would lock agent-bridge.exe on Windows.
-    live_siblings = count_sibling_servers() if siblings is None else siblings
-    if live_siblings > 0:
-        return {
-            "status": "blocked",
-            "up_to_date": False,
-            "install_kind": detected,
-            "current_commit": local_sha[:8],
-            "remote_commit": remote_sha[:8],
-            "message": f"发现新版本 ({local_sha[:8]} → {remote_sha[:8]})，但仍有 {live_siblings} 个主控 Bridge 实例运行中，请先关闭主控再更新",  # noqa: RUF001
-        }
-
-    return {
-        "status": "update_available",
-        "up_to_date": False,
-        "install_kind": detected,
-        "current_commit": local_sha[:8],
-        "remote_commit": remote_sha[:8],
-        "message": f"发现新版本 ({local_sha[:8]} → {remote_sha[:8]})，准备更新并重启",  # noqa: RUF001
-    }
-
-
-def _upgrade_commands(detected: str) -> tuple[list[list[str]], str | None]:
-    uv = shutil.which("uv")
-    git = shutil.which("git")
-    if detected == "uv-tool":
-        if not uv:
-            raise RuntimeError("uv 未在 PATH 中")
-        return [[uv, "tool", "upgrade", PACKAGE]], None
-    if detected == "checkout":
-        root = checkout_root()
-        if root is None or not git or not uv:
-            raise RuntimeError("源码目录更新需要 git 和 uv")
-        return [[git, "pull", "--ff-only"], [uv, "sync", "--extra", "dev"]], str(root)
-    raise RuntimeError("不支持的安装方式")
-
-
-def schedule_update_and_restart(
-    home: Path,
-    server: Any,
-    *,
-    host: str,
-    port: int,
-    delay_sec: float = 0.25,
-) -> dict[str, Any]:
-    check = check_update_available()
-    if check["status"] != "update_available":
-        return check
-
-    detected = str(check["install_kind"])
-    cmds, cwd = _upgrade_commands(detected)
-    exe, prefix = resolve_bridge_command()
-    relaunch = [exe, *prefix, "dashboard", "serve", "--host", host, "--port", str(port), "--no-open"]
-    env = os.environ.copy()
-    env["AGENT_BRIDGE_HOME"] = str(home)
-    _spawn_wait_then_run_helper(
-        os.getpid(),
-        [*cmds, relaunch],
-        cwd=cwd,
-        env=env,
-        log_path=billing_dir(home) / "update.log",
-    )
-    schedule_server_stop(server, delay_sec=delay_sec)
-    return {
-        **check,
-        "status": "updating",
-        "url": f"http://{host}:{port}",
-        "message": f"正在更新 ({check['current_commit']} → {check['remote_commit']}) 并重启服务…",
-    }
-
-
-def cli_update_and_restart(home: Path | None = None) -> dict[str, Any]:
-    """Run on-demand update check from CLI / tray; if update available, stop, upgrade, and restart."""
-    resolved = home or bridge_home()
-    rec = read_pid_record(resolved)
-    was_running = is_pid_record_alive(rec)
-    # Exclude the background dashboard PID itself when checking if other MCP coordinators block upgrade.
-    siblings = count_sibling_servers()
-    if was_running and siblings > 0:
-        siblings = max(0, siblings - 1)
-    check = check_update_available(siblings=siblings)
-    if check["status"] != "update_available":
-        return check
-    if was_running:
-        stop_background_service(resolved)
-    cmds, cwd = _upgrade_commands(str(check["install_kind"]))
-    for cmd in cmds:
-        completed = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=False)
-        if completed.returncode != 0:
-            if was_running:
-                start_background_service(resolved)
-            return {
-                **check,
-                "status": "error",
-                "message": f"更新命令失败：{' '.join(cmd)} (exit {completed.returncode})",  # noqa: RUF001
-            }
-    if was_running:
-        start_background_service(resolved)
-    return {
-        **check,
-        "status": "updated",
-        "message": f"已更新到 {check['remote_commit']} 并重启服务",
-    }
+def dashboard_update_response() -> dict[str, str]:
+    # Dashboard self-update is disabled. Its previous implementation is in 5c2596c.
+    return {"status": "disabled", "message": "最新，别搞"}  # noqa: RUF001
 
 
 def open_billing_folder(home: Path | None = None) -> dict[str, Any]:
@@ -966,9 +765,16 @@ def service_status(
 ) -> dict[str, Any]:
     resolved = home or bridge_home()
     cfg = load_service_config(resolved)
-    pid_rec = read_pid_record(resolved)
-    alive_rec = pid_rec if is_pid_record_alive(pid_rec) else None
+    alive_rec = None
+    identity_unknown = False
+    if current_pid is None:
+        try:
+            pid_rec = _tracked_record(resolved)
+            alive_rec = pid_rec if _recorded_process(pid_rec) is not None else None
+        except (psutil.Error, OSError, ValueError):
+            identity_unknown = True
 
+    running: bool | None
     if current_pid is not None and current_host is not None and current_port is not None:
         running = True
         pid = current_pid
@@ -986,7 +792,7 @@ def service_status(
                 dt = datetime.fromisoformat(alive_rec.started_at)
                 uptime_sec = max(0, int((datetime.now(UTC) - dt).total_seconds()))
     else:
-        running = False
+        running = None if identity_unknown else False
         pid = None
         host = cfg.host
         port = cfg.port

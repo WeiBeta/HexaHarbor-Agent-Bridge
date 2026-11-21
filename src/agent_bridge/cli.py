@@ -233,7 +233,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
         from agent_bridge.dashboard_server import run_dashboard
         from agent_bridge.dashboard_service import (
-            cli_update_and_restart,
+            dashboard_update_response,
             restart_background_service,
             service_status,
             start_background_service,
@@ -298,7 +298,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             parser = argparse.ArgumentParser(prog="agent-bridge dashboard update")
             parser.add_argument("--json", dest="as_json", action="store_true")
             opts = parser.parse_args(rest)
-            res = cli_update_and_restart()
+            res = dashboard_update_response()
             if opts.as_json:
                 print(json.dumps(res, ensure_ascii=False))
             else:

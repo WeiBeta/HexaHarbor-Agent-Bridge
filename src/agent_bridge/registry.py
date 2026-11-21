@@ -556,6 +556,15 @@ class Registry:
             # with a worker half-reaped.
             await asyncio.wait(idles, timeout=STOP_TASK_GRACE_SEC)
         finishing = set(self._receipt_writes.values())
+        for task in self.tasks.values():
+            if task.status == TaskStatus.queued:
+                queued = self._bg.pop(task.task_id, None)
+                if queued is not None and not queued.done():
+                    queued.cancel()
+                    finishing.add(queued)
+                queued_session = self.sessions[task.session_id]
+                self._mark_task_cancelled(task, queued_session)
+                finishing.add(self._receipt_writer(task, queued_session))
         for task_id, bg in self._bg.items():
             if not bg.done():
                 finishing.add(bg)
@@ -776,6 +785,8 @@ class Registry:
                     "reused": True,
                     "persisted": await self.flush_state(),
                 }
+            if self._stopping:
+                raise RuntimeError("Bridge is stopping")
             if session_id:
                 session = self.sessions.get(session_id)
                 if session is None:
@@ -844,10 +855,15 @@ class Registry:
             try:
                 persisted = await self.flush_state()
             finally:
-                # Even when the caller cancels mid-flush, the registered task
-                # must still start — a request_id retry would otherwise reuse
-                # a row that never runs.
-                self._bg[task.task_id] = asyncio.create_task(self._run_task(task.task_id), name=f"task-{task.task_id}")
+                if task.status == TaskStatus.queued:
+                    if self._stopping:
+                        self._mark_task_cancelled(task, session)
+                        await self._finish_receipt(task, session)
+                    else:
+                        # A dropped dispatch caller does not cancel an accepted turn.
+                        self._bg[task.task_id] = asyncio.create_task(
+                            self._run_task(task.task_id), name=f"task-{task.task_id}"
+                        )
         return {
             "task_id": task.task_id,
             "session_id": session.session_id,
@@ -1184,25 +1200,31 @@ class Registry:
         }
 
     async def _finish_receipt(self, task: Task, session: Session) -> None:
-        if self._done[task.task_id].is_set():
-            return
+        if not self._done[task.task_id].is_set():
+            # Both the turn and cancellation can reach this point. A cancelled
+            # caller must leave the one receipt writer running.
+            await asyncio.shield(self._receipt_writer(task, session))
+
+    def _receipt_writer(self, task: Task, session: Session) -> asyncio.Task[None]:
         writer = self._receipt_writes.get(task.task_id)
         if writer is None:
             writer = asyncio.create_task(self._persist_and_signal(task, session), name=f"receipt-{task.task_id}")
             self._receipt_writes[task.task_id] = writer
-        # Both the turn and the cancellation fallback can reach this point.
-        # Cancelling either caller must leave the one receipt writer running.
-        await asyncio.shield(writer)
+        return writer
 
     async def _persist_and_signal(self, task: Task, session: Session) -> None:
         try:
-            await self._persist_receipt(task, session)
+            payload = await self._persist_receipt(task, session)
         finally:
             self._receipt_writes.pop(task.task_id, None)
         self._done[task.task_id].set()
-        self.save()
+        try:
+            self.save()
+        finally:
+            if payload is not None:
+                self._enqueue_billing(payload)
 
-    async def _persist_receipt(self, task: Task, session: Session) -> Path | None:
+    async def _persist_receipt(self, task: Task, session: Session) -> dict[str, Any] | None:
         if task.status not in TERMINAL_STATUSES:
             return None
         dest = receipt_path(task.task_id, self.home)
@@ -1212,8 +1234,7 @@ class Registry:
         except (OSError, TypeError, ValueError):
             log.exception("could not persist receipt for task %s", task.task_id)
             return None
-        self._enqueue_billing(payload)
-        return dest
+        return payload
 
     def _enqueue_billing(self, payload: dict[str, Any]) -> None:
         # Receipt order is also turn order for a session. Only one ledger
@@ -1665,6 +1686,16 @@ class Registry:
         events = read_events(session_id, self.home)
         return page_events(events, offset=offset, limit=limit, kinds=kinds)
 
+    def _mark_task_cancelled(self, task: Task, session: Session) -> None:
+        task.status = TaskStatus.cancelled
+        task.stop_reason = "cancelled"
+        task.finished_at = iso()
+        task.files_changed_state = FilesChangedState.unavailable
+        if task.started_at is None:
+            self._cancel_requested.discard(task.task_id)
+            if session.proc_state == ProcState.spawning:
+                session.proc_state = ProcState.idle_unloaded
+
     async def cancel_task(self, task_id: str) -> dict:
         if not self.dispatch_enabled:
             raise RuntimeError(NESTED_CANCEL_ERROR)
@@ -1681,18 +1712,10 @@ class Registry:
             if task_id not in self._receipt_writes:
                 bg.cancel()
             await asyncio.wait({bg}, timeout=15)
-        else:
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self._done[task_id].wait(), timeout=15)
         if not self._done[task_id].is_set() and task_id not in self._receipt_writes:
-            # _run_task never ran (cancelled before its first step) or did not
-            # finish in time; close the record here.
-            task.status = TaskStatus.cancelled
-            task.stop_reason = "cancelled"
-            task.finished_at = iso()
-            task.files_changed_state = FilesChangedState.unavailable
-            if task.started_at is None and session.proc_state == ProcState.spawning:
-                session.proc_state = ProcState.idle_unloaded
+            # A registered dispatch can still be flushing its queued state.
+            # Closing it here prevents that dispatch from starting later.
+            self._mark_task_cancelled(task, session)
             self._bg.pop(task_id, None)
         await self._finish_receipt(task, session)
         task = self.tasks[task_id]

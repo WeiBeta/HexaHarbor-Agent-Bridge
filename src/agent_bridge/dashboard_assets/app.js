@@ -1813,38 +1813,9 @@
       }
     });
 
-    $("btn-svc-update").addEventListener("click", async () => {
-      const btn = $("btn-svc-update");
-      const origText = btn.textContent;
-      btn.disabled = true;
-      btn.textContent = "正在检查更新…";
-      try {
-        const res = await apiMutate("POST", "/api/service/update", {});
-        if (res.status === "up_to_date") {
-          openInfoModal(
-            "检查更新",
-            res.message || "最新，别搞",
-            res.current_commit ? `当前提交：${res.current_commit}` : ""
-          );
-        } else if (res.status === "updating") {
-          openInfoModal(
-            "正在更新并重启",
-            res.message || "发现新版本，正在更新并重启服务…",
-            "完成后页面将自动重连并刷新；如遇异常请查看 billing/update.log。"
-          );
-          await waitForServiceReconnect(res.url || window.location.origin);
-        } else {
-          const detail = res.current_commit && res.remote_commit
-            ? `本地 ${res.current_commit} → 远端 ${res.remote_commit}`
-            : (res.current_commit ? `当前提交：${res.current_commit}` : "");
-          openInfoModal("更新未执行", res.message || "无法执行自动更新", detail);
-        }
-      } catch (err) {
-        openInfoModal("检查更新失败", err.message || "请求失败");
-      } finally {
-        btn.disabled = false;
-        btn.textContent = origText;
-      }
+    // 看板更新暂不启用，原实现见 5c2596c。
+    $("btn-svc-update").addEventListener("click", () => {
+      openInfoModal("更新提示", "最新，别搞");
     });
 
     $("btn-svc-folder").addEventListener("click", async () => {

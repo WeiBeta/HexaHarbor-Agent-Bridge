@@ -58,6 +58,10 @@ def _json_req(
 def test_dashboard_refuses_non_loopback_bind(tmp_path: Path):
     with pytest.raises(ValueError, match="loopback"):
         DashboardHTTPServer(("0.0.0.0", 0), home=tmp_path)
+    with pytest.raises(ValueError, match="IPv4 loopback"):
+        DashboardHTTPServer(("::1", 0), home=tmp_path)
+    with DashboardHTTPServer(("localhost", 0), home=tmp_path) as local:
+        assert local.bound_host == "127.0.0.1"
 
 
 def test_dashboard_end_to_end_and_security_guards(tmp_path: Path):
@@ -233,6 +237,7 @@ async def test_registry_terminal_receipt_persists_to_independent_billing_ledger(
     from agent_bridge.billing_store import load_ledger
     from agent_bridge.config import AgentConfig, AppConfig
     from agent_bridge.models import Session, Task, TaskStatus
+    from agent_bridge.paths import receipt_path
     from agent_bridge.registry import Registry
 
     cfg = AppConfig(agents={"fake": AgentConfig(name="fake", protocol="fake", command=["fake"])})
@@ -247,13 +252,25 @@ async def test_registry_terminal_receipt_persists_to_independent_billing_ledger(
         model="gemini-4-argon",
         status=TaskStatus.completed,
         result_text="PRIVATE RESULT",
-        usage={"input_tokens": 1200, "cache_read_tokens": 3800, "output_tokens": 400, "scope": "turn"},
+        usage={
+            "input_tokens": 1200,
+            "cache_read_tokens": 3800,
+            "output_tokens": 400,
+            "scope": "turn",
+            "detail": {"body": "PRIVATE USAGE"},
+        },
+        error="PRIVATE ERROR",
+        warnings=["PRIVATE WARNING"],
     )
     reg.sessions[sess.session_id] = sess
     reg.tasks[task.task_id] = task
+    reg._done[task.task_id] = asyncio.Event()
 
-    receipt_file = await reg._persist_receipt(task, sess)
-    assert receipt_file is not None and receipt_file.is_file()
+    await reg._finish_receipt(task, sess)
+    receipt_file = receipt_path(task.task_id, tmp_path)
+    assert receipt_file.is_file()
+    receipt = receipt_file.read_text(encoding="utf-8")
+    assert all(marker in receipt for marker in ("PRIVATE RESULT", "PRIVATE USAGE", "PRIVATE ERROR", "PRIVATE WARNING"))
 
     # Pruning the task deletes the receipt, but the independent billing ledger keeps it.
     reg._drop_task(task.task_id)
@@ -268,5 +285,5 @@ async def test_registry_terminal_receipt_persists_to_independent_billing_ledger(
     assert records[0].task_id == "task_reg_1"
     assert records[0].tokens.uncached_input_tokens == 1200
     assert records[0].tokens.cache_read_tokens == 3800
-    assert "PRIVATE PROMPT" not in records[0].model_dump_json()
-    assert "PRIVATE RESULT" not in records[0].model_dump_json()
+    assert "PRIVATE" not in records[0].model_dump_json()
+    assert await reg.flush_state()
