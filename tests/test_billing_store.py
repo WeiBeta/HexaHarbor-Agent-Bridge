@@ -9,6 +9,7 @@ import pytest
 from agent_bridge.billing_pricing import ModelRate, PricingConfig
 from agent_bridge.billing_store import (
     MIN_LEDGER_MAX_BYTES,
+    RETENTION_TARGET_RATIO,
     StoragePolicy,
     append_receipt_record,
     backfill_from_bridge_home,
@@ -169,6 +170,53 @@ def test_size_retention_keeps_newer_usage_when_old_receipt_arrives_last(tmp_path
     rows, corrupt = load_ledger(tmp_path)
     assert corrupt == 0
     assert [row.task_id for row in rows] == ["middle", "newest"]
+
+
+@pytest.mark.parametrize("backfill_newest", [False, True])
+def test_backfill_of_evicted_receipt_preserves_rows_under_the_size_cap(tmp_path, backfill_newest):
+    now = datetime.now(UTC)
+    cap = MIN_LEDGER_MAX_BYTES
+    target = int(cap * RETENTION_TARGET_RATIO)
+    save_storage_policy(StoragePolicy(max_bytes=cap, max_age_days=None), home=tmp_path)
+
+    def receipt(task_id, days_ago, size):
+        return {
+            "task_id": task_id,
+            "agent": "codex",
+            "status": "completed",
+            "title": "a" * size,
+            "created_at": (now - timedelta(days=days_ago)).isoformat(),
+        }
+
+    old = receipt("old", 4, 500_000)
+    _write_receipt(tmp_path, old)
+    append_receipt_record(tmp_path, old)
+    append_receipt_record(tmp_path, receipt("middle", 3, 331_000))
+    append_receipt_record(tmp_path, receipt("recent", 2, 331_000))
+    append_receipt_record(tmp_path, receipt("newest", 1, 331_000))
+    rows, corrupt = load_ledger(tmp_path)
+    assert corrupt == 0
+    assert [row.task_id for row in rows] == ["middle", "recent", "newest"]
+    path = usage_ledger_path(tmp_path)
+    prior = path.read_bytes()
+    assert target < len(prior) < cap
+
+    for _ in range(2):
+        outcome = backfill_from_bridge_home(tmp_path)
+        assert outcome["imported"] == 1
+        assert outcome["retention"]["removed_by_size"] == 1
+        assert path.read_bytes() == prior
+
+    latest = receipt("latest", 0, 331_000)
+    if backfill_newest:
+        _write_receipt(tmp_path, latest)
+        assert backfill_from_bridge_home(tmp_path)["imported"] == 2
+    else:
+        append_receipt_record(tmp_path, latest)
+    rows, corrupt = load_ledger(tmp_path)
+    assert corrupt == 0
+    assert [row.task_id for row in rows] == ["newest", "latest"]
+    assert path.stat().st_size <= target
 
 
 @pytest.mark.parametrize("auto_rotate", [False, True])

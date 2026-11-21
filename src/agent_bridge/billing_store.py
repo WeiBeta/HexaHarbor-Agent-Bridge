@@ -14,7 +14,7 @@ import logging
 import os
 import uuid
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from datetime import UTC, datetime, timedelta
 from itertools import chain
 from pathlib import Path
@@ -276,6 +276,7 @@ def _enforce_retention_locked(
     policy: StoragePolicy,
     *,
     now: datetime | None = None,
+    backfilled_ids: Collection[str] = (),
 ) -> dict[str, Any]:
     path = usage_ledger_path(home)
     if not path.is_file():
@@ -305,34 +306,42 @@ def _enforce_retention_locked(
         current_time = current_time.replace(tzinfo=UTC)
 
     cutoff = current_time - timedelta(days=policy.max_age_days) if policy.max_age_days is not None else None
-    kept: list[tuple[bytes, datetime | None]] = []
+    kept: list[tuple[bytes, datetime | None, bool]] = []
     for raw_line in lines:
         try:
-            ts = record_timestamp(LedgerRecord.model_validate(json.loads(raw_line.decode("utf-8"))))
+            record = LedgerRecord.model_validate(json.loads(raw_line.decode("utf-8")))
+            ts = record_timestamp(record)
+            backfilled = record.task_id in backfilled_ids
         except ValueError:
             ts = None
+            backfilled = False
         if cutoff is None or ts is None or ts >= cutoff:
-            kept.append((raw_line, ts))
+            kept.append((raw_line, ts, backfilled))
 
     removed_by_age = len(lines) - len(kept)
     dropped_for_size: set[int] = set()
-    remaining_bytes = sum(len(line) for line, _ in kept)
+    remaining_bytes = sum(len(line) for line, _, _ in kept)
     if policy.max_bytes is not None and remaining_bytes > policy.max_bytes and len(kept) > 1:
         target = max(1, int(policy.max_bytes * RETENTION_TARGET_RATIO))
         # Backfill can append an old turn after newer rows. Evict by record
         # time and keep file order for the surviving rows and equal times.
         by_age = sorted(range(len(kept)), key=lambda index: kept[index][1] or EARLIEST_TIMESTAMP)
+        only_backfilled = bool(backfilled_ids)
         for index in by_age[:-1]:
-            if remaining_bytes <= target:
+            # Older imports alone can bring a fitting ledger back under its
+            # cap. Leave its saved rows in place when they still fit.
+            if remaining_bytes <= (policy.max_bytes if only_backfilled else target):
                 break
+            line, _, backfilled = kept[index]
             dropped_for_size.add(index)
-            remaining_bytes -= len(kept[index][0])
+            remaining_bytes -= len(line)
+            only_backfilled = only_backfilled and backfilled
 
     removed_by_size = len(dropped_for_size)
     changed = bool(removed_by_age or removed_by_size)
     if changed:
         _atomic_write_bytes(
-            path, b"".join(line for index, (line, _) in enumerate(kept) if index not in dropped_for_size)
+            path, b"".join(line for index, (line, _, _) in enumerate(kept) if index not in dropped_for_size)
         )
 
     return {
@@ -520,7 +529,10 @@ def backfill_from_bridge_home(home: Path | None = None) -> dict[str, Any]:
             _append_records_locked(path, existing, additions)
 
         policy = load_storage_policy(resolved)
-        retention = _enforce_retention_locked(resolved, policy) if (additions and policy.auto_rotate) else None
+        retention = None
+        if additions and policy.auto_rotate:
+            backfilled_ids = {record.task_id for record in additions} if existing else set()
+            retention = _enforce_retention_locked(resolved, policy, backfilled_ids=backfilled_ids)
 
     return {
         "scanned": len(candidates),
