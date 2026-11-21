@@ -73,6 +73,7 @@ def test_wheel_ships_dashboard_assets_and_opencodex_license(tmp_path: Path):
         assert "agent_bridge/dashboard_assets/index.html" in names
         assert "agent_bridge/dashboard_assets/app.css" in names
         assert "agent_bridge/dashboard_assets/app.js" in names
+        assert "agent_bridge/share/dashboard-tray.ps1" in names
         metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
         license_root = metadata_name.removesuffix("METADATA") + "licenses/"
         ocx_mit = archive.read(license_root + "LICENSES/opencodex-MIT.txt").decode("utf-8")

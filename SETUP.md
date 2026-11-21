@@ -588,16 +588,25 @@ Most worker CLIs run in always-approve / skip-permissions mode. Codex CLI defaul
 
 ## Usage and billing dashboard
 
-HexaHarbor Agent Bridge includes an optional local usage & billing module that stays completely out of the MCP tool list (zero context overhead for coordinators):
+HexaHarbor Agent Bridge includes an optional local usage & billing module and background service that stay completely out of the MCP tool list (zero context overhead for coordinators):
 
 ```powershell
-agent-bridge dashboard                 # binds 127.0.0.1:8765 and opens browser
+agent-bridge dashboard                 # binds 127.0.0.1:8765 (or service.json port) and opens browser
 agent-bridge dashboard --port 9000 --no-open
+agent-bridge dashboard start --tray    # start detached background service + Windows system tray
+agent-bridge dashboard stop            # stop the background service
+agent-bridge dashboard restart         # restart the background service
+agent-bridge dashboard status          # print JSON service status
+agent-bridge dashboard tray            # launch Windows system tray control (--stop to close)
+agent-bridge dashboard update          # on-demand update check; upgrades & restarts only if behind remote
 ```
 
 - **Loopback only**: accepts only `127.0.0.1`, `localhost`, or `::1`, validates the `Host` header, and guards configuration updates with a per-process CSRF token injected into the local page.
 - **Metadata only**: records task timestamps, agent, model, status, duration, changed-file counts, and token/usage structures — never prompt messages, worker output bodies, or transcripts.
+- **Live auto-refresh**: the dashboard polls a lightweight stat-based `/api/version` fingerprint (default 10 s, configurable in the top bar: `关 / 5s / 10s / 30s`) and automatically backfills newly written `receipts/*.json` files on disk.
+- **Background service, Windows system tray & autostart**: manage background service lifecycle, optional Windows WinForms system tray (`share/dashboard-tray.ps1`, zero extra Python dependencies), user-scoped `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` autostart (no admin/UAC required, disabled by default), and on-demand **Restart & Update** from the **Management (管理)** tab or the CLI subcommands above.
 - **Independent storage (`~/.agent-bridge/billing/`)**:
-  - `usage_ledger.jsonl` — append-only task usage ledger unaffected by `state.json` / `receipts/` pruning. Starting the dashboard also backfills existing terminal receipts by `task_id`.
+  - `usage_ledger.jsonl` — append-only task usage ledger unaffected by `state.json` / `receipts/` pruning. Starting the dashboard or polling `/api/version` incrementally backfills terminal receipts by `task_id`.
   - `pricing.json` — optional manual USD/1M token overrides (`input`, `output`, `cache_read`, `cache_write`; supports exact `model` or `agent::model` keys) plus `harness_discounts` rules (either `quota_boost` %, e.g. ZCode GLM 150% quota -> `0.6667x` effective cost, or direct `cost_multiplier`). Built-in reference prices are adapted from `@bitkyc08/opencodex` (MIT); unpriced models are explicitly excluded rather than counted as `$0`.
-  - `storage.json` — rolling retention limits (`max_bytes` default 100 MiB, `max_age_days` default 180 days, `auto_rotate` default `true`). Manage rotation, manual backfill, JSONL export, or ledger reset from the **Storage** tab.
+  - `storage.json` — rolling retention limits (`max_bytes` default 100 MiB, `max_age_days` default 180 days, `auto_rotate` default `true`). Manage rotation, manual backfill, JSONL export, or double-confirmed ledger reset from the **Management (管理)** tab.
+  - `service.json` — background service host/port, autostart flag, and system tray flag (`auto_start` and `tray_enabled` default to `false`).

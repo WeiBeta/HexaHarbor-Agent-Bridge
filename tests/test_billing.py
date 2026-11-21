@@ -164,8 +164,30 @@ def test_pricing_resolution_and_zcode_150_discount():
     assert m_argon.source == "preset_derived"
     assert m_argon.matched_key == "gemini-4-argon"
 
-    # Unverified preview model must remain honestly unpriced until user configures it.
-    assert resolve_model_rate("antigravity", "gemini-4-hydrogen-xhigh", cfg) is None
+    # Verified Nov-2026 Antigravity & Claude models resolve directly or via effort suffix.
+    m_hydro = resolve_model_rate("antigravity", "gemini-4-hydrogen-xhigh", cfg)
+    assert m_hydro is not None
+    assert m_hydro.matched_key == "gemini-4-hydrogen"
+    assert m_hydro.rate.input == 1.5
+    assert m_hydro.rate.output == 7.5
+    assert m_hydro.rate.cache_read == 0.075
+
+    m_neon = resolve_model_rate("antigravity", "gemini-4-neon-xhigh", cfg)
+    assert m_neon is not None
+    assert m_neon.matched_key == "gemini-4-neon"
+    assert m_neon.rate.input == 3.0
+    assert m_neon.rate.output == 15.0
+
+    m_opus5 = resolve_model_rate("claude", "claude-opus-5", cfg)
+    assert m_opus5 is not None
+    assert m_opus5.rate.input == 5.0
+    assert m_opus5.rate.output == 25.0
+    assert m_opus5.rate.cache_read == 0.5
+    assert m_opus5.rate.cache_write == 6.25
+
+    # Unknown / internal orchestrator models remain honestly unpriced until user configures them.
+    assert resolve_model_rate("antigravity", "gemini-pro-orchestrator", cfg) is None
+    assert resolve_model_rate("antigravity", "custom-preview-unpriced-x", cfg) is None
 
     # ZCode GLM 150% preset quota boost applies to zhipu\GLM-5.3 (1 / 1.5 = 0.666667).
     rec, _ = build_ledger_record(
@@ -221,7 +243,7 @@ def test_summary_excludes_unpriced_and_computes_cache_rate_over_observed_only():
             "task_id": "t1",
             "session_id": "s1",
             "agent": "antigravity",
-            "model": "gemini-4-hydrogen-xhigh",
+            "model": "custom-preview-unpriced-x",
             "status": "completed",
             "usage": {"input_tokens": 1000, "cache_read_tokens": 9000, "output_tokens": 500, "scope": "turn"},
             "created_at": "2026-11-20T08:00:00+00:00",

@@ -121,5 +121,29 @@ def storage_policy_path(home: Path | None = None) -> Path:
     return billing_dir(home) / "storage.json"
 
 
+def service_config_path(home: Path | None = None) -> Path:
+    return billing_dir(home) / "service.json"
+
+
+def dashboard_pid_path(home: Path | None = None) -> Path:
+    return billing_dir(home) / "dashboard.pid"
+
+
+def dashboard_log_path(home: Path | None = None) -> Path:
+    return billing_dir(home) / "dashboard.log"
+
+
 def dashboard_assets_dir() -> Path:
     return Path(__file__).resolve().parent / "dashboard_assets"
+
+
+def bundled_tray_script() -> Path:
+    here = Path(__file__).resolve()
+    for candidate in (
+        here.parent / "share" / "dashboard-tray.ps1",
+        here.parents[1] / "share" / "dashboard-tray.ps1",
+        here.parents[2] / "src" / "agent_bridge" / "share" / "dashboard-tray.ps1",
+    ):
+        if candidate.is_file():
+            return candidate
+    return here.parent / "share" / "dashboard-tray.ps1"

@@ -28,10 +28,19 @@
         <button class="tab active" data-tab="stats" role="tab" aria-selected="true">统计</button>
         <button class="tab" data-tab="records" role="tab" aria-selected="false">明细</button>
         <button class="tab" data-tab="pricing" role="tab" aria-selected="false">计价与折扣</button>
-        <button class="tab" data-tab="storage" role="tab" aria-selected="false">磁盘管理</button>
+        <button class="tab" data-tab="storage" role="tab" aria-selected="false">管理</button>
       </nav>
 
       <div class="topbar-actions">
+        <div class="live-poll-wrap" title="按文件指纹轻量探测新数据，仅在数据变化时静默刷新">
+          <span class="live-dot" id="live-poll-dot" aria-hidden="true"></span>
+          <select class="input input-sm" id="auto-refresh-select" aria-label="自动刷新间隔">
+            <option value="0">自动刷新：关</option>
+            <option value="5000">自动刷新：5s</option>
+            <option value="10000" selected>自动刷新：10s</option>
+            <option value="30000">自动刷新：30s</option>
+          </select>
+        </div>
         <button class="btn btn-ghost" id="btn-refresh" title="刷新数据">刷新</button>
         <button class="btn btn-ghost" id="btn-theme" title="切换浅色/深色主题">切换主题</button>
       </div>
@@ -245,8 +254,6 @@
               <label class="checkbox-label"><input type="checkbox" class="col-toggle" data-col="rate" checked /> tok/s</label>
               <label class="checkbox-label"><input type="checkbox" class="col-toggle" data-col="cost" checked /> 计费</label>
               <label class="checkbox-label"><input type="checkbox" class="col-toggle" data-col="duration" checked /> 耗时</label>
-              <span class="divider"></span>
-              <label class="checkbox-label"><input type="checkbox" id="rec-auto-refresh" /> 自动刷新 (10s)</label>
               <button class="btn btn-ghost btn-sm" id="btn-rec-reset">重置筛选</button>
             </div>
           </div>
@@ -407,14 +414,61 @@
         </div>
       </section>
 
-      <!-- ==================== TAB 4: 磁盘管理 ==================== -->
+      <!-- ==================== TAB 4: 管理 ==================== -->
       <section class="tab-panel" id="panel-storage">
+        <!-- Service & System Settings (Top Priority Section) -->
+        <div class="panel">
+          <div class="section-head">
+            <div>
+              <h2 class="section-title">服务与系统设置 <span class="badge badge-ok" id="svc-state-badge">检测中</span></h2>
+              <div class="section-sub">管理本地后台看板服务、Windows 系统托盘、用户级开机自启与按需更新（默认均关闭，仅在手动启用后生效）。</div>
+            </div>
+            <div class="inline-actions" id="svc-meta-badges"></div>
+          </div>
+
+          <div class="service-status-strip" id="svc-status-strip"></div>
+
+          <form class="storage-form" id="form-service-settings">
+            <div class="service-grid">
+              <div class="storage-field">
+                <label class="checkbox-label">
+                  <input type="checkbox" id="svc-autostart" />
+                  开机自动启动（Windows HKCU\Run，免管理员权限）
+                </label>
+                <div class="muted small-note" id="svc-autostart-note">登录 Windows 时静默启动后台看板服务；正式安装后建议重新开关一次以刷新路径。</div>
+              </div>
+
+              <div class="storage-field">
+                <label class="checkbox-label">
+                  <input type="checkbox" id="svc-tray" />
+                  开启 Windows 系统托盘控件 <span class="badge" id="svc-tray-badge">未运行</span>
+                </label>
+                <div class="muted small-note">托盘支持一键打开面板、启动/停止/重启服务、重启并更新及打开日志目录。</div>
+              </div>
+
+              <div class="storage-field" style="max-width:220px">
+                <label class="filter-label" for="svc-port">监听端口（仅 127.0.0.1）</label>
+                <input type="number" min="1024" max="65535" step="1" class="input input-sm" id="svc-port" value="8765" />
+                <div class="muted small-note">修改后点击「重启服务」生效。</div>
+              </div>
+            </div>
+
+            <div class="storage-actions">
+              <button type="submit" class="btn btn-primary">保存服务设置</button>
+              <button type="button" class="btn btn-ghost" id="btn-svc-restart">重启服务</button>
+              <button type="button" class="btn btn-ghost" id="btn-svc-update">重启并更新</button>
+              <button type="button" class="btn btn-ghost" id="btn-svc-folder">打开日志文件夹</button>
+              <button type="button" class="btn btn-danger" id="btn-svc-stop">停止服务</button>
+            </div>
+          </form>
+        </div>
+
         <div class="kpi-grid" id="storage-kpis"></div>
 
         <div class="panel">
           <div class="section-head">
             <div>
-              <h2 class="section-title">独立账本滚动留存策略</h2>
+              <h2 class="section-title">独立账本滚动留存与磁盘管理</h2>
               <div class="section-sub">账本独立落盘于 <code>~/.agent-bridge/billing/usage_ledger.jsonl</code>，不受主桥 <code>state.json</code> 200 条裁剪影响。体积超限时按完整行边界滚动保留最新 90%。</div>
             </div>
           </div>
@@ -561,6 +615,24 @@
           </div>
         </div>
       </form>
+    </div>
+  </div>
+
+  <!-- Info / Update Notice Modal -->
+  <div class="modal-backdrop hidden" id="info-modal-backdrop">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="info-modal-title">
+      <div class="modal-head">
+        <h3 id="info-modal-title">提示</h3>
+        <button class="btn btn-ghost btn-sm" id="btn-info-close">关闭</button>
+      </div>
+      <div class="modal-body">
+        <p id="info-modal-message" style="margin:0;font-size:14px"></p>
+        <div class="muted mono small-note hidden" id="info-modal-detail"></div>
+      </div>
+      <div class="modal-foot">
+        <span></span>
+        <button type="button" class="btn btn-primary" id="btn-info-ok">知道了</button>
+      </div>
     </div>
   </div>
 

@@ -24,8 +24,8 @@ These changes began in November 2026.
 ## Third-party design and reference data attribution
 
 The local billing ledger retention model, dashboard statistics/request-detail
-layout, and built-in reference USD API pricing table draw inspiration and
-verified public model price snapshots from
+layout, Windows WinForms system tray pattern, and built-in reference USD API
+pricing table draw inspiration and verified public model price snapshots from
 [opencodex](https://www.npmjs.com/package/@bitkyc08/opencodex)
 (`@bitkyc08/opencodex` v2.100.6, MIT License).
 

@@ -69,7 +69,7 @@ def test_dashboard_end_to_end_and_security_guards(tmp_path: Path):
             "cwd": "C:/Dev/Demo",
             "title": "Audit PR",
             "status": "completed",
-            "model": "gemini-4-hydrogen-xhigh",
+            "model": "custom-preview-unpriced-x",
             "message": "SECRET USER MESSAGE",
             "result_preview": "SECRET OUTPUT",
             "usage": {
@@ -136,7 +136,7 @@ def test_dashboard_end_to_end_and_security_guards(tmp_path: Path):
         agent_names = [a["name"] for a in meta["agents"]]
         assert {"antigravity", "codex", "cursor", "claude", "zcode"}.issubset(set(agent_names))
 
-        # 4. Summary for AGY initially marks gemini-4-hydrogen-xhigh unpriced
+        # 4. Summary for AGY initially marks custom-preview-unpriced-x unpriced
         st, summary = _json_req(port, "GET", "/api/summary?agents_filter=1&agents=antigravity")
         assert st == 200
         assert summary["overview"]["tasks"] == 1
@@ -169,7 +169,7 @@ def test_dashboard_end_to_end_and_security_guards(tmp_path: Path):
             csrf=csrf,
             payload={
                 "upsert_model": {
-                    "key": "gemini-4-hydrogen-xhigh",
+                    "key": "custom-preview-unpriced-x",
                     "rate": {"input": 4.0, "output": 20.0, "cache_read": 0.4, "cache_write": 0.0},
                 }
             },

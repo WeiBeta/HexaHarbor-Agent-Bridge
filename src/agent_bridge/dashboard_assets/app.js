@@ -4,6 +4,7 @@
   const CSRF_TOKEN = document.querySelector('meta[name="ab-csrf"]')?.getAttribute("content") || "";
   const COL_STORAGE_KEY = "hh.billing.records.cols.v1";
   const THEME_STORAGE_KEY = "hh.billing.theme.v1";
+  const REFRESH_STORAGE_KEY = "hh.billing.refresh.v1";
   const DEFAULT_COLS = { effort: true, tokens: true, rate: true, cost: true, duration: true };
 
   // Official brand casings for all bundled Agent IDE / Harness entries.
@@ -34,7 +35,12 @@
     summary: null,
     pricing: null,
     storage: null,
+    service: null,
     records: null,
+    lastRevision: null,
+    autoRefreshMs: loadRefreshMs(),
+    autoRefreshTimer: null,
+    pollInFlight: false,
     selectedAgents: new Set(),
     selectedModels: new Set(), // keys are "agent::model"
     statsModelQuery: "",
@@ -55,7 +61,6 @@
     recOffset: 0,
     recLimit: 50,
     recCols: loadCols(),
-    recTimer: null,
     pricingView: "observed", // observed | unpriced | user | presets
     pricingSearch: "",
     drawerTaskId: null,
@@ -73,6 +78,25 @@
       .replaceAll(">", "&gt;")
       .replaceAll('"', "&quot;")
       .replaceAll("'", "&#39;");
+  }
+
+  function loadRefreshMs() {
+    try {
+      const raw = localStorage.getItem(REFRESH_STORAGE_KEY);
+      if (raw === null) return 10000;
+      const n = Number(raw);
+      return [0, 5000, 10000, 30000].includes(n) ? n : 10000;
+    } catch {
+      return 10000;
+    }
+  }
+
+  function saveRefreshMs(ms) {
+    try {
+      localStorage.setItem(REFRESH_STORAGE_KEY, String(ms));
+    } catch {
+      // ignore
+    }
   }
 
   function loadCols() {
@@ -175,6 +199,15 @@
   function fmtPct(ratio) {
     if (ratio === null || ratio === undefined || Number.isNaN(Number(ratio))) return "—";
     return `${(Number(ratio) * 100).toFixed(1)}%`;
+  }
+
+  function fmtPct4(ratio) {
+    if (ratio === null || ratio === undefined || Number.isNaN(Number(ratio))) return "—";
+    const pct = Number(ratio) * 100;
+    if (!Number.isFinite(pct)) return "—";
+    if (pct <= 0) return "0%";
+    if (pct >= 100) return "100%";
+    return `${pct.toPrecision(4)}%`;
   }
 
   function fmtUsd(amount) {
@@ -445,7 +478,7 @@
         : "";
     const hitSub =
       ov.cache_hit_rate !== null
-        ? `综合命中率 ${fmtPct(ov.cache_hit_rate)} · 缓存写入 ${fmtCompact(ov.cache_write_tokens)}`
+        ? `综合命中率 ${fmtPct4(ov.cache_hit_rate)} · 缓存写入 ${fmtCompact(ov.cache_write_tokens)}`
         : "所选记录未上报缓存明细";
     const outSub =
       ov.reasoning_tokens > 0
@@ -566,13 +599,20 @@
       const idx = Number(btn.getAttribute("data-idx"));
       const d = daily[idx];
       btn.addEventListener("pointerenter", (ev) => {
+        const hitDenom = (d.uncached_input_tokens || 0) + (d.cache_read_tokens || 0);
+        const hitRatio =
+          d.cache_hit_rate !== undefined && d.cache_hit_rate !== null
+            ? d.cache_hit_rate
+            : hitDenom > 0 && d.cache_read_tokens > 0
+              ? d.cache_read_tokens / hitDenom
+              : null;
         tooltip.innerHTML = `
           <div class="tip-date">${esc(d.date)}</div>
           <div class="tip-row"><span class="tip-k">任务数</span><span class="tip-v">${fmtInt(d.tasks)} (已计量 ${fmtInt(d.measured_tasks)})</span></div>
           <div class="tip-row"><span class="tip-k">总 Token</span><span class="tip-v"><b>${fmtInt(d.total_tokens)}</b></span></div>
           <div class="tip-row"><span class="tip-k">输入 (净)</span><span class="tip-v">${fmtInt(d.uncached_input_tokens)}</span></div>
           <div class="tip-row"><span class="tip-k">缓存命中</span><span class="tip-v">${fmtInt(d.cache_read_tokens)}</span></div>
-          <div class="tip-row"><span class="tip-k">命中率</span><span class="tip-v">${fmtPct(d.cache_hit_rate)}</span></div>
+          <div class="tip-row"><span class="tip-k">命中率</span><span class="tip-v">${fmtPct4(hitRatio)}</span></div>
           <div class="tip-row"><span class="tip-k">输出</span><span class="tip-v">${fmtInt(d.output_tokens)}</span></div>
           <div class="tip-row"><span class="tip-k">折算费用</span><span class="tip-v"><b>${d.priced_tasks > 0 ? fmtUsd(d.effective_cost_usd) : "未定价"}</b></span></div>`;
         tooltip.classList.remove("hidden");
@@ -643,7 +683,7 @@
           <td class="num">${r.cache_read_tokens !== null ? fmtCompact(r.cache_read_tokens) : "—"}</td>
           <td class="num">${r.cache_write_tokens > 0 ? fmtCompact(r.cache_write_tokens) : "—"}</td>
           <td class="num">${fmtCompact(r.output_tokens)}</td>
-          <td class="num">${fmtPct(r.cache_hit_rate)}</td>
+          <td class="num">${fmtPct4(r.cache_hit_rate)}</td>
           <td class="num">${r.tok_per_sec !== null ? `${r.tok_per_sec}` : "—"}</td>
           <td class="num">${fmtCompact(r.total_tokens)}</td>
           <td class="num">${costCell}</td>
@@ -675,7 +715,7 @@
         <td class="num">${fmtCompact(a.uncached_input_tokens)}</td>
         <td class="num">${fmtCompact(a.cache_read_tokens)}</td>
         <td class="num">${fmtCompact(a.output_tokens)}</td>
-        <td class="num">${fmtPct(a.cache_hit_rate)}</td>
+        <td class="num">${fmtPct4(a.cache_hit_rate)}</td>
         <td class="num">${fmtCompact(a.total_tokens)}</td>
         <td class="num">${fmtUsd(a.list_cost_usd)}</td>
         <td class="num"><b>${fmtUsd(a.effective_cost_usd)}</b></td>
@@ -887,7 +927,7 @@
           <div class="kv-k">总 Token</div><div class="kv-v mono"><b>${fmtInt(t.total_tokens)}</b></div>
           <div class="kv-k">总输入（含缓存）</div><div class="kv-v mono">${fmtInt(t.input_tokens)}</div>
           <div class="kv-k">输入（净非缓存）</div><div class="kv-v mono">${fmtInt(t.uncached_input_tokens)}</div>
-          <div class="kv-k">缓存命中 (c)</div><div class="kv-v mono">${t.cache_reported ? `${fmtInt(t.cache_read_tokens)} (${fmtPct(r.cache_hit_rate)})` : "未上报"}</div>
+          <div class="kv-k">缓存命中 (c)</div><div class="kv-v mono">${t.cache_reported ? `${fmtInt(t.cache_read_tokens)} (${fmtPct4(r.cache_hit_rate)})` : "未上报"}</div>
           <div class="kv-k">缓存写入 (w)</div><div class="kv-v mono">${t.cache_write_tokens !== null ? fmtInt(t.cache_write_tokens) : "—"}</div>
           <div class="kv-k">输出（含推理）</div><div class="kv-v mono">${fmtInt(t.output_tokens)}</div>
           <div class="kv-k">其中推理/思考</div><div class="kv-v mono">${fmtInt(t.reasoning_tokens)}</div>
@@ -1091,7 +1131,139 @@
     $("modal-backdrop").classList.add("hidden");
   }
 
-  // ==================== Tab 4: Storage (磁盘管理) ====================
+  // ==================== Info Modal ====================
+  function openInfoModal(title, message, detail = "") {
+    $("info-modal-title").textContent = title || "提示";
+    $("info-modal-message").textContent = message || "";
+    const detailEl = $("info-modal-detail");
+    if (detail) {
+      detailEl.textContent = detail;
+      detailEl.classList.remove("hidden");
+    } else {
+      detailEl.textContent = "";
+      detailEl.classList.add("hidden");
+    }
+    $("info-modal-backdrop").classList.remove("hidden");
+  }
+
+  function closeInfoModal() {
+    $("info-modal-backdrop").classList.add("hidden");
+  }
+
+  function fmtUptime(sec) {
+    const s = Math.max(0, Math.floor(Number(sec) || 0));
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    const remS = s % 60;
+    if (m < 60) return `${m}m ${remS}s`;
+    const h = Math.floor(m / 60);
+    const remM = m % 60;
+    if (h < 24) return `${h}h ${remM}m`;
+    const d = Math.floor(h / 24);
+    return `${d}d ${h % 24}h`;
+  }
+
+  // ==================== Tab 4: Management (服务与磁盘管理) ====================
+  async function loadService() {
+    const res = await apiGet("/api/service");
+    state.service = res.service;
+    renderService();
+  }
+
+  function renderService() {
+    const svc = state.service;
+    if (!svc) return;
+    const badge = $("svc-state-badge");
+    badge.textContent = svc.running ? "运行中" : "已停止";
+    badge.className = svc.running ? "badge badge-ok" : "badge badge-warn";
+
+    const metaBadges = [];
+    if (svc.pid) metaBadges.push(`<span class="badge mono">PID ${esc(svc.pid)}</span>`);
+    if (svc.is_checkout) {
+      metaBadges.push(`<span class="badge badge-warn">源码测试版</span>`);
+    } else if (svc.install_kind) {
+      metaBadges.push(`<span class="badge">${esc(svc.install_kind)}</span>`);
+    }
+    if (svc.autostart?.enabled && !svc.autostart?.matches_current) {
+      metaBadges.push(`<span class="badge badge-warn">自启路径待刷新</span>`);
+    }
+    $("svc-meta-badges").innerHTML = metaBadges.join("");
+
+    const autostartText = svc.windows_supported
+      ? (svc.autostart?.enabled ? "已开启" : "未开启")
+      : "仅 Windows";
+    const trayText = svc.windows_supported
+      ? (svc.tray_running ? "运行中" : "未运行")
+      : "仅 Windows";
+    $("svc-status-strip").innerHTML = `
+      <div><span class="muted">监听地址：</span><span class="mono">${esc(svc.url)}</span></div>
+      <div><span class="muted">运行时间：</span><span class="mono">${svc.running ? esc(fmtUptime(svc.uptime_sec)) : "—"}</span></div>
+      <div><span class="muted">托盘 / 自启：</span><span>${esc(trayText)} / ${esc(autostartText)}</span></div>
+      <div><span class="muted">日志文件：</span><span class="mono">${esc(svc.log_path)}</span></div>
+    `;
+
+    const winOk = Boolean(svc.windows_supported);
+    $("svc-autostart").checked = Boolean(svc.config?.auto_start);
+    $("svc-autostart").disabled = !winOk;
+    if (!winOk) {
+      $("svc-autostart-note").textContent = "当前非 Windows 平台，仅 Windows 支持用户级 HKCU\\Run 开机自启。";
+    } else if (svc.is_checkout) {
+      $("svc-autostart-note").textContent = "当前处于测试源码目录，建议合并到正式安装后再开启开机自启；安装路径变更后重新保存一次即可刷新。";
+    } else {
+      $("svc-autostart-note").textContent = "登录 Windows 时静默启动后台看板服务；正式安装路径变更后重新保存一次即可刷新。";
+    }
+
+    $("svc-tray").checked = Boolean(svc.config?.tray_enabled);
+    $("svc-tray").disabled = !winOk;
+    const trayBadge = $("svc-tray-badge");
+    trayBadge.textContent = !winOk ? "仅 Windows" : (svc.tray_running ? "运行中" : "未运行");
+    trayBadge.className = winOk && svc.tray_running ? "badge badge-ok" : "badge";
+
+    $("svc-port").value = String(svc.config?.port ?? svc.port ?? 8765);
+  }
+
+  async function waitForServiceReconnect(targetUrl) {
+    const prevPid = state.service?.pid ?? null;
+    clearInterval(state.autoRefreshTimer);
+    state.autoRefreshTimer = null;
+    syncAutoRefreshUI(false);
+
+    let sameOrigin = true;
+    try {
+      const parsed = new URL(targetUrl || window.location.href, window.location.href);
+      sameOrigin = parsed.origin === window.location.origin;
+    } catch {
+      sameOrigin = true;
+    }
+
+    if (!sameOrigin) {
+      setTimeout(() => {
+        window.location.href = targetUrl;
+      }, 1800);
+      return;
+    }
+
+    // Wait briefly so the old process begins shutting down before polling /api/health.
+    await new Promise((r) => setTimeout(r, 900));
+    let sawDown = false;
+    for (let i = 0; i < 45; i++) {
+      try {
+        const res = await fetch("/api/health", { cache: "no-store" });
+        if (res.ok) {
+          const data = await res.json();
+          if (sawDown || (prevPid !== null && data.pid && data.pid !== prevPid)) {
+            window.location.reload();
+            return;
+          }
+        }
+      } catch {
+        sawDown = true;
+      }
+      await new Promise((r) => setTimeout(r, 700));
+    }
+    showToast("服务重连超时，请检查日志或手动刷新页面", true);
+  }
+
   async function loadStorage() {
     const res = await apiGet("/api/storage");
     state.storage = res.storage;
@@ -1166,7 +1338,7 @@
     if (state.activeTab === "stats") await loadSummary();
     else if (state.activeTab === "records") await loadRecords();
     else if (state.activeTab === "pricing") await loadPricing();
-    else if (state.activeTab === "storage") await loadStorage();
+    else if (state.activeTab === "storage") await Promise.all([loadService(), loadStorage()]);
   }
 
   async function refreshAll(firstLoad = false) {
@@ -1179,6 +1351,68 @@
     }
   }
 
+  // ==================== Auto-Refresh (Revision Polling) ====================
+  function isUserEditingOverlayOrForm() {
+    const modals = ["modal-backdrop", "clear-modal-backdrop", "info-modal-backdrop"];
+    for (const id of modals) {
+      const el = $(id);
+      if (el && !el.classList.contains("hidden")) return true;
+    }
+    const active = document.activeElement;
+    if (active && ["INPUT", "TEXTAREA", "SELECT"].includes(active.tagName)) {
+      if (active.closest("#panel-storage") || active.closest("#panel-pricing")) return true;
+    }
+    return false;
+  }
+
+  function syncAutoRefreshUI(online = true) {
+    const sel = $("auto-refresh-select");
+    if (sel) sel.value = String(state.autoRefreshMs);
+    const dot = $("live-poll-dot");
+    if (dot) {
+      dot.classList.toggle("active", Boolean(online && state.autoRefreshMs > 0 && !document.hidden));
+    }
+  }
+
+  async function checkRevisionAndRefresh() {
+    if (document.hidden || state.pollInFlight || state.autoRefreshMs <= 0) return;
+    state.pollInFlight = true;
+    try {
+      const ver = await apiGet("/api/version");
+      syncAutoRefreshUI(true);
+      if (state.lastRevision === null) {
+        state.lastRevision = ver.revision;
+        return;
+      }
+      if (ver.revision !== state.lastRevision) {
+        if (isUserEditingOverlayOrForm()) {
+          // Defer reload until user closes modal / finishes form input.
+          return;
+        }
+        state.lastRevision = ver.revision;
+        await refreshAll(false);
+        if (ver.imported_receipts > 0) {
+          showToast(`已自动同步 ${ver.imported_receipts} 条新回执`);
+        }
+      }
+    } catch {
+      syncAutoRefreshUI(false);
+    } finally {
+      state.pollInFlight = false;
+    }
+  }
+
+  function startAutoRefresh() {
+    clearInterval(state.autoRefreshTimer);
+    state.autoRefreshTimer = null;
+    syncAutoRefreshUI(true);
+    if (state.autoRefreshMs > 0) {
+      state.autoRefreshTimer = setInterval(() => {
+        checkRevisionAndRefresh();
+      }, state.autoRefreshMs);
+    }
+  }
+
   // ==================== Event Wiring ====================
   function wireEvents() {
     document.querySelectorAll(".tab").forEach((btn) => {
@@ -1187,6 +1421,19 @@
     $("btn-theme").addEventListener("click", toggleTheme);
     $("btn-refresh").addEventListener("click", () => {
       refreshAll(false).then(() => showToast("已刷新")).catch((e) => showToast(e.message, true));
+    });
+    $("auto-refresh-select").addEventListener("change", (ev) => {
+      const ms = Number(ev.target.value);
+      state.autoRefreshMs = [0, 5000, 10000, 30000].includes(ms) ? ms : 10000;
+      saveRefreshMs(state.autoRefreshMs);
+      startAutoRefresh();
+      showToast(state.autoRefreshMs > 0 ? `已开启自动刷新 (${state.autoRefreshMs / 1000}s)` : "已关闭自动刷新");
+    });
+    document.addEventListener("visibilitychange", () => {
+      syncAutoRefreshUI(true);
+      if (!document.hidden && state.autoRefreshMs > 0) {
+        checkRevisionAndRefresh();
+      }
     });
 
     // Agent pills
@@ -1325,16 +1572,6 @@
         saveCols();
         applyColumnVisibility();
       });
-    });
-
-    $("rec-auto-refresh").addEventListener("change", (ev) => {
-      clearInterval(state.recTimer);
-      state.recTimer = null;
-      if (ev.target.checked) {
-        state.recTimer = setInterval(() => {
-          if (state.activeTab === "records") loadRecords().catch(() => {});
-        }, 10000);
-      }
     });
 
     $("btn-rec-reset").addEventListener("click", () => {
@@ -1544,6 +1781,105 @@
       }
     });
 
+    // Service & system settings (Management tab top section)
+    $("form-service-settings").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      try {
+        const portVal = Number($("svc-port").value);
+        const payload = {
+          auto_start: $("svc-autostart").checked,
+          tray_enabled: $("svc-tray").checked,
+          port: portVal,
+        };
+        const res = await apiMutate("PUT", "/api/service", payload);
+        state.service = res.service;
+        renderService();
+        showToast(res.message || "已保存服务设置");
+      } catch (err) {
+        showToast(`保存失败：${err.message}`, true);
+      }
+    });
+
+    $("btn-svc-restart").addEventListener("click", async () => {
+      const btn = $("btn-svc-restart");
+      btn.disabled = true;
+      try {
+        const res = await apiMutate("POST", "/api/service/restart", {});
+        showToast(res.message || "正在重启服务…");
+        await waitForServiceReconnect(res.url || window.location.origin);
+      } catch (err) {
+        btn.disabled = false;
+        showToast(`重启失败：${err.message}`, true);
+      }
+    });
+
+    $("btn-svc-update").addEventListener("click", async () => {
+      const btn = $("btn-svc-update");
+      const origText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "正在检查更新…";
+      try {
+        const res = await apiMutate("POST", "/api/service/update", {});
+        if (res.status === "up_to_date") {
+          openInfoModal(
+            "检查更新",
+            res.message || "最新，别搞",
+            res.current_commit ? `当前提交：${res.current_commit}` : ""
+          );
+        } else if (res.status === "updating") {
+          openInfoModal(
+            "正在更新并重启",
+            res.message || "发现新版本，正在更新并重启服务…",
+            "完成后页面将自动重连并刷新；如遇异常请查看 billing/update.log。"
+          );
+          await waitForServiceReconnect(res.url || window.location.origin);
+        } else {
+          const detail = res.current_commit && res.remote_commit
+            ? `本地 ${res.current_commit} → 远端 ${res.remote_commit}`
+            : (res.current_commit ? `当前提交：${res.current_commit}` : "");
+          openInfoModal("更新未执行", res.message || "无法执行自动更新", detail);
+        }
+      } catch (err) {
+        openInfoModal("检查更新失败", err.message || "请求失败");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = origText;
+      }
+    });
+
+    $("btn-svc-folder").addEventListener("click", async () => {
+      try {
+        const res = await apiMutate("POST", "/api/service/open-folder", {});
+        if (res.ok) showToast(`已打开日志目录：${res.path}`);
+        else showToast(res.message || "无法打开目录", true);
+      } catch (err) {
+        showToast(`打开目录失败：${err.message}`, true);
+      }
+    });
+
+    $("btn-svc-stop").addEventListener("click", async () => {
+      if (!window.confirm("确认停止本地看板服务？停止后当前页面将断开，可随时通过托盘或 CLI 重新启动。")) return;
+      try {
+        await apiMutate("POST", "/api/service/stop", {});
+        clearInterval(state.autoRefreshTimer);
+        state.autoRefreshTimer = null;
+        syncAutoRefreshUI(false);
+        const badge = $("svc-state-badge");
+        badge.textContent = "已停止";
+        badge.className = "badge badge-warn";
+        openInfoModal(
+          "服务已停止",
+          "本地看板服务已停止，当前页面已断开连接。",
+          "如需再次查看，请运行 agent-bridge dashboard start 或从系统托盘点击「启动服务」。"
+        );
+      } catch (err) {
+        showToast(`停止失败：${err.message}`, true);
+      }
+    });
+
+    $("btn-info-close").addEventListener("click", closeInfoModal);
+    $("btn-info-ok").addEventListener("click", closeInfoModal);
+
     // Storage tab
     $("st-enable-size").addEventListener("change", (ev) => { $("st-max-mb").disabled = !ev.target.checked; });
     $("st-enable-age").addEventListener("change", (ev) => { $("st-max-days").disabled = !ev.target.checked; });
@@ -1632,6 +1968,7 @@
         closeDrawer();
         closePriceModal();
         closeClearModal();
+        closeInfoModal();
       }
     });
   }
@@ -1639,6 +1976,18 @@
   // ==================== Boot ====================
   initTheme();
   wireEvents();
+  syncAutoRefreshUI(true);
   updateDiscountPreview();
-  refreshAll(true).catch((err) => showToast(`初始化加载失败：${err.message}`, true));
+  refreshAll(true)
+    .then(() =>
+      apiGet("/api/version")
+        .then((v) => {
+          state.lastRevision = v.revision;
+        })
+        .catch(() => {})
+    )
+    .catch((err) => showToast(`初始化加载失败：${err.message}`, true))
+    .finally(() => {
+      startAutoRefresh();
+    });
 })();

@@ -35,7 +35,7 @@ HELP = f"""HexaHarbor Agent Bridge — connect local coding agents.
 
 Usage:
   agent-bridge                 start the MCP server on stdio
-  agent-bridge dashboard       open the localhost usage & billing dashboard
+  agent-bridge dashboard       open the localhost usage & billing dashboard (start|stop|restart|status|tray|update)
   agent-bridge --env           print reconstructed worker environment
   agent-bridge --quota         print each worker's remaining quota (fresh, no cache)
   agent-bridge --version       print the installed version
@@ -231,22 +231,83 @@ def main(argv: Sequence[str] | None = None) -> None:
     if command in {"dashboard", "billing", "--dashboard"}:
         import argparse
 
-        from agent_bridge.dashboard_server import (
-            DEFAULT_DASHBOARD_HOST,
-            DEFAULT_DASHBOARD_PORT,
-            run_dashboard,
+        from agent_bridge.dashboard_server import run_dashboard
+        from agent_bridge.dashboard_service import (
+            cli_update_and_restart,
+            restart_background_service,
+            service_status,
+            start_background_service,
+            start_tray,
+            stop_background_service,
+            stop_tray,
         )
 
-        parser = argparse.ArgumentParser(
-            prog="agent-bridge dashboard",
-            description="Start the local loopback usage & billing dashboard.",
+        sub_args = args[1:]
+        action = sub_args[0] if sub_args and not sub_args[0].startswith("-") else "serve"
+        rest = sub_args[1:] if sub_args and not sub_args[0].startswith("-") else sub_args
+
+        if action == "serve":
+            parser = argparse.ArgumentParser(
+                prog="agent-bridge dashboard",
+                description="Start the local loopback usage & billing dashboard.",
+            )
+            parser.add_argument("--host", default=None, help="loopback host (default: service.json or 127.0.0.1)")
+            parser.add_argument("--port", type=int, default=None, help="port (default: service.json or 8765)")
+            parser.add_argument("--no-open", action="store_true", help="do not open the browser automatically")
+            opts = parser.parse_args(rest)
+            run_dashboard(host=opts.host, port=opts.port, open_browser=not opts.no_open)
+            return
+        if action == "start":
+            parser = argparse.ArgumentParser(prog="agent-bridge dashboard start")
+            parser.add_argument("--host", default=None)
+            parser.add_argument("--port", type=int, default=None)
+            parser.add_argument("--open", action="store_true")
+            parser.add_argument("--tray", action="store_true")
+            opts = parser.parse_args(rest)
+            res = start_background_service(
+                host=opts.host,
+                port=opts.port,
+                open_browser=opts.open,
+                with_tray=True if opts.tray else None,
+            )
+            print(res.get("message", ""))
+            return
+        if action == "stop":
+            res = stop_background_service()
+            print(res.get("message", ""))
+            return
+        if action == "restart":
+            parser = argparse.ArgumentParser(prog="agent-bridge dashboard restart")
+            parser.add_argument("--host", default=None)
+            parser.add_argument("--port", type=int, default=None)
+            opts = parser.parse_args(rest)
+            res = restart_background_service(host=opts.host, port=opts.port)
+            print(res.get("message", ""))
+            return
+        if action == "status":
+            print(json.dumps(service_status(), indent=2, ensure_ascii=False))
+            return
+        if action == "tray":
+            parser = argparse.ArgumentParser(prog="agent-bridge dashboard tray")
+            parser.add_argument("--stop", action="store_true")
+            opts = parser.parse_args(rest)
+            res = stop_tray() if opts.stop else start_tray()
+            print(res.get("message", ""))
+            return
+        if action == "update":
+            parser = argparse.ArgumentParser(prog="agent-bridge dashboard update")
+            parser.add_argument("--json", dest="as_json", action="store_true")
+            opts = parser.parse_args(rest)
+            res = cli_update_and_restart()
+            if opts.as_json:
+                print(json.dumps(res, ensure_ascii=False))
+            else:
+                print(res.get("message", ""))
+            return
+        raise SystemExit(
+            f"unknown dashboard action: {action}\n"
+            "Use: agent-bridge dashboard [serve|start|stop|restart|status|tray|update]"
         )
-        parser.add_argument("--host", default=DEFAULT_DASHBOARD_HOST, help="loopback host (default: 127.0.0.1)")
-        parser.add_argument("--port", type=int, default=DEFAULT_DASHBOARD_PORT, help="port (default: 8765)")
-        parser.add_argument("--no-open", action="store_true", help="do not open the browser automatically")
-        opts = parser.parse_args(args[1:])
-        run_dashboard(host=opts.host, port=opts.port, open_browser=not opts.no_open)
-        return
     if command in {"--env", "env", "--print-env"}:
         from agent_bridge.config import load_config
         from agent_bridge.worker_env import describe_env
