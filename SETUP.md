@@ -595,3 +595,28 @@ Auth is `mcode login` under `~/.minimax` (`auth/<build>/<region>/auth.json`), or
 ## Permissions
 
 Most worker CLIs run in always-approve / skip-permissions mode. Codex CLI defaults to `--approve-for-me` (auto review + workspace-write); `--yolo` is opt-in via `[agents.codex] session_meta = { yolo = true }`. Review is the coordinator's job: `git diff`, build, tests. Cap follow-up turns at three, then the coordinator patches the rest.
+
+## Usage and billing dashboard
+
+HexaHarbor Agent Bridge includes an optional local usage & billing module and background service that stay completely out of the MCP tool list (zero context overhead for coordinators):
+
+```powershell
+agent-bridge dashboard                 # binds 127.0.0.1:8765 (or service.json port) and opens browser
+agent-bridge dashboard --port 9000 --no-open
+agent-bridge dashboard start --tray    # start detached background service + Windows system tray
+agent-bridge dashboard stop            # stop the background service
+agent-bridge dashboard restart         # restart the background service
+agent-bridge dashboard status          # print JSON service status
+agent-bridge dashboard tray            # launch Windows system tray control (--stop to close)
+agent-bridge dashboard update          # compatibility notice only
+```
+
+- The dashboard binds to IPv4 loopback. Use `127.0.0.1` or `localhost`. The `Host` allowlist and per-process CSRF token protect browser requests. Local processes and users who can reach the port can read dashboard data.
+- Backfill parses receipt and state JSON, which can contain a result preview. Metering uses those files as its task inputs and selects only metadata and token counters. The same projection applies to dashboard records and exports. See the formal task receipt for complete diagnostics.
+- **Live auto-refresh**: the dashboard polls a lightweight stat-based `/api/version` fingerprint (default 10 s, configurable in the top bar: `关 / 5s / 10s / 30s`) and automatically backfills newly written `receipts/*.json` files on disk.
+- The dashboard supports a background service and an optional Windows WinForms tray (`share/dashboard-tray.ps1`). Windows autostart is off by default and can belong to one Bridge home per user. This release shows a local notice for dashboard update. Use the [standard update command](#update) to upgrade Bridge.
+- **Independent storage (`~/.agent-bridge/billing/`)**:
+  - `usage_ledger.jsonl` — task usage ledger independent of `state.json` and `receipts/` pruning. Bridge records usage in the background after saving each receipt, even with the dashboard closed. `wait_task` can return before billing catches up. Starting the dashboard or polling `/api/version` backfills missing terminal receipts by `task_id` and corrects affected cumulative deltas when it recovers a missing turn.
+  - `pricing.json` — optional manual USD/1M token overrides (`input`, `output`, `cache_read`, `cache_write`; supports exact `model` or `agent::model` keys) plus `harness_discounts` rules (either `quota_boost` %, e.g. ZCode GLM 150% quota -> `0.6667x` effective cost, or direct `cost_multiplier`). Built-in reference prices are adapted from `@bitkyc08/opencodex` (MIT); unpriced models are explicitly excluded rather than counted as `$0`.
+  - `storage.json` — rolling retention limits (`max_bytes` default 100 MiB, `max_age_days` default 180 days, `auto_rotate` default `true`). Automatic rotation checks both limits on writes and removes the oldest usage first. Manage rotation, manual backfill, JSONL export, or double-confirmed ledger reset from the **Management (管理)** tab.
+  - `service.json` — background service host/port, autostart flag, and system tray flag (`auto_start` and `tray_enabled` default to `false`).

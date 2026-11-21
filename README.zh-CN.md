@@ -50,6 +50,7 @@ codex mcp add agent_bridge -- $bridge
 
 ## 扩展与开发
 
+- **本地计量与计费看板**：运行 `agent-bridge dashboard`，可用 `start|stop|restart|status|tray` 管理后台服务与 Windows 托盘。看板监听 IPv4 回环地址，本机进程可以访问。看板显示 Token 用量、缓存命中率、USD 标价折算和 Harness 折扣，支持自动刷新和磁盘留存。计量从任务回执和保存的状态中提取元数据，写入 `~/.agent-bridge/billing/` 下的独立账本。配置与文件格式见 [Usage and billing dashboard](SETUP.md#usage-and-billing-dashboard)。
 - [新增执行端](skills/add-worker/SKILL.md)或[接入另一种主控](skills/add-coordinator/SKILL.md)。遵循标准 ACP 的 CLI 往往只需补配置，不必写适配代码。
 - [中文贡献指南](CONTRIBUTING.zh-CN.md)：在源码目录运行 `uv run --extra dev pytest`。`tests/` 只放 pytest 测试；真实联调用 `scripts/setup_lab.py` 生成的本地 `lab/`，不进 Git。
 - [更新方法](SETUP.md#update)：先关掉正在使用 Bridge 的主控，运行 `agent-bridge upgrade`，再重启。本分支从 Git 安装，命令仍是 `agent-bridge`，示例中的 Codex MCP 名称为 `agent_bridge`。
