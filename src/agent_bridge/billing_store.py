@@ -240,24 +240,38 @@ def _encode_record(record: LedgerRecord) -> bytes:
     return (line + "\n").encode("utf-8")
 
 
-def _append_records_locked(path: Path, existing: list[LedgerRecord], additions: list[LedgerRecord]) -> None:
+def _append_records_locked(
+    path: Path,
+    existing: list[LedgerRecord],
+    additions: list[LedgerRecord],
+    *,
+    backfill_policy: StoragePolicy | None = None,
+) -> dict[str, Any] | None:
     corrections = _reconcile_cumulative_usage(existing, additions)
-    appended = b"".join(_encode_record(record) for record in additions)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if corrections:
+    appended = [_encode_record(record) for record in additions]
+    retention = None
+    if corrections or backfill_policy is not None:
         lines = _read_raw_lines(path)
-        for index, line in enumerate(lines):
-            try:
-                payload = json.loads(line.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            task_id = payload.get("task_id") if isinstance(payload, dict) else None
-            if isinstance(task_id, str) and task_id in corrections:
-                lines[index] = _encode_record(corrections[task_id])
-        # Publish the late turn and its changed successor deltas together.
-        _atomic_write_bytes(path, b"".join(lines) + appended)
-        return
+        if corrections:
+            for index, line in enumerate(lines):
+                try:
+                    payload = json.loads(line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                task_id = payload.get("task_id") if isinstance(payload, dict) else None
+                if isinstance(task_id, str) and task_id in corrections:
+                    lines[index] = _encode_record(corrections[task_id])
+        lines.extend(appended)
+        if backfill_policy is not None:
+            backfilled_ids = {record.task_id for record in additions} if existing else set()
+            lines, retention = _select_retained_lines(lines, backfill_policy, backfilled_ids=backfilled_ids)
+        if corrections or (retention is not None and retention["changed"]):
+            # Publish backfill, delta corrections, and eviction together. If
+            # replacement fails, a later write sees the original ledger.
+            _atomic_write_bytes(path, b"".join(lines))
+            return retention
 
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b") as handle:
         handle.seek(0, os.SEEK_END)
         if handle.tell():
@@ -267,8 +281,9 @@ def _append_records_locked(path: Path, existing: list[LedgerRecord], additions: 
                 # Drop that suffix before it can consume the next committed record.
                 handle.seek(0)
                 handle.truncate(handle.read().rfind(b"\n") + 1)
-        handle.write(appended)
+        handle.write(b"".join(appended))
         handle.flush()
+    return retention
 
 
 def _enforce_retention_locked(
@@ -276,31 +291,22 @@ def _enforce_retention_locked(
     policy: StoragePolicy,
     *,
     now: datetime | None = None,
-    backfilled_ids: Collection[str] = (),
 ) -> dict[str, Any]:
     path = usage_ledger_path(home)
-    if not path.is_file():
-        return {
-            "changed": False,
-            "removed_by_age": 0,
-            "removed_by_size": 0,
-            "removed_bytes": 0,
-            "remaining_records": 0,
-            "remaining_bytes": 0,
-        }
+    kept, retention = _select_retained_lines(_read_raw_lines(path), policy, now=now)
+    if retention["changed"]:
+        _atomic_write_bytes(path, b"".join(kept))
+    return retention
 
-    lines = _read_raw_lines(path)
+
+def _select_retained_lines(
+    lines: list[bytes],
+    policy: StoragePolicy,
+    *,
+    now: datetime | None = None,
+    backfilled_ids: Collection[str] = (),
+) -> tuple[list[bytes], dict[str, Any]]:
     original_bytes = sum(len(line) for line in lines)
-    if not lines:
-        return {
-            "changed": False,
-            "removed_by_age": 0,
-            "removed_by_size": 0,
-            "removed_bytes": 0,
-            "remaining_records": 0,
-            "remaining_bytes": 0,
-        }
-
     current_time = now or datetime.now(UTC)
     if current_time.tzinfo is None:
         current_time = current_time.replace(tzinfo=UTC)
@@ -338,18 +344,13 @@ def _enforce_retention_locked(
             only_backfilled = only_backfilled and backfilled
 
     removed_by_size = len(dropped_for_size)
-    changed = bool(removed_by_age or removed_by_size)
-    if changed:
-        _atomic_write_bytes(
-            path, b"".join(line for index, (line, _, _) in enumerate(kept) if index not in dropped_for_size)
-        )
-
-    return {
-        "changed": changed,
+    retained = [line for index, (line, _, _) in enumerate(kept) if index not in dropped_for_size]
+    return retained, {
+        "changed": bool(removed_by_age or removed_by_size),
         "removed_by_age": removed_by_age,
         "removed_by_size": removed_by_size,
         "removed_bytes": max(0, original_bytes - remaining_bytes),
-        "remaining_records": len(kept) - removed_by_size,
+        "remaining_records": len(retained),
         "remaining_bytes": remaining_bytes,
     }
 
@@ -525,14 +526,12 @@ def backfill_from_bridge_home(home: Path | None = None) -> dict[str, Any]:
             additions.append(record)
             known_ids.add(tid)
 
-        if additions:
-            _append_records_locked(path, existing, additions)
-
-        policy = load_storage_policy(resolved)
         retention = None
-        if additions and policy.auto_rotate:
-            backfilled_ids = {record.task_id for record in additions} if existing else set()
-            retention = _enforce_retention_locked(resolved, policy, backfilled_ids=backfilled_ids)
+        if additions:
+            policy = load_storage_policy(resolved)
+            retention = _append_records_locked(
+                path, existing, additions, backfill_policy=policy if policy.auto_rotate else None
+            )
 
     return {
         "scanned": len(candidates),

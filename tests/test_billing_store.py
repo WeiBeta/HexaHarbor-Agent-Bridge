@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_bridge import billing_store
 from agent_bridge.billing_pricing import ModelRate, PricingConfig
 from agent_bridge.billing_store import (
     MIN_LEDGER_MAX_BYTES,
@@ -217,6 +218,53 @@ def test_backfill_of_evicted_receipt_preserves_rows_under_the_size_cap(tmp_path,
     assert corrupt == 0
     assert [row.task_id for row in rows] == ["newest", "latest"]
     assert path.stat().st_size <= target
+
+
+def test_failed_backfill_rotation_leaves_the_previous_ledger_and_can_retry(tmp_path, monkeypatch):
+    now = datetime.now(UTC)
+    cap = MIN_LEDGER_MAX_BYTES
+    save_storage_policy(StoragePolicy(max_bytes=cap, max_age_days=None), home=tmp_path)
+
+    def receipt(task_id, days_ago, size):
+        return {
+            "task_id": task_id,
+            "agent": "codex",
+            "status": "completed",
+            "title": "a" * size,
+            "created_at": (now - timedelta(days=days_ago)).isoformat(),
+        }
+
+    previous_ids = ["middle", "recent", "newest"]
+    for task_id, days_ago in zip(previous_ids, (3, 2, 1), strict=True):
+        append_receipt_record(tmp_path, receipt(task_id, days_ago, 331_000))
+    _write_receipt(tmp_path, receipt("old", 4, 300_000))
+    path = usage_ledger_path(tmp_path)
+    original = path.read_bytes()
+    assert int(cap * RETENTION_TARGET_RATIO) < len(original) < cap
+    real_replace = billing_store.os.replace
+    ledger_replacements = []
+
+    def replace(src, dst):
+        if dst == path:
+            ledger_replacements.append(dst)
+            if len(ledger_replacements) == 1:
+                raise PermissionError("synthetic ledger replacement failure")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(billing_store.os, "replace", replace)
+    with pytest.raises(PermissionError, match="synthetic ledger replacement failure"):
+        backfill_from_bridge_home(tmp_path)
+    assert len(ledger_replacements) == 1
+    assert path.read_bytes() == original
+
+    append_receipt_record(tmp_path, receipt("small", 0, 100))
+    committed = path.read_bytes()
+    assert committed.startswith(original) and len(committed) < cap
+    retried = backfill_from_bridge_home(tmp_path)
+    assert retried["imported"] == 1 and retried["retention"]["removed_by_size"] == 1
+    assert path.read_bytes() == committed
+    rows, corrupt = load_ledger(tmp_path)
+    assert corrupt == 0 and [row.task_id for row in rows] == [*previous_ids, "small"]
 
 
 @pytest.mark.parametrize("auto_rotate", [False, True])
