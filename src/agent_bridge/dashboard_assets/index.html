@@ -4,16 +4,21 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="ab-csrf" content="__AB_CSRF_TOKEN__" />
-  <title>HexaHarbor · Agent Bridge 计量与计费看板</title>
+  <title>六库仙贼/HexaHarbor · 计量与计费看板</title>
   <link rel="stylesheet" href="/assets/app.css" />
 </head>
 <body>
   <div class="app-shell">
     <header class="topbar">
       <div class="brand">
-        <div class="brand-mark" aria-hidden="true">HH</div>
+        <div class="brand-mark" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round">
+            <polygon points="12 2 21 7 21 17 12 22 3 17 3 7"></polygon>
+            <circle cx="12" cy="12" r="2.4" fill="currentColor" stroke="none"></circle>
+          </svg>
+        </div>
         <div>
-          <div class="brand-title">HexaHarbor · 计量与计费看板</div>
+          <div class="brand-title">六库仙贼/HexaHarbor · 计量与计费看板</div>
           <div class="brand-sub" id="brand-meta">本地循环地址 · 仅元数据统计（不含对话正文）· USD</div>
         </div>
       </div>
@@ -38,9 +43,9 @@
           <div class="filter-row">
             <div class="filter-group grow">
               <div class="filter-header">
-                <span class="filter-label">一级归因 · Agent / Harness</span>
+                <span class="filter-label">Agent IDE/Harness</span>
                 <div class="inline-actions">
-                  <button class="btn-link" id="btn-agent-agy">仅选 AGY</button>
+                  <button class="btn-link" id="btn-agent-agy">仅选 Antigravity</button>
                   <button class="btn-link" id="btn-agent-all">全选</button>
                   <button class="btn-link" id="btn-agent-clear">清空</button>
                 </div>
@@ -52,7 +57,7 @@
           <div class="filter-row">
             <div class="filter-group grow">
               <div class="filter-header">
-                <span class="filter-label">二级归因 · 模型 <span class="muted" id="stats-model-count"></span></span>
+                <span class="filter-label">模型 <span class="muted" id="stats-model-count"></span></span>
                 <div class="inline-actions">
                   <input type="search" class="input input-sm" id="stats-model-search" placeholder="筛选模型…" />
                   <button class="btn-link" id="btn-model-all">全选</button>
@@ -151,7 +156,7 @@
         <!-- Agent summary table -->
         <div class="panel table-card">
           <div class="section-head">
-            <h2 class="section-title">按 Agent / Harness 汇总</h2>
+            <h2 class="section-title">按 Agent IDE/Harness 汇总</h2>
           </div>
           <div class="table-wrap">
             <table class="data-table">

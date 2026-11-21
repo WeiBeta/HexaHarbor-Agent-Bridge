@@ -701,6 +701,8 @@ def compute_summary(
                 "cache_write_tokens": 0,
                 "output_tokens": 0,
                 "total_tokens": 0,
+                "cache_observed_input_tokens": 0,
+                "cache_observed_hits": 0,
                 "list_cost_usd": 0.0,
                 "effective_cost_usd": 0.0,
                 "priced_tasks": 0,
@@ -817,6 +819,8 @@ def compute_summary(
                 cache_obs_tasks += 1
                 cache_obs_input += t.input_tokens
                 cache_obs_hits += t.cache_read_tokens
+                d_bucket["cache_observed_input_tokens"] += t.input_tokens
+                d_bucket["cache_observed_hits"] += t.cache_read_tokens
                 m_row["cache_observed_tasks"] += 1
                 m_row["cache_observed_input_tokens"] += t.input_tokens
                 m_row["cache_observed_hits"] += t.cache_read_tokens
@@ -936,6 +940,9 @@ def compute_summary(
     for point in daily_series:
         point["list_cost_usd"] = round(point["list_cost_usd"], 6)
         point["effective_cost_usd"] = round(point["effective_cost_usd"], 6)
+        obs_in = point.pop("cache_observed_input_tokens")
+        obs_hits = point.pop("cache_observed_hits")
+        point["cache_hit_rate"] = round(obs_hits / obs_in, 6) if obs_in > 0 else None
 
     overall_hit_rate = (cache_obs_hits / cache_obs_input) if cache_obs_input > 0 else None
     overall_tps = (

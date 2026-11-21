@@ -6,6 +6,28 @@
   const THEME_STORAGE_KEY = "hh.billing.theme.v1";
   const DEFAULT_COLS = { effort: true, tokens: true, rate: true, cost: true, duration: true };
 
+  // Official brand casings for all bundled Agent IDE / Harness entries.
+  const AGENT_DISPLAY_NAMES = {
+    antigravity: "Antigravity",
+    claude: "Claude Code",
+    codex: "Codex",
+    cursor: "Cursor",
+    devin: "Devin",
+    dsh: "DeepSeek Harness",
+    grok: "Grok Build",
+    kimi: "Kimi Code",
+    minimax: "MiniMax Code",
+    opencode: "OpenCode",
+    zcode: "ZCode",
+  };
+
+  function agentLabel(id) {
+    if (!id) return "";
+    if (id === "*") return "* (全部 Agent)";
+    const key = String(id).trim().toLowerCase();
+    return AGENT_DISPLAY_NAMES[key] || String(id);
+  }
+
   const state = {
     activeTab: "stats",
     meta: null,
@@ -303,13 +325,13 @@
     const recAgentSel = $("rec-agent");
     const prevRecAgent = recAgentSel.value;
     recAgentSel.innerHTML = `<option value="">全部 Agent</option>` +
-      state.meta.agents.map((a) => `<option value="${esc(a.name)}">${esc(a.name)} (${a.tasks})</option>`).join("");
+      state.meta.agents.map((a) => `<option value="${esc(a.name)}">${esc(agentLabel(a.name))} (${a.tasks})</option>`).join("");
     recAgentSel.value = prevRecAgent;
 
     const discAgentSel = $("disc-agent");
     const prevDiscAgent = discAgentSel.value;
     discAgentSel.innerHTML = state.meta.agents
-      .map((a) => `<option value="${esc(a.name)}">${esc(a.name)}</option>`)
+      .map((a) => `<option value="${esc(a.name)}">${esc(agentLabel(a.name))}</option>`)
       .join("") + `<option value="*">* (全部 Agent)</option>`;
     if (prevDiscAgent) discAgentSel.value = prevDiscAgent;
     else if (state.meta.agents.some((a) => a.name === "zcode")) discAgentSel.value = "zcode";
@@ -324,8 +346,8 @@
     wrap.innerHTML = state.meta.agents
       .map((a) => {
         const sel = state.selectedAgents.has(a.name);
-        return `<button type="button" class="pill ${sel ? "selected" : ""}" data-agent="${esc(a.name)}">
-          <span>${esc(a.name)}</span>
+        return `<button type="button" class="pill ${sel ? "selected" : ""}" data-agent="${esc(a.name)}" title="${esc(a.name)}">
+          <span>${esc(agentLabel(a.name))}</span>
           <span class="pill-count">${a.tasks}</span>
         </button>`;
       })
@@ -337,7 +359,12 @@
     const available = modelsForSelectedAgents();
     const q = state.statsModelQuery.trim().toLowerCase();
     const visible = q
-      ? available.filter((x) => x.model.toLowerCase().includes(q) || x.agent.toLowerCase().includes(q))
+      ? available.filter(
+          (x) =>
+            x.model.toLowerCase().includes(q) ||
+            x.agent.toLowerCase().includes(q) ||
+            agentLabel(x.agent).toLowerCase().includes(q)
+        )
       : available;
     const selectedCount = available.filter((x) => state.selectedModels.has(x.pair)).length;
     $("stats-model-count").textContent = available.length ? `(已选 ${selectedCount}/${available.length})` : "(当前 Agent 暂无模型记录)";
@@ -350,7 +377,7 @@
     wrap.innerHTML = visible
       .map((x) => {
         const sel = state.selectedModels.has(x.pair);
-        const label = multiAgent ? `${x.agent} / ${x.model}` : x.model;
+        const label = multiAgent ? `${agentLabel(x.agent)} / ${x.model}` : x.model;
         return `<button type="button" class="pill ${sel ? "selected" : ""}" data-pair="${esc(x.pair)}" title="${esc(x.pair)}">
           <span class="mono">${esc(label)}</span>
         </button>`;
@@ -391,7 +418,7 @@
     if (ov.tasks === 0 && state.meta && state.meta.total_records > 0) {
       const nonEmpty = state.meta.agents.filter((a) => a.tasks > 0);
       if (nonEmpty.length > 0) {
-        banner.innerHTML = `<span>当前筛选下暂无记录，但账本中共有 ${fmtInt(state.meta.total_records)} 条记录（${esc(nonEmpty.map((a) => `${a.name}:${a.tasks}`).join(" / "))}）。</span>
+        banner.innerHTML = `<span>当前筛选下暂无记录，但账本中共有 ${fmtInt(state.meta.total_records)} 条记录（${esc(nonEmpty.map((a) => `${agentLabel(a.name)}: ${a.tasks}`).join(" / "))}）。</span>
           <button type="button" class="btn btn-primary btn-sm" id="btn-show-nonempty">切换到有数据的 Agent</button>`;
         banner.classList.remove("hidden");
         $("btn-show-nonempty")?.addEventListener("click", () => {
@@ -473,13 +500,13 @@
 
     if (metric === "tokens") {
       legend.innerHTML = `
-        <span class="legend-item"><span class="legend-dot" style="background:var(--bar-in)"></span>输入 (净)</span>
         <span class="legend-item"><span class="legend-dot" style="background:var(--bar-cache)"></span>缓存命中</span>
+        <span class="legend-item"><span class="legend-dot" style="background:var(--bar-in)"></span>输入 (净)</span>
         <span class="legend-item"><span class="legend-dot" style="background:var(--bar-out)"></span>输出</span>`;
     } else if (metric === "cost") {
       legend.innerHTML = `<span class="legend-item"><span class="legend-dot" style="background:var(--bar-cost)"></span>折算费用 (USD)</span>`;
     } else {
-      legend.innerHTML = `<span class="legend-item"><span class="legend-dot" style="background:var(--accent)"></span>任务数</span>`;
+      legend.innerHTML = `<span class="legend-item"><span class="legend-dot" style="background:var(--bar-tasks)"></span>任务数</span>`;
     }
 
     if (!daily.length) {
@@ -509,12 +536,12 @@
         if (metric === "tokens") {
           const denom = d.uncached_input_tokens + d.cache_read_tokens + d.output_tokens;
           if (denom > 0) {
-            const pIn = (d.uncached_input_tokens / denom) * 100;
             const pCache = (d.cache_read_tokens / denom) * 100;
-            const pOut = Math.max(0, 100 - pIn - pCache);
+            const pIn = (d.uncached_input_tokens / denom) * 100;
+            const pOut = Math.max(0, 100 - pCache - pIn);
             inner = `
-              <div class="bar-seg-in" style="height:${pIn.toFixed(2)}%"></div>
               <div class="bar-seg-cache" style="height:${pCache.toFixed(2)}%"></div>
+              <div class="bar-seg-in" style="height:${pIn.toFixed(2)}%"></div>
               <div class="bar-seg-out" style="height:${pOut.toFixed(2)}%"></div>`;
           } else {
             inner = `<div class="bar-seg-in" style="height:100%"></div>`;
@@ -540,12 +567,14 @@
       const d = daily[idx];
       btn.addEventListener("pointerenter", (ev) => {
         tooltip.innerHTML = `
-          <div class="mono" style="font-weight:650;margin-bottom:4px">${esc(d.date)}</div>
-          <div>任务：<b>${fmtInt(d.tasks)}</b>（已计量 ${fmtInt(d.measured_tasks)}）</div>
-          <div>总 Token：<b>${fmtInt(d.total_tokens)}</b></div>
-          <div>输入(净)：${fmtInt(d.uncached_input_tokens)} · 缓存：${fmtInt(d.cache_read_tokens)}</div>
-          <div>输出：${fmtInt(d.output_tokens)}</div>
-          <div>折算费用：<b>${d.priced_tasks > 0 ? fmtUsd(d.effective_cost_usd) : "未定价"}</b>${d.unpriced_tasks > 0 ? ` (排 ${d.unpriced_tasks})` : ""}</div>`;
+          <div class="tip-date">${esc(d.date)}</div>
+          <div class="tip-row"><span class="tip-k">任务数</span><span class="tip-v">${fmtInt(d.tasks)} (已计量 ${fmtInt(d.measured_tasks)})</span></div>
+          <div class="tip-row"><span class="tip-k">总 Token</span><span class="tip-v"><b>${fmtInt(d.total_tokens)}</b></span></div>
+          <div class="tip-row"><span class="tip-k">输入 (净)</span><span class="tip-v">${fmtInt(d.uncached_input_tokens)}</span></div>
+          <div class="tip-row"><span class="tip-k">缓存命中</span><span class="tip-v">${fmtInt(d.cache_read_tokens)}</span></div>
+          <div class="tip-row"><span class="tip-k">命中率</span><span class="tip-v">${fmtPct(d.cache_hit_rate)}</span></div>
+          <div class="tip-row"><span class="tip-k">输出</span><span class="tip-v">${fmtInt(d.output_tokens)}</span></div>
+          <div class="tip-row"><span class="tip-k">折算费用</span><span class="tip-v"><b>${d.priced_tasks > 0 ? fmtUsd(d.effective_cost_usd) : "未定价"}</b></span></div>`;
         tooltip.classList.remove("hidden");
         positionTooltip(ev);
       });
@@ -578,7 +607,12 @@
     const rows = state.summary?.models || [];
     const q = state.modelsTableQuery.trim().toLowerCase();
     const filtered = q
-      ? rows.filter((r) => r.model.toLowerCase().includes(q) || r.agent.toLowerCase().includes(q))
+      ? rows.filter(
+          (r) =>
+            r.model.toLowerCase().includes(q) ||
+            r.agent.toLowerCase().includes(q) ||
+            agentLabel(r.agent).toLowerCase().includes(q)
+        )
       : rows;
     $("models-table-count").textContent = String(filtered.length);
 
@@ -599,7 +633,7 @@
             : `<span class="badge badge-warn">未定价</span>`;
         return `<tr>
           <td class="mono" title="${esc(r.model)}">${esc(r.model)}</td>
-          <td><span class="badge">${esc(r.agent)}</span></td>
+          <td><span class="badge" title="${esc(r.agent)}">${esc(agentLabel(r.agent))}</span></td>
           <td>
             <span class="share-bar"><span class="share-fill" style="width:${(r.share_ratio * 100).toFixed(1)}%"></span></span>
             <span class="num muted">${fmtPct(r.share_ratio)}</span>
@@ -632,7 +666,7 @@
     body.innerHTML = rows
       .map(
         (a) => `<tr>
-        <td><span class="badge badge-accent">${esc(a.agent)}</span></td>
+        <td><span class="badge badge-accent" title="${esc(a.agent)}">${esc(agentLabel(a.agent))}</span></td>
         <td>
           <span class="share-bar"><span class="share-fill" style="width:${(a.share_ratio * 100).toFixed(1)}%"></span></span>
           <span class="num muted">${fmtPct(a.share_ratio)}</span>
@@ -745,7 +779,7 @@
               <div>${esc(item.title || item.task_id)}${deltaBadge}</div>
               <div class="muted mono" style="font-size:11px">${esc(shortPath(item.cwd))}</div>
             </td>
-            <td><span class="badge">${esc(item.agent)}</span></td>
+            <td><span class="badge" title="${esc(item.agent)}">${esc(agentLabel(item.agent))}</span></td>
             <td class="mono">${esc(item.effective_model)}${modelNote}</td>
             <td data-col-cell="effort" class="mono muted">${esc(effortVal)}</td>
             <td>${statusBadge(item.status)}</td>
@@ -825,7 +859,7 @@
       <div class="detail-sec">
         <h4>基本信息</h4>
         <div class="kv-grid">
-          <div class="kv-k">Agent / Harness</div><div class="kv-v"><span class="badge badge-accent">${esc(r.agent)}</span></div>
+          <div class="kv-k">Agent IDE/Harness</div><div class="kv-v"><span class="badge badge-accent" title="${esc(r.agent)}">${esc(agentLabel(r.agent))}</span></div>
           <div class="kv-k">状态</div><div class="kv-v">${statusBadge(r.status)} ${r.stop_reason ? `<span class="muted mono">(${esc(r.stop_reason)})</span>` : ""}</div>
           <div class="kv-k">模型</div><div class="kv-v mono">${esc(r.effective_model)}${r.model && r.observed_model && r.model !== r.observed_model ? ` <span class="muted">(请求 ${esc(r.model)})</span>` : ""}</div>
           <div class="kv-k">推理强度</div><div class="kv-v mono">${esc(r.observed_effort || r.effort || "—")}</div>
@@ -905,7 +939,7 @@
       .map(
         (r, idx) => `<tr>
         <td><input type="checkbox" class="disc-toggle" data-idx="${idx}" ${r.enabled ? "checked" : ""} /></td>
-        <td><span class="badge badge-accent">${esc(r.agent)}</span></td>
+        <td><span class="badge badge-accent" title="${esc(r.agent)}">${esc(agentLabel(r.agent))}</span></td>
         <td class="mono">${esc(r.model_pattern || "*")}</td>
         <td>${r.mode === "quota_boost" ? "额度膨胀 %" : "计费倍率 ×"}</td>
         <td class="num">${Number(r.quota_boost_pct).toFixed(1)}%</td>
@@ -930,7 +964,7 @@
         .map((m) => ({
           key: m.model,
           agent: m.agent,
-          subLabel: `${m.agent} · ${m.tasks} 次任务`,
+          subLabel: `${agentLabel(m.agent)} · ${m.tasks} 次任务`,
           source: m.source,
           rate: m.rate,
           discount: m.discount_multiplier !== 1 ? `${m.discount_label || ""} (×${Number(m.discount_multiplier).toFixed(3)})` : "—",
@@ -944,7 +978,7 @@
         return {
           key: k,
           agent: ag === "*" ? "" : ag,
-          subLabel: ag === "*" ? "全局模型覆盖" : `仅限 ${ag}`,
+          subLabel: ag === "*" ? "全局模型覆盖" : `仅限 ${agentLabel(ag)}`,
           source: "user",
           rate,
           discount: "—",
@@ -961,7 +995,7 @@
         return {
           key: p.key,
           agent: p.agent_hint,
-          subLabel: `参考归属：${p.agent_hint}`,
+          subLabel: `参考归属：${agentLabel(p.agent_hint)}`,
           source: hasOverride ? "user" : "preset",
           rate: effectiveRate,
           discount: "—",
@@ -1038,7 +1072,7 @@
     state.modalCtx = { agent: scopedAgent, baseModel, scopedKey };
     $("modal-scope-wrap").classList.toggle("hidden", !scopedAgent);
     $("modal-scope-agent").checked = useScoped;
-    $("modal-scope-label").textContent = `仅覆盖当前 Agent (${scopedAgent}::${baseModel})`;
+    $("modal-scope-label").textContent = `仅覆盖当前 ${agentLabel(scopedAgent)} (${scopedAgent}::${baseModel})`;
     $("modal-key").value = useScoped && scopedAgent ? scopedKey : baseModel;
     $("modal-in").value = activeRate ? String(activeRate.input) : "";
     $("modal-out").value = activeRate ? String(activeRate.output) : "";

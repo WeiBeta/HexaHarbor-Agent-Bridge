@@ -252,6 +252,8 @@ def test_summary_excludes_unpriced_and_computes_cache_rate_over_observed_only():
     # NOT diluted by Cursor's unreported 10000 input tokens.
     assert ov["cache_hit_rate"] == pytest.approx(0.9, rel=1e-6)
     assert ov["effective_cost_usd"] == pytest.approx((10000 * 1.25 + 1000 * 6.0) / 1e6, rel=1e-6)
+    assert len(summary["daily"]) == 1
+    assert summary["daily"][0]["cache_hit_rate"] == pytest.approx(0.9, rel=1e-6)
 
     # Filtering by agent and pair model key works accurately.
     only_agy = filter_records([rec_agy_unpriced, rec_cursor_nocache], agents={"antigravity"})
