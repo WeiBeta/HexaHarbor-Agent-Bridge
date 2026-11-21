@@ -583,11 +583,55 @@ def test_non_tray_launch_paths_still_use_detached_kwargs(tmp_path: Path, monkeyp
     monkeypatch.setattr(dashboard_service.subprocess, "Popen", popen)
     dashboard_service.open_billing_folder(tmp_path)
     dashboard_service._spawn_restart_helper(tmp_path, ("127.0.0.1", 8765), log_path=tmp_path / "dashboard.log")
-    dashboard_service.start_background_service(tmp_path, with_tray=False)
-    assert len(calls) == 3
+    assert len(calls) == 2
     for kwargs in calls:
         assert kwargs["creationflags"] == sentinel["creationflags"]
         assert kwargs["close_fds"] is True
+
+
+def test_background_dashboard_uses_only_create_no_window_on_windows(tmp_path: Path, monkeypatch):
+    sentinel = {"creationflags": 0x12345678, "close_fds": True}
+    calls = []
+    monkeypatch.setattr(dashboard_service, "_detached_kwargs", lambda: dict(sentinel))
+    monkeypatch.setattr(dashboard_service, "os", _OsNameProxy("nt"))
+    monkeypatch.setattr(dashboard_service, "process_create_time", lambda _pid: 1.0)
+    monkeypatch.setattr(dashboard_service, "resolve_bridge_command", lambda: ("agent-bridge.exe", []))
+    monkeypatch.setattr(dashboard_service, "read_pid_record", lambda _home: None)
+
+    def popen(_cmd, **kwargs):
+        calls.append(kwargs)
+        return types.SimpleNamespace(pid=4567, poll=lambda: 1)
+
+    monkeypatch.setattr(dashboard_service.subprocess, "Popen", popen)
+    dashboard_service.start_background_service(tmp_path, with_tray=False)
+    assert len(calls) == 1
+    kwargs = calls[0]
+    assert kwargs["creationflags"] == 0x08000000
+    assert not kwargs["creationflags"] & 0x00000008
+    assert not kwargs["creationflags"] & 0x00000200
+    assert kwargs["close_fds"] is True
+    assert "start_new_session" not in kwargs
+    spawn_options = {key: kwargs[key] for key in ("creationflags", "close_fds")}
+    assert spawn_options != dashboard_service._detached_kwargs()
+
+
+def test_background_dashboard_starts_new_session_on_posix(tmp_path: Path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(dashboard_service, "os", _OsNameProxy("posix"))
+    monkeypatch.setattr(dashboard_service, "process_create_time", lambda _pid: 1.0)
+    monkeypatch.setattr(dashboard_service, "resolve_bridge_command", lambda: ("agent-bridge", []))
+    monkeypatch.setattr(dashboard_service, "read_pid_record", lambda _home: None)
+
+    def popen(_cmd, **kwargs):
+        calls.append(kwargs)
+        return types.SimpleNamespace(pid=4567, poll=lambda: 1)
+
+    monkeypatch.setattr(dashboard_service.subprocess, "Popen", popen)
+    dashboard_service.start_background_service(tmp_path, with_tray=False)
+    assert len(calls) == 1
+    assert calls[0]["start_new_session"] is True
+    assert calls[0]["close_fds"] is True
+    assert "creationflags" not in calls[0]
 
 
 def test_unrecorded_health_cannot_report_launch_success(tmp_path, monkeypatch):

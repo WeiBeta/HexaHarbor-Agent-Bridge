@@ -348,6 +348,18 @@ def _detached_kwargs() -> dict[str, Any]:
     return {"start_new_session": True, "close_fds": True}
 
 
+def _dashboard_service_kwargs() -> dict[str, Any]:
+    """Launch the dashboard service without a console or terminal window.
+
+    DETACHED_PROCESS makes Windows ignore CREATE_NO_WINDOW, so the dashboard
+    child can receive a visible console hosted by Windows Terminal.  Keep this
+    launch separate from the detached children that need their own process group.
+    """
+    if os.name == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000), "close_fds": True}
+    return {"start_new_session": True, "close_fds": True}
+
+
 def start_tray(
     home: Path | None = None,
     *,
@@ -590,7 +602,7 @@ def start_background_service(
                 stdout=sink,
                 stderr=sink,
                 env=env,
-                **_detached_kwargs(),
+                **_dashboard_service_kwargs(),
             )
     except OSError as exc:
         return {"started": False, "running": False, "message": f"无法启动看板命令 ({type(exc).__name__})"}
