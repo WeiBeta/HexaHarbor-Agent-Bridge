@@ -1,0 +1,184 @@
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+from agent_bridge.billing_pricing import ModelRate, PricingConfig
+from agent_bridge.billing_store import (
+    MIN_LEDGER_MAX_BYTES,
+    StoragePolicy,
+    append_receipt_record,
+    backfill_from_bridge_home,
+    clear_ledger,
+    enforce_retention,
+    load_ledger,
+    load_pricing,
+    load_storage_policy,
+    reset_pricing,
+    save_pricing,
+    save_storage_policy,
+    storage_stats,
+)
+from agent_bridge.paths import usage_ledger_path
+
+
+def _write_receipt(home: Path, payload: dict) -> None:
+    rec_dir = home / "receipts"
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    (rec_dir / f"{payload['task_id']}.json").write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def test_backfill_computes_agy_conversation_delta_and_is_idempotent(tmp_path: Path):
+    _write_receipt(
+        tmp_path,
+        {
+            "task_id": "task_a",
+            "session_id": "sess_agy",
+            "agent": "antigravity",
+            "cwd": str(tmp_path),
+            "title": "Turn 1",
+            "status": "completed",
+            "model": "gemini-4-argon",
+            "result_preview": "DO NOT COPY RESULT TEXT",
+            "usage": {"input_tokens": 500, "cache_read_tokens": 1000, "output_tokens": 200, "scope": "turn"},
+            "created_at": "2026-11-20T10:00:00+00:00",
+            "started_at": "2026-11-20T10:00:00+00:00",
+            "finished_at": "2026-11-20T10:00:05+00:00",
+        },
+    )
+    _write_receipt(
+        tmp_path,
+        {
+            "task_id": "task_b",
+            "session_id": "sess_agy",
+            "agent": "antigravity",
+            "cwd": str(tmp_path),
+            "title": "Turn 2",
+            "status": "completed",
+            "model": "gemini-4-argon",
+            "usage": {"input_tokens": 900, "cache_read_tokens": 3500, "output_tokens": 500, "scope": "conversation"},
+            "created_at": "2026-11-20T10:01:00+00:00",
+            "started_at": "2026-11-20T10:01:00+00:00",
+            "finished_at": "2026-11-20T10:01:08+00:00",
+        },
+    )
+
+    first = backfill_from_bridge_home(tmp_path)
+    assert first["scanned"] == 2
+    assert first["imported"] == 2
+    assert first["skipped_existing"] == 0
+
+    records, corrupt = load_ledger(tmp_path)
+    assert corrupt == 0
+    assert len(records) == 2
+    by_id = {r.task_id: r for r in records}
+    assert by_id["task_a"].tokens.uncached_input_tokens == 500
+    assert by_id["task_b"].tokens.delta_from_conversation is True
+    assert by_id["task_b"].tokens.uncached_input_tokens == 400
+    assert by_id["task_b"].tokens.cache_read_tokens == 2500
+    assert by_id["task_b"].tokens.output_tokens == 300
+
+    # Ensure no body leaked onto disk.
+    raw_disk = usage_ledger_path(tmp_path).read_text(encoding="utf-8")
+    assert "DO NOT COPY RESULT TEXT" not in raw_disk
+
+    # Second backfill must be a clean no-op.
+    second = backfill_from_bridge_home(tmp_path)
+    assert second["imported"] == 0
+    assert second["skipped_existing"] == 2
+
+
+def test_retention_by_age_and_size_and_clear(tmp_path: Path):
+    now = datetime(2026, 11, 21, 12, 0, 0, tzinfo=UTC)
+    old_ts = (now - timedelta(days=200)).isoformat()
+    recent_ts = (now - timedelta(days=2)).isoformat()
+
+    append_receipt_record(
+        tmp_path,
+        {
+            "task_id": "task_old",
+            "session_id": "s_old",
+            "agent": "codex",
+            "status": "completed",
+            "model": "gpt-6.2-sol",
+            "usage": {"input_tokens": 100, "output_tokens": 50},
+            "created_at": old_ts,
+        },
+        enforce_policy=False,
+    )
+    append_receipt_record(
+        tmp_path,
+        {
+            "task_id": "task_new",
+            "session_id": "s_new",
+            "agent": "codex",
+            "status": "completed",
+            "model": "gpt-6.2-sol",
+            "usage": {"input_tokens": 200, "output_tokens": 60},
+            "created_at": recent_ts,
+        },
+        enforce_policy=False,
+    )
+
+    res = enforce_retention(tmp_path, StoragePolicy(max_age_days=180, max_bytes=None), now=now)
+    assert res["changed"] is True
+    assert res["removed_by_age"] == 1
+    assert res["remaining_records"] == 1
+    recs, _ = load_ledger(tmp_path)
+    assert [r.task_id for r in recs] == ["task_new"]
+
+    # Test size rotation above 1 MiB ceiling trims oldest rows cleanly to <= 90% target.
+    big_title = "x" * 1800
+    lpath = usage_ledger_path(tmp_path)
+    with lpath.open("ab") as f:
+        for i in range(650):
+            row = {
+                "schema_version": 1,
+                "task_id": f"bulk_{i}",
+                "session_id": "s_bulk",
+                "agent": "antigravity",
+                "cwd": "C:/Dev/Work",
+                "title": big_title,
+                "effective_model": "gemini-4-argon",
+                "status": "completed",
+                "created_at": recent_ts,
+                "tokens": {"measured": True, "input_tokens": 10, "uncached_input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            }
+            f.write((json.dumps(row) + "\n").encode("utf-8"))
+    assert lpath.stat().st_size > MIN_LEDGER_MAX_BYTES
+
+    size_res = enforce_retention(
+        tmp_path,
+        StoragePolicy(max_age_days=None, max_bytes=MIN_LEDGER_MAX_BYTES),
+        now=now,
+    )
+    assert size_res["changed"] is True
+    assert size_res["removed_by_size"] > 0
+    assert size_res["remaining_bytes"] <= int(MIN_LEDGER_MAX_BYTES * 0.9)
+    surviving, corrupt = load_ledger(tmp_path)
+    assert corrupt == 0
+    assert surviving[-1].task_id == "bulk_649"
+
+    # Pricing & storage policy survive clear_ledger.
+    save_pricing(
+        PricingConfig(models={"custom-model": ModelRate(input=1.2, output=3.4)}),
+        home=tmp_path,
+    )
+    save_storage_policy(StoragePolicy(max_bytes=50 * 1024 * 1024, max_age_days=90), home=tmp_path)
+    cleared = clear_ledger(tmp_path)
+    assert cleared["cleared_records"] == len(surviving)
+    assert load_ledger(tmp_path) == ([], 0)
+    assert "custom-model" in load_pricing(tmp_path).models
+    assert load_storage_policy(tmp_path).max_age_days == 90
+
+    stats = storage_stats(tmp_path)
+    assert stats["record_count"] == 0
+    assert stats["policy"]["max_age_days"] == 90
+
+    reset = reset_pricing(tmp_path)
+    assert reset.models == {}
+    assert any(d.id == "preset-zcode-glm-150" for d in reset.harness_discounts)

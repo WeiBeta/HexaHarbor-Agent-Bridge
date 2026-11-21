@@ -52,3 +52,30 @@ def test_wheel_ships_coordinator_defaults(tmp_path: Path):
     assert "[coordinator]" in text
     assert 'mode = "auto"' in text
     assert "instructions" in text
+
+
+def test_wheel_ships_dashboard_assets_and_opencodex_license(tmp_path: Path):
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv is required to build the wheel")
+    completed = subprocess.run(
+        [uv, "build", "--wheel", "--out-dir", str(tmp_path)],
+        cwd=str(ROOT),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    wheels = sorted(tmp_path.glob("agent_bridge-*.whl"))
+    assert wheels
+    with zipfile.ZipFile(wheels[-1]) as archive:
+        names = set(archive.namelist())
+        assert "agent_bridge/dashboard_assets/index.html" in names
+        assert "agent_bridge/dashboard_assets/app.css" in names
+        assert "agent_bridge/dashboard_assets/app.js" in names
+        metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
+        license_root = metadata_name.removesuffix("METADATA") + "licenses/"
+        ocx_mit = archive.read(license_root + "LICENSES/opencodex-MIT.txt").decode("utf-8")
+        assert "Copyright (c) 2026 opencodex contributors" in ocx_mit
+        notice = archive.read(license_root + "NOTICE.md").decode("utf-8")
+        assert "@bitkyc08/opencodex" in notice

@@ -17,6 +17,7 @@ import psutil
 from agent_bridge.adapters import build_adapter
 from agent_bridge.adapters.acp import AcpError
 from agent_bridge.adapters.base import Adapter
+from agent_bridge.billing_store import record_receipt_to_ledger
 from agent_bridge.config import (
     COORDINATOR_MODE_HINTS,
     AgentConfig,
@@ -1163,6 +1164,7 @@ class Registry:
         if task.status not in TERMINAL_STATUSES:
             return None
         payload = self._receipt_payload(task, session)
+        await asyncio.to_thread(record_receipt_to_ledger, self.home, payload)
         dest = receipt_path(task.task_id, self.home)
         try:
             await asyncio.to_thread(atomic_write_json, dest, payload)

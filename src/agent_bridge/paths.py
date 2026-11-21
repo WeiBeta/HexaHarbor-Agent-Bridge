@@ -101,3 +101,25 @@ def bundled_dsh_cordis() -> Path:
         if candidate.is_file():
             return candidate
     return here.parent / "share" / "dsh-acp.cordis.yml"
+
+
+def billing_dir(home: Path | None = None) -> Path:
+    path = (home or bridge_home()) / "billing"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def usage_ledger_path(home: Path | None = None) -> Path:
+    return billing_dir(home) / "usage_ledger.jsonl"
+
+
+def pricing_path(home: Path | None = None) -> Path:
+    return billing_dir(home) / "pricing.json"
+
+
+def storage_policy_path(home: Path | None = None) -> Path:
+    return billing_dir(home) / "storage.json"
+
+
+def dashboard_assets_dir() -> Path:
+    return Path(__file__).resolve().parent / "dashboard_assets"

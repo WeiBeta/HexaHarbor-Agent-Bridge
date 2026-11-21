@@ -585,3 +585,19 @@ Auth is `mcode login` under `~/.minimax` (`auth/<build>/<region>/auth.json`), or
 ## Permissions
 
 Most worker CLIs run in always-approve / skip-permissions mode. Codex CLI defaults to `--approve-for-me` (auto review + workspace-write); `--yolo` is opt-in via `[agents.codex] session_meta = { yolo = true }`. Review is the coordinator's job: `git diff`, build, tests. Cap follow-up turns at three, then the coordinator patches the rest.
+
+## Usage and billing dashboard
+
+HexaHarbor Agent Bridge includes an optional local usage & billing module that stays completely out of the MCP tool list (zero context overhead for coordinators):
+
+```powershell
+agent-bridge dashboard                 # binds 127.0.0.1:8765 and opens browser
+agent-bridge dashboard --port 9000 --no-open
+```
+
+- **Loopback only**: accepts only `127.0.0.1`, `localhost`, or `::1`, validates the `Host` header, and guards configuration updates with a per-process CSRF token injected into the local page.
+- **Metadata only**: records task timestamps, agent, model, status, duration, changed-file counts, and token/usage structures — never prompt messages, worker output bodies, or transcripts.
+- **Independent storage (`~/.agent-bridge/billing/`)**:
+  - `usage_ledger.jsonl` — append-only task usage ledger unaffected by `state.json` / `receipts/` pruning. Starting the dashboard also backfills existing terminal receipts by `task_id`.
+  - `pricing.json` — optional manual USD/1M token overrides (`input`, `output`, `cache_read`, `cache_write`; supports exact `model` or `agent::model` keys) plus `harness_discounts` rules (either `quota_boost` %, e.g. ZCode GLM 150% quota -> `0.6667x` effective cost, or direct `cost_multiplier`). Built-in reference prices are adapted from `@bitkyc08/opencodex` (MIT); unpriced models are explicitly excluded rather than counted as `$0`.
+  - `storage.json` — rolling retention limits (`max_bytes` default 100 MiB, `max_age_days` default 180 days, `auto_rotate` default `true`). Manage rotation, manual backfill, JSONL export, or ledger reset from the **Storage** tab.

@@ -35,6 +35,7 @@ HELP = f"""HexaHarbor Agent Bridge — connect local coding agents.
 
 Usage:
   agent-bridge                 start the MCP server on stdio
+  agent-bridge dashboard       open the localhost usage & billing dashboard
   agent-bridge --env           print reconstructed worker environment
   agent-bridge --quota         print each worker's remaining quota (fresh, no cache)
   agent-bridge --version       print the installed version
@@ -226,6 +227,25 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
     if command in {"--version", "-V", "version"}:
         print(package_version())
+        return
+    if command in {"dashboard", "billing", "--dashboard"}:
+        import argparse
+
+        from agent_bridge.dashboard_server import (
+            DEFAULT_DASHBOARD_HOST,
+            DEFAULT_DASHBOARD_PORT,
+            run_dashboard,
+        )
+
+        parser = argparse.ArgumentParser(
+            prog="agent-bridge dashboard",
+            description="Start the local loopback usage & billing dashboard.",
+        )
+        parser.add_argument("--host", default=DEFAULT_DASHBOARD_HOST, help="loopback host (default: 127.0.0.1)")
+        parser.add_argument("--port", type=int, default=DEFAULT_DASHBOARD_PORT, help="port (default: 8765)")
+        parser.add_argument("--no-open", action="store_true", help="do not open the browser automatically")
+        opts = parser.parse_args(args[1:])
+        run_dashboard(host=opts.host, port=opts.port, open_browser=not opts.no_open)
         return
     if command in {"--env", "env", "--print-env"}:
         from agent_bridge.config import load_config

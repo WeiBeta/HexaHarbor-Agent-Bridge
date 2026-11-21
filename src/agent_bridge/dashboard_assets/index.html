@@ -1,0 +1,565 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="ab-csrf" content="__AB_CSRF_TOKEN__" />
+  <title>HexaHarbor · Agent Bridge 计量与计费看板</title>
+  <link rel="stylesheet" href="/assets/app.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">HH</div>
+        <div>
+          <div class="brand-title">HexaHarbor · 计量与计费看板</div>
+          <div class="brand-sub" id="brand-meta">本地循环地址 · 仅元数据统计（不含对话正文）· USD</div>
+        </div>
+      </div>
+
+      <nav class="tabs" role="tablist" aria-label="主导航">
+        <button class="tab active" data-tab="stats" role="tab" aria-selected="true">统计</button>
+        <button class="tab" data-tab="records" role="tab" aria-selected="false">明细</button>
+        <button class="tab" data-tab="pricing" role="tab" aria-selected="false">计价与折扣</button>
+        <button class="tab" data-tab="storage" role="tab" aria-selected="false">磁盘管理</button>
+      </nav>
+
+      <div class="topbar-actions">
+        <button class="btn btn-ghost" id="btn-refresh" title="刷新数据">刷新</button>
+        <button class="btn btn-ghost" id="btn-theme" title="切换浅色/深色主题">切换主题</button>
+      </div>
+    </header>
+
+    <main class="main">
+      <!-- ==================== TAB 1: 统计 ==================== -->
+      <section class="tab-panel active" id="panel-stats">
+        <div class="panel filter-card">
+          <div class="filter-row">
+            <div class="filter-group grow">
+              <div class="filter-header">
+                <span class="filter-label">一级归因 · Agent / Harness</span>
+                <div class="inline-actions">
+                  <button class="btn-link" id="btn-agent-agy">仅选 AGY</button>
+                  <button class="btn-link" id="btn-agent-all">全选</button>
+                  <button class="btn-link" id="btn-agent-clear">清空</button>
+                </div>
+              </div>
+              <div class="pill-wrap" id="stats-agent-pills"></div>
+            </div>
+          </div>
+
+          <div class="filter-row">
+            <div class="filter-group grow">
+              <div class="filter-header">
+                <span class="filter-label">二级归因 · 模型 <span class="muted" id="stats-model-count"></span></span>
+                <div class="inline-actions">
+                  <input type="search" class="input input-sm" id="stats-model-search" placeholder="筛选模型…" />
+                  <button class="btn-link" id="btn-model-all">全选</button>
+                  <button class="btn-link" id="btn-model-none">取消</button>
+                </div>
+              </div>
+              <div class="pill-wrap pill-wrap-scroll" id="stats-model-pills"></div>
+            </div>
+          </div>
+
+          <div class="filter-row filter-row-compact">
+            <div class="filter-group">
+              <span class="filter-label">时间范围</span>
+              <div class="seg-group" id="stats-range-group">
+                <button class="seg" data-range="today">今天</button>
+                <button class="seg" data-range="7d">7 天</button>
+                <button class="seg" data-range="30d">30 天</button>
+                <button class="seg active" data-range="all">全部</button>
+                <button class="seg" data-range="custom">自定义</button>
+              </div>
+            </div>
+            <div class="filter-group hidden" id="stats-custom-range">
+              <span class="filter-label">起止时间（本地）</span>
+              <div class="inline-inputs">
+                <input type="datetime-local" class="input input-sm" id="stats-start" />
+                <span class="muted">至</span>
+                <input type="datetime-local" class="input input-sm" id="stats-end" />
+                <button class="btn btn-primary btn-sm" id="btn-stats-apply-range">应用</button>
+              </div>
+            </div>
+            <div class="filter-group">
+              <span class="filter-label">项目目录 (cwd)</span>
+              <select class="input input-sm" id="stats-cwd-select">
+                <option value="">全部目录</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div class="notice-banner hidden" id="stats-empty-hint"></div>
+
+        <!-- KPI cards -->
+        <div class="kpi-grid" id="stats-kpis"></div>
+
+        <!-- Bar chart -->
+        <div class="panel chart-card">
+          <div class="section-head">
+            <div>
+              <h2 class="section-title">每日用量柱状图</h2>
+              <div class="section-sub" id="chart-subtitle">点击柱子可跳转到当日明细</div>
+            </div>
+            <div class="seg-group" id="chart-metric-group">
+              <button class="seg active" data-metric="tokens">Token（堆叠）</button>
+              <button class="seg" data-metric="cost">折算费用 (USD)</button>
+              <button class="seg" data-metric="tasks">任务数</button>
+            </div>
+          </div>
+          <div class="chart-legend" id="chart-legend"></div>
+          <div class="chart-stage" id="chart-stage"></div>
+          <div class="chart-tooltip hidden" id="chart-tooltip"></div>
+        </div>
+
+        <!-- Model breakdown table -->
+        <div class="panel table-card">
+          <div class="section-head">
+            <div>
+              <h2 class="section-title">模型统计明细 <span class="badge" id="models-table-count">0</span></h2>
+              <div class="section-sub">API 标价折算仅供参考，并非实际账单；未定价任务明确标注并排除在总金额之外。</div>
+            </div>
+            <input type="search" class="input input-sm" id="models-table-search" placeholder="搜索表格模型…" />
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>模型</th>
+                  <th>Agent</th>
+                  <th>占比</th>
+                  <th class="num">任务 (已计量)</th>
+                  <th class="num" title="不含缓存命中的净输入 Token">输入 (净)</th>
+                  <th class="num">缓存命中</th>
+                  <th class="num">缓存写入</th>
+                  <th class="num">输出</th>
+                  <th class="num">缓存命中率</th>
+                  <th class="num" title="端到端输出 Token / 总耗时秒数">输出 tok/s</th>
+                  <th class="num">Token 总数</th>
+                  <th class="num">折算计费 (USD)</th>
+                  <th class="num">操作</th>
+                </tr>
+              </thead>
+              <tbody id="models-table-body"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Agent summary table -->
+        <div class="panel table-card">
+          <div class="section-head">
+            <h2 class="section-title">按 Agent / Harness 汇总</h2>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Agent</th>
+                  <th>占比</th>
+                  <th class="num">任务数</th>
+                  <th class="num">输入 (净)</th>
+                  <th class="num">缓存命中</th>
+                  <th class="num">输出</th>
+                  <th class="num">命中率</th>
+                  <th class="num">Token 总数</th>
+                  <th class="num">原价 (USD)</th>
+                  <th class="num">折算计费 (USD)</th>
+                </tr>
+              </thead>
+              <tbody id="agents-table-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== TAB 2: 明细 ==================== -->
+      <section class="tab-panel" id="panel-records">
+        <div class="panel filter-card">
+          <div class="filter-row filter-row-compact">
+            <div class="filter-group">
+              <span class="filter-label">Agent</span>
+              <select class="input input-sm" id="rec-agent">
+                <option value="">全部 Agent</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <span class="filter-label">状态</span>
+              <select class="input input-sm" id="rec-status">
+                <option value="all">全部状态</option>
+                <option value="completed">成功 (completed)</option>
+                <option value="failed">失败 (failed)</option>
+                <option value="cancelled">已取消 (cancelled)</option>
+                <option value="errors">仅异常</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <span class="filter-label">时间</span>
+              <select class="input input-sm" id="rec-range">
+                <option value="all">全部时间</option>
+                <option value="15m">最近 15 分钟</option>
+                <option value="1h">最近 1 小时</option>
+                <option value="24h">最近 24 小时</option>
+                <option value="7d">最近 7 天</option>
+                <option value="30d">最近 30 天</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <span class="filter-label">输出速率</span>
+              <select class="input input-sm" id="rec-speed">
+                <option value="all">全部速度</option>
+                <option value="slow">&lt; 15 tok/s</option>
+                <option value="medium">15 – 50 tok/s</option>
+                <option value="fast">≥ 50 tok/s</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <span class="filter-label">目录 (cwd)</span>
+              <select class="input input-sm" id="rec-cwd">
+                <option value="">全部目录</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <span class="filter-label">会话 ID</span>
+              <input type="search" class="input input-sm" id="rec-session" placeholder="session_id…" />
+            </div>
+            <div class="filter-group grow">
+              <span class="filter-label">关键词（模型 / 标题 / 任务 ID）</span>
+              <input type="search" class="input input-sm" id="rec-query" placeholder="搜索…" />
+            </div>
+          </div>
+
+          <div class="filter-row filter-row-compact records-toolbar">
+            <div class="inline-actions" id="rec-day-chip-wrap"></div>
+            <div class="inline-actions">
+              <label class="checkbox-label"><input type="checkbox" class="col-toggle" data-col="effort" checked /> 推理强度</label>
+              <label class="checkbox-label"><input type="checkbox" class="col-toggle" data-col="tokens" checked /> Token</label>
+              <label class="checkbox-label"><input type="checkbox" class="col-toggle" data-col="rate" checked /> tok/s</label>
+              <label class="checkbox-label"><input type="checkbox" class="col-toggle" data-col="cost" checked /> 计费</label>
+              <label class="checkbox-label"><input type="checkbox" class="col-toggle" data-col="duration" checked /> 耗时</label>
+              <span class="divider"></span>
+              <label class="checkbox-label"><input type="checkbox" id="rec-auto-refresh" /> 自动刷新 (10s)</label>
+              <button class="btn btn-ghost btn-sm" id="btn-rec-reset">重置筛选</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="scope-bar" id="rec-scope-bar"></div>
+
+        <div class="panel table-card">
+          <div class="table-wrap">
+            <table class="data-table records-table" id="records-table">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>任务 / 目录</th>
+                  <th>Agent</th>
+                  <th>模型</th>
+                  <th data-col-cell="effort">推理强度</th>
+                  <th>状态</th>
+                  <th class="num" data-col-cell="tokens">Token 明细</th>
+                  <th class="num" data-col-cell="rate">tok/s</th>
+                  <th class="num" data-col-cell="cost">折算费用 (USD)</th>
+                  <th class="num" data-col-cell="duration">耗时</th>
+                </tr>
+              </thead>
+              <tbody id="records-table-body"></tbody>
+            </table>
+          </div>
+          <div class="pager" id="records-pager">
+            <div class="muted" id="records-pager-info"></div>
+            <div class="inline-actions">
+              <button class="btn btn-ghost btn-sm" id="btn-rec-prev">上一页</button>
+              <button class="btn btn-ghost btn-sm" id="btn-rec-next">下一页</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== TAB 3: 计价与折扣 ==================== -->
+      <section class="tab-panel" id="panel-pricing">
+        <div class="panel">
+          <div class="section-head">
+            <div>
+              <h2 class="section-title">Harness 折扣 / 额度倍率</h2>
+              <div class="section-sub">用于折算特定 Harness 或模型的额度促销（如 ZCode 运行 GLM 额度膨胀到 150%，等效计费倍率 ×0.6667）。所有费用固定为 USD。</div>
+            </div>
+            <button class="btn btn-ghost btn-sm" id="btn-pricing-reset">恢复全部默认预置</button>
+          </div>
+
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>启用</th>
+                  <th>Harness (Agent)</th>
+                  <th>模型通配符</th>
+                  <th>模式</th>
+                  <th class="num">额度倍率 (%)</th>
+                  <th class="num">等效计费倍率</th>
+                  <th>说明</th>
+                  <th class="num">操作</th>
+                </tr>
+              </thead>
+              <tbody id="discounts-table-body"></tbody>
+            </table>
+          </div>
+
+          <form class="inline-form" id="form-add-discount">
+            <div class="form-field">
+              <label>Harness</label>
+              <select class="input input-sm" id="disc-agent"></select>
+            </div>
+            <div class="form-field">
+              <label>模型匹配（留空=*）</label>
+              <input type="text" class="input input-sm" id="disc-pattern" placeholder="例如 glm* 或 *" />
+            </div>
+            <div class="form-field">
+              <label>折算方式</label>
+              <select class="input input-sm" id="disc-mode">
+                <option value="quota_boost">额度膨胀百分比 (%)</option>
+                <option value="cost_multiplier">直接计费倍率 (×)</option>
+              </select>
+            </div>
+            <div class="form-field">
+              <label id="disc-value-label">额度百分比 (%)</label>
+              <input type="number" step="any" min="0.01" class="input input-sm" id="disc-value" value="150" required />
+            </div>
+            <div class="form-field grow">
+              <label>备注标签</label>
+              <input type="text" class="input input-sm" id="disc-label" placeholder="如：ZCode GLM 150% 额度活动" />
+            </div>
+            <div class="form-field form-field-end">
+              <div class="muted small-preview" id="disc-preview">×0.6667</div>
+              <button type="submit" class="btn btn-primary btn-sm">添加规则</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="panel">
+          <div class="section-head">
+            <div>
+              <h2 class="section-title">模型单价表（USD / 1M Tokens）</h2>
+              <div class="section-sub">每百万 Token 美元价格。缓存写入留空按 0 计算。模型键支持直接填模型 ID，或用 <code>agent::model</code> 仅覆盖特定 Harness。</div>
+            </div>
+            <div class="inline-actions">
+              <div class="seg-group" id="pricing-view-group">
+                <button class="seg active" data-view="observed">账本已出现</button>
+                <button class="seg" data-view="unpriced">仅未定价</button>
+                <button class="seg" data-view="user">我的手动覆盖</button>
+                <button class="seg" data-view="presets">全部预置目录</button>
+              </div>
+              <input type="search" class="input input-sm" id="pricing-search" placeholder="搜索模型…" />
+            </div>
+          </div>
+
+          <form class="inline-form" id="form-add-price">
+            <div class="form-field grow">
+              <label>模型键（如 gemini-4-hydrogen-xhigh 或 antigravity::&lt;default&gt;）</label>
+              <input type="text" class="input input-sm" id="price-new-key" placeholder="输入模型 ID" required />
+            </div>
+            <div class="form-field num-field">
+              <label>输入 ($/1M)</label>
+              <input type="number" step="any" min="0" class="input input-sm" id="price-new-in" required />
+            </div>
+            <div class="form-field num-field">
+              <label>输出 ($/1M)</label>
+              <input type="number" step="any" min="0" class="input input-sm" id="price-new-out" required />
+            </div>
+            <div class="form-field num-field">
+              <label>缓存命中 ($/1M)</label>
+              <input type="number" step="any" min="0" class="input input-sm" id="price-new-cr" placeholder="0" />
+            </div>
+            <div class="form-field num-field">
+              <label>缓存写入 ($/1M)</label>
+              <input type="number" step="any" min="0" class="input input-sm" id="price-new-cw" placeholder="0" />
+            </div>
+            <div class="form-field form-field-end">
+              <button type="submit" class="btn btn-primary btn-sm">保存单价</button>
+            </div>
+          </form>
+
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>模型 / 价格键</th>
+                  <th>来源 / 适用 Agent</th>
+                  <th class="num">输入 ($/1M)</th>
+                  <th class="num">输出 ($/1M)</th>
+                  <th class="num">缓存命中 ($/1M)</th>
+                  <th class="num">缓存写入 ($/1M)</th>
+                  <th>折扣状态</th>
+                  <th class="num">操作</th>
+                </tr>
+              </thead>
+              <tbody id="pricing-table-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== TAB 4: 磁盘管理 ==================== -->
+      <section class="tab-panel" id="panel-storage">
+        <div class="kpi-grid" id="storage-kpis"></div>
+
+        <div class="panel">
+          <div class="section-head">
+            <div>
+              <h2 class="section-title">独立账本滚动留存策略</h2>
+              <div class="section-sub">账本独立落盘于 <code>~/.agent-bridge/billing/usage_ledger.jsonl</code>，不受主桥 <code>state.json</code> 200 条裁剪影响。体积超限时按完整行边界滚动保留最新 90%。</div>
+            </div>
+          </div>
+
+          <form class="storage-form" id="form-storage-policy">
+            <div class="storage-field">
+              <label class="checkbox-label">
+                <input type="checkbox" id="st-enable-size" checked />
+                启用最大体积滚动上限 (MB)
+              </label>
+              <input type="number" min="1" step="1" class="input input-sm" id="st-max-mb" value="100" />
+              <div class="muted">默认 100 MB（最小 1 MB）；超限时自动裁剪最旧记录至上限的 90%。</div>
+            </div>
+
+            <div class="storage-field">
+              <label class="checkbox-label">
+                <input type="checkbox" id="st-enable-age" checked />
+                启用最长保留天数滚动 (天)
+              </label>
+              <input type="number" min="1" max="36500" step="1" class="input input-sm" id="st-max-days" value="180" />
+              <div class="muted">默认 180 天；超出天数的最旧记录在滚动时移除。</div>
+            </div>
+
+            <div class="storage-field">
+              <label class="checkbox-label">
+                <input type="checkbox" id="st-auto-rotate" checked />
+                新记录追加时自动检查并滚动
+              </label>
+              <div class="muted">关闭后仅在点击下方「立即执行滚动清理」时裁剪。</div>
+            </div>
+
+            <div class="storage-actions">
+              <button type="submit" class="btn btn-primary">保存留存策略</button>
+              <button type="button" class="btn btn-ghost" id="btn-storage-prune">立即执行滚动清理</button>
+              <button type="button" class="btn btn-ghost" id="btn-storage-backfill">同步回填历史 Receipts</button>
+              <a class="btn btn-ghost" href="/api/storage/export" download="agent-bridge-usage-ledger.jsonl">导出账本 JSONL</a>
+            </div>
+          </form>
+
+          <div class="path-box" id="storage-paths"></div>
+        </div>
+
+        <div class="panel danger-panel">
+          <div class="section-head">
+            <div>
+              <h2 class="section-title danger-text">危险操作 · 一键清空账本</h2>
+              <div class="section-sub">仅清空 <code>usage_ledger.jsonl</code> 计量记录，不会删除你的定价配置、Harness 折扣规则或 <code>~/.agent-bridge/receipts/</code> 原始回执。</div>
+            </div>
+            <button class="btn btn-danger" id="btn-storage-clear">一键清空账本…</button>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Slide-over Detail Drawer -->
+  <div class="drawer-backdrop hidden" id="drawer-backdrop"></div>
+  <aside class="drawer hidden" id="detail-drawer" aria-label="任务详情">
+    <div class="drawer-head">
+      <div>
+        <div class="drawer-title">任务详情</div>
+        <div class="muted mono" id="drawer-task-id"></div>
+      </div>
+      <div class="inline-actions">
+        <button class="btn btn-ghost btn-sm" id="btn-drawer-copy">复制任务 ID</button>
+        <button class="btn btn-ghost btn-sm" id="btn-drawer-close">关闭</button>
+      </div>
+    </div>
+    <div class="drawer-body" id="drawer-body"></div>
+  </aside>
+
+  <!-- Quick Pricing Modal -->
+  <div class="modal-backdrop hidden" id="modal-backdrop">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div class="modal-head">
+        <h3 id="modal-title">编辑模型价格 (USD / 1M Tokens)</h3>
+        <button class="btn btn-ghost btn-sm" id="btn-modal-close">关闭</button>
+      </div>
+      <form id="form-modal-price">
+        <div class="modal-body">
+          <div class="form-field">
+            <label>价格键</label>
+            <input type="text" class="input" id="modal-key" readonly />
+            <label class="checkbox-label" id="modal-scope-wrap">
+              <input type="checkbox" id="modal-scope-agent" />
+              <span id="modal-scope-label">仅覆盖当前 Agent</span>
+            </label>
+          </div>
+          <div class="modal-grid">
+            <div class="form-field">
+              <label>输入 ($/1M)</label>
+              <input type="number" step="any" min="0" class="input" id="modal-in" required />
+            </div>
+            <div class="form-field">
+              <label>输出 ($/1M)</label>
+              <input type="number" step="any" min="0" class="input" id="modal-out" required />
+            </div>
+            <div class="form-field">
+              <label>缓存命中 ($/1M)</label>
+              <input type="number" step="any" min="0" class="input" id="modal-cr" placeholder="0" />
+            </div>
+            <div class="form-field">
+              <label>缓存写入 ($/1M)</label>
+              <input type="number" step="any" min="0" class="input" id="modal-cw" placeholder="0" />
+            </div>
+          </div>
+          <div class="form-field">
+            <label>备注（选填）</label>
+            <input type="text" class="input" id="modal-note" placeholder="如：官网标价 / 内部估算" />
+          </div>
+          <div class="muted small-note">单位为每百万 Token 美元价格。空白缓存费率按 0 计算，允许设为 0。</div>
+        </div>
+        <div class="modal-foot">
+          <button type="button" class="btn btn-ghost hidden" id="btn-modal-delete">删除手动覆盖</button>
+          <div class="inline-actions">
+            <button type="button" class="btn btn-ghost" id="btn-modal-cancel">取消</button>
+            <button type="submit" class="btn btn-primary">保存价格</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Clear Confirmation Modal -->
+  <div class="modal-backdrop hidden" id="clear-modal-backdrop">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="clear-modal-title">
+      <div class="modal-head">
+        <h3 id="clear-modal-title" class="danger-text">确认清空计量账本</h3>
+        <button class="btn btn-ghost btn-sm" id="btn-clear-close">关闭</button>
+      </div>
+      <form id="form-clear-confirm">
+        <div class="modal-body">
+          <p>此操作将清空 <code>usage_ledger.jsonl</code> 中的全部历史计量记录（保留价格设置与磁盘策略）。</p>
+          <div class="form-field">
+            <label>请输入 <code>CLEAR</code> 确认执行</label>
+            <input type="text" class="input mono" id="clear-confirm-input" autocomplete="off" placeholder="CLEAR" required />
+          </div>
+        </div>
+        <div class="modal-foot">
+          <span></span>
+          <div class="inline-actions">
+            <button type="button" class="btn btn-ghost" id="btn-clear-cancel">取消</button>
+            <button type="submit" class="btn btn-danger">确认清空</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="toast hidden" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>
