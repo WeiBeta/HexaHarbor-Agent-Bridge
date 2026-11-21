@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import http.client
 import json
 import re
@@ -257,6 +258,10 @@ async def test_registry_terminal_receipt_persists_to_independent_billing_ledger(
     # Pruning the task deletes the receipt, but the independent billing ledger keeps it.
     reg._drop_task(task.task_id)
     assert not receipt_file.exists()
+    with reg._billing_lock:
+        work = reg._billing_work
+    if work is not None:
+        await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(work)), timeout=5)
     records, corrupt = load_ledger(tmp_path)
     assert corrupt == 0
     assert len(records) == 1
