@@ -151,15 +151,20 @@ def _pricing_payload(home: Path) -> dict[str, Any]:
             }
         )
 
-    presets = [
-        {
-            "key": entry.key,
-            "agent_hint": entry.agent_hint,
-            "rate": entry.rate.model_dump(mode="json"),
-            "source": entry.source,
-        }
-        for entry in PRESET_MODEL_CATALOG
-    ]
+    presets = []
+    for entry in PRESET_MODEL_CATALOG:
+        disc = resolve_harness_discount(entry.agent_hint, entry.key, pricing)
+        presets.append(
+            {
+                "key": entry.key,
+                "agent_hint": entry.agent_hint,
+                "rate": entry.rate.model_dump(mode="json"),
+                "source": entry.source,
+                "discount_multiplier": disc.effective_multiplier() if disc else 1.0,
+                "discount_quota_boost_pct": disc.quota_boost_pct if disc else 100.0,
+                "discount_label": (disc.label or f"{disc.agent}:{disc.model_pattern}") if disc else None,
+            }
+        )
 
     return {
         "currency": "USD",

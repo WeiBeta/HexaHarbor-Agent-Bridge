@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="ab-csrf" content="__AB_CSRF_TOKEN__" />
   <title>六库仙贼/HexaHarbor · 计量与计费看板</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%2309090b'/%3E%3Cpolygon points='12 3 20 7.5 20 16.5 12 21 4 16.5 4 7.5' fill='none' stroke='%23fafafa' stroke-width='1.8' stroke-linejoin='round'/%3E%3Ccircle cx='12' cy='12' r='2.3' fill='%23fafafa'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/assets/app.css" />
 </head>
 <body>
@@ -19,7 +20,7 @@
         </div>
         <div>
           <div class="brand-title">六库仙贼/HexaHarbor · 计量与计费看板</div>
-          <div class="brand-sub" id="brand-meta">本地循环地址 · 仅元数据统计（不含对话正文）· USD</div>
+          <div class="brand-sub" id="brand-meta">本地回环地址 · 仅元数据统计（不含对话正文）· USD</div>
         </div>
       </div>
 
@@ -59,9 +60,9 @@
               <div class="filter-header">
                 <span class="filter-label">模型 <span class="muted" id="stats-model-count"></span></span>
                 <div class="inline-actions">
-                  <input type="search" class="input input-sm" id="stats-model-search" placeholder="筛选模型…" />
+                  <input type="search" class="input input-sm" id="stats-model-search" aria-label="筛选模型" placeholder="筛选模型…" />
                   <button class="btn-link" id="btn-model-all">全选</button>
-                  <button class="btn-link" id="btn-model-none">取消</button>
+                  <button class="btn-link" id="btn-model-none">清空</button>
                 </div>
               </div>
               <div class="pill-wrap pill-wrap-scroll" id="stats-model-pills"></div>
@@ -80,16 +81,16 @@
               </div>
             </div>
             <div class="filter-group hidden" id="stats-custom-range">
-              <span class="filter-label">起止时间（本地）</span>
+              <label class="filter-label" for="stats-start">起止时间（本地）</label>
               <div class="inline-inputs">
-                <input type="datetime-local" class="input input-sm" id="stats-start" />
+                <input type="datetime-local" class="input input-sm" id="stats-start" aria-label="开始时间" />
                 <span class="muted">至</span>
-                <input type="datetime-local" class="input input-sm" id="stats-end" />
+                <input type="datetime-local" class="input input-sm" id="stats-end" aria-label="结束时间" />
                 <button class="btn btn-primary btn-sm" id="btn-stats-apply-range">应用</button>
               </div>
             </div>
             <div class="filter-group">
-              <span class="filter-label">项目目录 (cwd)</span>
+              <label class="filter-label" for="stats-cwd-select">项目目录 (cwd)</label>
               <select class="input input-sm" id="stats-cwd-select">
                 <option value="">全部目录</option>
               </select>
@@ -127,7 +128,7 @@
               <h2 class="section-title">模型统计明细 <span class="badge" id="models-table-count">0</span></h2>
               <div class="section-sub">API 标价折算仅供参考，并非实际账单；未定价任务明确标注并排除在总金额之外。</div>
             </div>
-            <input type="search" class="input input-sm" id="models-table-search" placeholder="搜索表格模型…" />
+            <input type="search" class="input input-sm" id="models-table-search" aria-label="搜索表格模型" placeholder="搜索表格模型…" />
           </div>
           <div class="table-wrap">
             <table class="data-table">
@@ -185,13 +186,13 @@
         <div class="panel filter-card">
           <div class="filter-row filter-row-compact">
             <div class="filter-group">
-              <span class="filter-label">Agent</span>
+              <label class="filter-label" for="rec-agent">Agent</label>
               <select class="input input-sm" id="rec-agent">
                 <option value="">全部 Agent</option>
               </select>
             </div>
             <div class="filter-group">
-              <span class="filter-label">状态</span>
+              <label class="filter-label" for="rec-status">状态</label>
               <select class="input input-sm" id="rec-status">
                 <option value="all">全部状态</option>
                 <option value="completed">成功 (completed)</option>
@@ -201,7 +202,7 @@
               </select>
             </div>
             <div class="filter-group">
-              <span class="filter-label">时间</span>
+              <label class="filter-label" for="rec-range">时间</label>
               <select class="input input-sm" id="rec-range">
                 <option value="all">全部时间</option>
                 <option value="15m">最近 15 分钟</option>
@@ -212,7 +213,7 @@
               </select>
             </div>
             <div class="filter-group">
-              <span class="filter-label">输出速率</span>
+              <label class="filter-label" for="rec-speed">输出速率</label>
               <select class="input input-sm" id="rec-speed">
                 <option value="all">全部速度</option>
                 <option value="slow">&lt; 15 tok/s</option>
@@ -221,17 +222,17 @@
               </select>
             </div>
             <div class="filter-group">
-              <span class="filter-label">目录 (cwd)</span>
+              <label class="filter-label" for="rec-cwd">目录 (cwd)</label>
               <select class="input input-sm" id="rec-cwd">
                 <option value="">全部目录</option>
               </select>
             </div>
             <div class="filter-group">
-              <span class="filter-label">会话 ID</span>
+              <label class="filter-label" for="rec-session">会话 ID</label>
               <input type="search" class="input input-sm" id="rec-session" placeholder="session_id…" />
             </div>
             <div class="filter-group grow">
-              <span class="filter-label">关键词（模型 / 标题 / 任务 ID）</span>
+              <label class="filter-label" for="rec-query">关键词（模型 / 标题 / 任务 ID）</label>
               <input type="search" class="input input-sm" id="rec-query" placeholder="搜索…" />
             </div>
           </div>
@@ -314,26 +315,26 @@
 
           <form class="inline-form" id="form-add-discount">
             <div class="form-field">
-              <label>Harness</label>
+              <label for="disc-agent">Harness</label>
               <select class="input input-sm" id="disc-agent"></select>
             </div>
             <div class="form-field">
-              <label>模型匹配（留空=*）</label>
+              <label for="disc-pattern">模型匹配（留空=*）</label>
               <input type="text" class="input input-sm" id="disc-pattern" placeholder="例如 glm* 或 *" />
             </div>
             <div class="form-field">
-              <label>折算方式</label>
+              <label for="disc-mode">折算方式</label>
               <select class="input input-sm" id="disc-mode">
                 <option value="quota_boost">额度膨胀百分比 (%)</option>
                 <option value="cost_multiplier">直接计费倍率 (×)</option>
               </select>
             </div>
             <div class="form-field">
-              <label id="disc-value-label">额度百分比 (%)</label>
+              <label id="disc-value-label" for="disc-value">额度百分比 (%)</label>
               <input type="number" step="any" min="0.01" class="input input-sm" id="disc-value" value="150" required />
             </div>
             <div class="form-field grow">
-              <label>备注标签</label>
+              <label for="disc-label">备注标签</label>
               <input type="text" class="input input-sm" id="disc-label" placeholder="如：ZCode GLM 150% 额度活动" />
             </div>
             <div class="form-field form-field-end">
@@ -356,29 +357,29 @@
                 <button class="seg" data-view="user">我的手动覆盖</button>
                 <button class="seg" data-view="presets">全部预置目录</button>
               </div>
-              <input type="search" class="input input-sm" id="pricing-search" placeholder="搜索模型…" />
+              <input type="search" class="input input-sm" id="pricing-search" aria-label="搜索模型单价" placeholder="搜索模型…" />
             </div>
           </div>
 
           <form class="inline-form" id="form-add-price">
             <div class="form-field grow">
-              <label>模型键（如 gemini-4-hydrogen-xhigh 或 antigravity::&lt;default&gt;）</label>
+              <label for="price-new-key">模型键（如 gemini-4-hydrogen-xhigh 或 antigravity::&lt;default&gt;）</label>
               <input type="text" class="input input-sm" id="price-new-key" placeholder="输入模型 ID" required />
             </div>
             <div class="form-field num-field">
-              <label>输入 ($/1M)</label>
+              <label for="price-new-in">输入 ($/1M)</label>
               <input type="number" step="any" min="0" class="input input-sm" id="price-new-in" required />
             </div>
             <div class="form-field num-field">
-              <label>输出 ($/1M)</label>
+              <label for="price-new-out">输出 ($/1M)</label>
               <input type="number" step="any" min="0" class="input input-sm" id="price-new-out" required />
             </div>
             <div class="form-field num-field">
-              <label>缓存命中 ($/1M)</label>
+              <label for="price-new-cr">缓存命中 ($/1M)</label>
               <input type="number" step="any" min="0" class="input input-sm" id="price-new-cr" placeholder="0" />
             </div>
             <div class="form-field num-field">
-              <label>缓存写入 ($/1M)</label>
+              <label for="price-new-cw">缓存写入 ($/1M)</label>
               <input type="number" step="any" min="0" class="input input-sm" id="price-new-cw" placeholder="0" />
             </div>
             <div class="form-field form-field-end">
@@ -396,7 +397,7 @@
                   <th class="num">输出 ($/1M)</th>
                   <th class="num">缓存命中 ($/1M)</th>
                   <th class="num">缓存写入 ($/1M)</th>
-                  <th>折扣状态</th>
+                  <th class="col-gap-left">折扣状态</th>
                   <th class="num">操作</th>
                 </tr>
               </thead>
@@ -424,7 +425,7 @@
                 <input type="checkbox" id="st-enable-size" checked />
                 启用最大体积滚动上限 (MB)
               </label>
-              <input type="number" min="1" step="1" class="input input-sm" id="st-max-mb" value="100" />
+              <input type="number" min="1" step="1" class="input input-sm" id="st-max-mb" aria-label="最大体积滚动上限 (MB)" value="100" />
               <div class="muted">默认 100 MB（最小 1 MB）；超限时自动裁剪最旧记录至上限的 90%。</div>
             </div>
 
@@ -433,7 +434,7 @@
                 <input type="checkbox" id="st-enable-age" checked />
                 启用最长保留天数滚动 (天)
               </label>
-              <input type="number" min="1" max="36500" step="1" class="input input-sm" id="st-max-days" value="180" />
+              <input type="number" min="1" max="36500" step="1" class="input input-sm" id="st-max-days" aria-label="最长保留天数 (天)" value="180" />
               <div class="muted">默认 180 天；超出天数的最旧记录在滚动时移除。</div>
             </div>
 
@@ -495,7 +496,7 @@
       <form id="form-modal-price">
         <div class="modal-body">
           <div class="form-field">
-            <label>价格键</label>
+            <label for="modal-key">价格键</label>
             <input type="text" class="input" id="modal-key" readonly />
             <label class="checkbox-label" id="modal-scope-wrap">
               <input type="checkbox" id="modal-scope-agent" />
@@ -504,24 +505,24 @@
           </div>
           <div class="modal-grid">
             <div class="form-field">
-              <label>输入 ($/1M)</label>
+              <label for="modal-in">输入 ($/1M)</label>
               <input type="number" step="any" min="0" class="input" id="modal-in" required />
             </div>
             <div class="form-field">
-              <label>输出 ($/1M)</label>
+              <label for="modal-out">输出 ($/1M)</label>
               <input type="number" step="any" min="0" class="input" id="modal-out" required />
             </div>
             <div class="form-field">
-              <label>缓存命中 ($/1M)</label>
+              <label for="modal-cr">缓存命中 ($/1M)</label>
               <input type="number" step="any" min="0" class="input" id="modal-cr" placeholder="0" />
             </div>
             <div class="form-field">
-              <label>缓存写入 ($/1M)</label>
+              <label for="modal-cw">缓存写入 ($/1M)</label>
               <input type="number" step="any" min="0" class="input" id="modal-cw" placeholder="0" />
             </div>
           </div>
           <div class="form-field">
-            <label>备注（选填）</label>
+            <label for="modal-note">备注（选填）</label>
             <input type="text" class="input" id="modal-note" placeholder="如：官网标价 / 内部估算" />
           </div>
           <div class="muted small-note">单位为每百万 Token 美元价格。空白缓存费率按 0 计算，允许设为 0。</div>
@@ -548,7 +549,7 @@
         <div class="modal-body">
           <p>此操作将清空 <code>usage_ledger.jsonl</code> 中的全部历史计量记录（保留价格设置与磁盘策略）。</p>
           <div class="form-field">
-            <label>请输入 <code>CLEAR</code> 确认执行</label>
+            <label for="clear-confirm-input">请输入 <code>CLEAR</code> 确认执行</label>
             <input type="text" class="input mono" id="clear-confirm-input" autocomplete="off" placeholder="CLEAR" required />
           </div>
         </div>

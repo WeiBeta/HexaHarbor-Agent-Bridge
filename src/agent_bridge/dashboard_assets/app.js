@@ -309,7 +309,7 @@
   function renderMetaControls() {
     if (!state.meta) return;
     $("brand-meta").textContent =
-      `v${state.meta.version} · 本地循环地址 · 仅元数据（不含对话正文）· 账本 ${fmtInt(state.meta.total_records)} 条 · USD`;
+      `v${state.meta.version} · 本地回环地址 · 仅元数据（不含对话正文）· 账本 ${fmtInt(state.meta.total_records)} 条 · USD`;
 
     // Populate cwd dropdowns
     const cwds = state.meta.cwds || [];
@@ -832,7 +832,7 @@
         <div class="kv-grid">
           <div class="kv-k">匹配价格键</div><div class="kv-v mono">${esc(c.matched_price_key)} ${priceSourceBadge(c.price_source)}</div>
           <div class="kv-k">单价 ($/1M)</div><div class="kv-v mono">输入 ${fmtRate(c.rate_input)} · 输出 ${fmtRate(c.rate_output)} · 缓存命中 ${fmtRate(c.rate_cache_read)} · 写入 ${fmtRate(c.rate_cache_write)}</div>
-          <div class="kv-k">分项费用</div><div class="kv-v mono">输入 ${fmtUsd(c.input_cost_usd)} + 缓存 ${fmtUsd(c.cache_read_cost_usd)} + 写入 ${fmtUsd(c.cache_write_cost_usd)} + 输出 ${fmtUsd(c.output_cost_usd)}</div>
+          <div class="kv-k">分项费用</div><div class="kv-v mono"><span class="cost-term">输入 ${fmtUsd(c.input_cost_usd)}</span> + <span class="cost-term">缓存 ${fmtUsd(c.cache_read_cost_usd)}</span> + <span class="cost-term">写入 ${fmtUsd(c.cache_write_cost_usd)}</span> + <span class="cost-term">输出 ${fmtUsd(c.output_cost_usd)}</span></div>
           <div class="kv-k">API 标价原价</div><div class="kv-v mono">${fmtUsd(c.list_cost_usd)}</div>
           <div class="kv-k">Harness 折扣</div><div class="kv-v">${c.discount_label ? `${esc(c.discount_label)}（额度 ${c.discount_quota_boost_pct}% · 倍率 ×${c.discount_multiplier}）` : "无折扣（×1.0）"}</div>
           <div class="kv-k">折算计费 (USD)</div><div class="kv-v mono"><b>${fmtUsd(c.effective_cost_usd)}</b></div>
@@ -863,9 +863,9 @@
           <div class="kv-k">状态</div><div class="kv-v">${statusBadge(r.status)} ${r.stop_reason ? `<span class="muted mono">(${esc(r.stop_reason)})</span>` : ""}</div>
           <div class="kv-k">模型</div><div class="kv-v mono">${esc(r.effective_model)}${r.model && r.observed_model && r.model !== r.observed_model ? ` <span class="muted">(请求 ${esc(r.model)})</span>` : ""}</div>
           <div class="kv-k">推理强度</div><div class="kv-v mono">${esc(r.observed_effort || r.effort || "—")}</div>
-          <div class="kv-k">Session ID</div><div class="kv-v mono">${esc(r.session_id)}</div>
-          <div class="kv-k">原生会话 ID</div><div class="kv-v mono">${esc(r.native_session_id || "—")}</div>
-          <div class="kv-k">项目目录 (cwd)</div><div class="kv-v mono">${esc(r.cwd || "—")}</div>
+          <div class="kv-k">Session ID</div><div class="kv-v kv-v-path mono">${esc(r.session_id)}</div>
+          <div class="kv-k">原生会话 ID</div><div class="kv-v kv-v-path mono">${esc(r.native_session_id || "—")}</div>
+          <div class="kv-k">项目目录 (cwd)</div><div class="kv-v kv-v-path mono">${esc(r.cwd || "—")}</div>
           <div class="kv-k">标题</div><div class="kv-v">${esc(r.title || "—")}</div>
           <div class="kv-k">文件改动数</div><div class="kv-v mono">${fmtInt(r.files_changed_total)}${r.files_outside_cwd_total > 0 ? `（工作区外 ${r.files_outside_cwd_total}）` : ""}</div>
         </div>
@@ -998,7 +998,10 @@
           subLabel: `参考归属：${agentLabel(p.agent_hint)}`,
           source: hasOverride ? "user" : "preset",
           rate: effectiveRate,
-          discount: "—",
+          discount:
+            p.discount_multiplier !== undefined && p.discount_multiplier !== 1
+              ? `${p.discount_label || ""} (×${Number(p.discount_multiplier).toFixed(3)})`
+              : "—",
           hasUserOverride: hasOverride,
         };
       });
@@ -1025,7 +1028,7 @@
           <td class="num">${rate ? fmtRate(rate.output) : "—"}</td>
           <td class="num">${rate ? fmtRate(rate.cache_read) : "—"}</td>
           <td class="num">${rate ? fmtRate(rate.cache_write) : "—"}</td>
-          <td class="muted" style="font-size:12px">${esc(r.discount)}</td>
+          <td class="muted col-gap-left" style="font-size:12px">${esc(r.discount)}</td>
           <td class="num">
             <button type="button" class="btn btn-ghost btn-sm btn-edit-price-row"
               data-agent="${esc(r.agent || "")}" data-key="${esc(r.exactKey || r.key)}">编辑</button>

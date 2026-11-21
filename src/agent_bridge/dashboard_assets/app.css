@@ -23,6 +23,7 @@
   --ok-soft: rgba(52, 211, 153, 0.12);
   --warn: #fbbf24;
   --warn-soft: rgba(251, 191, 36, 0.12);
+  --warn-border: rgba(251, 191, 36, 0.28);
   --danger: #f87171;
   --danger-soft: rgba(248, 113, 113, 0.12);
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
@@ -55,8 +56,9 @@
   --bar-tasks: #27272a;
   --ok: #0e9f6e;
   --ok-soft: rgba(14, 159, 110, 0.1);
-  --warn: #b45309;
-  --warn-soft: rgba(180, 83, 9, 0.1);
+  --warn: #92400e;
+  --warn-soft: #fef3c7;
+  --warn-border: rgba(146, 64, 14, 0.32);
   --danger: #dc2626;
   --danger-soft: rgba(220, 38, 38, 0.1);
   --shadow-sm: 0 1px 2px rgba(9, 9, 11, 0.06);
@@ -81,6 +83,11 @@ html, body {
 code, .mono, .num {
   font-family: var(--mono);
   font-variant-numeric: tabular-nums;
+}
+
+input[type="checkbox"] {
+  accent-color: var(--fg);
+  cursor: pointer;
 }
 
 .hidden {
@@ -533,7 +540,7 @@ code, .mono, .num {
 
 .badge-warn {
   color: var(--warn);
-  border-color: rgba(251, 191, 36, 0.28);
+  border-color: var(--warn-border);
   background: var(--warn-soft);
 }
 
@@ -759,6 +766,7 @@ code, .mono, .num {
   width: 72px;
   height: 5px;
   background: var(--surface-2);
+  border: 1px solid var(--border);
   border-radius: 999px;
   overflow: hidden;
   display: inline-block;
@@ -767,8 +775,14 @@ code, .mono, .num {
 }
 
 .share-fill {
+  display: block;
   height: 100%;
   background: var(--fg);
+  border-radius: 999px;
+}
+
+.col-gap-left {
+  padding-left: 22px !important;
 }
 
 .tok-chips {
@@ -993,7 +1007,16 @@ code, .mono, .num {
 }
 
 .kv-v {
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+
+.kv-v-path {
   word-break: break-all;
+}
+
+.cost-term {
+  white-space: nowrap;
 }
 
 .json-pre {
@@ -1087,6 +1110,12 @@ code, .mono, .num {
 
 .cell-trunc {
   max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cell-trunc > div {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
