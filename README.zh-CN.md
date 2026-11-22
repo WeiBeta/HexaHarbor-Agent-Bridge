@@ -64,6 +64,7 @@ agent-bridge dashboard tray            # 启动 Windows 系统托盘（加 --sto
 
 - **前台交互与后台常驻的区别**：`agent-bridge dashboard`（即 `dashboard serve`，支持 `--host`、`--port`、`--no-open`）在前台终端中运行，按 `Ctrl+C` 停止，未加 `--no-open` 时会自动打开浏览器。`agent-bridge dashboard start`（支持 `--host`、`--port`、`--open`、`--tray`）则以脱离终端的后台服务方式运行（Windows 下不弹出控制台窗口，日志写入 `~/.agent-bridge/billing/dashboard.log`，仅在指定 `--open` 时打开浏览器）。开启 Windows 登录自启后，登录系统时会自动在后台静默拉起 `dashboard start`，进入登录后的后台常驻运行。
 - **Windows 登录自启和托盘**：当前 Bridge 目录没有已保存设置时，第一次明确启动看板默认开启登录自启和托盘图标。如果登录项已被另一个 Bridge 目录占用，就保留原项。要更改设置，请在看板的**管理**页分别勾选或取消，再点「保存服务设置」。之后启动时会沿用你的选择。
+- **简中 / 英文界面切换**：看板页头右上角提供 **CN / EN** 切换键（默认简体中文）。选择保存在同一 Bridge 目录下的 `~/.agent-bridge/billing/preferences.json`（独立于 `service.json` 首次默认设置），并与同目录的 Windows 系统托盘同步。
 - **查询状态不会顺带启用服务**：`agent-bridge dashboard status` 是纯只读查询，只会输出当前服务状态 JSON，**不会**启动后台服务、初始化首次配置、写入自启项或拉起托盘。
 - **计量与费用仅为本地统计与估算**：计量模块会解析任务回执与状态 JSON（其中可能带有结果摘要），但只提取任务元数据与 Token 计数写入独立账本 `~/.agent-bridge/billing/usage_ledger.jsonl`（账本与导出文件均不含提示词和输出正文）。看板中的 Token 统计、缓存命中率、USD API 标价折算（基于内置公开参考价或你在 `pricing.json` 中的手动覆盖）以及 Harness 折扣规则，**都只是本地统计与估算，仅供对照参考，不是供应商真实账单，也不是计费依据**。未匹配到单价的模型或缺少明细计数的任务会被明确排除，不会按 `$0` 计入。
 - **页面里的更新提示不会自动升级**：网页界面中的更新提示（以及 Windows 托盘菜单项和 `agent-bridge dashboard update`）只是提示，**不会**自动检测远程版本或执行升级。需要升级时，请按[更新方法](SETUP.md#update)自行操作。

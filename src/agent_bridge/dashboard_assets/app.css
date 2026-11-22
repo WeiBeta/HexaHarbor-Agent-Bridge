@@ -80,6 +80,10 @@ html, body {
   -webkit-font-smoothing: antialiased;
 }
 
+html[lang="en"]:not([data-i18n-ready="1"]) body {
+  visibility: hidden;
+}
+
 code, .mono, .num {
   font-family: var(--mono);
   font-variant-numeric: tabular-nums;
@@ -186,6 +190,18 @@ input[type="checkbox"] {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.lang-switch .seg {
+  min-width: 34px;
+  padding: 5px 9px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.lang-switch .seg:disabled {
+  opacity: 0.6;
+  cursor: wait;
 }
 
 .live-poll-wrap {
@@ -902,7 +918,7 @@ input[type="checkbox"] {
 }
 
 .form-field.num-field {
-  width: 120px;
+  width: 128px;
 }
 
 .form-field label {
@@ -1036,7 +1052,7 @@ input[type="checkbox"] {
 
 .kv-grid {
   display: grid;
-  grid-template-columns: 128px 1fr;
+  grid-template-columns: 150px 1fr;
   gap: 6px 10px;
   font-size: 12px;
 }

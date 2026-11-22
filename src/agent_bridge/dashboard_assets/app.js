@@ -2,6 +2,8 @@
   "use strict";
 
   const CSRF_TOKEN = document.querySelector('meta[name="ab-csrf"]')?.getAttribute("content") || "";
+  const INITIAL_LOCALE = document.querySelector('meta[name="ab-locale"]')?.getAttribute("content") || "zh-CN";
+  const I18N = window.AbI18n;
   const COL_STORAGE_KEY = "hh.billing.records.cols.v1";
   const THEME_STORAGE_KEY = "hh.billing.theme.v1";
   const REFRESH_STORAGE_KEY = "hh.billing.refresh.v1";
@@ -22,9 +24,21 @@
     zcode: "ZCode",
   };
 
+  function t(key, params) {
+    return I18N ? I18N.t(key, params) : key;
+  }
+
+  function trBackend(msg) {
+    return I18N ? I18N.translateBackendText(msg) : String(msg ?? "");
+  }
+
+  function trDiscountLabel(label, ruleId) {
+    return I18N ? I18N.translateDiscountLabel(label, ruleId) : String(label ?? "");
+  }
+
   function agentLabel(id) {
     if (!id) return "";
-    if (id === "*") return "* (全部 Agent)";
+    if (id === "*") return t("common.allAgentsWildcard");
     const key = String(id).trim().toLowerCase();
     return AGENT_DISPLAY_NAMES[key] || String(id);
   }
@@ -36,11 +50,13 @@
     pricing: null,
     storage: null,
     service: null,
+    serviceStopped: false,
     records: null,
     lastRevision: null,
     autoRefreshMs: loadRefreshMs(),
     autoRefreshTimer: null,
     pollInFlight: false,
+    localeSwitching: false,
     selectedAgents: new Set(),
     selectedModels: new Set(), // keys are "agent::model"
     statsModelQuery: "",
@@ -64,7 +80,9 @@
     pricingView: "observed", // observed | unpriced | user | presets
     pricingSearch: "",
     drawerTaskId: null,
+    drawerRecord: null,
     modalCtx: null,
+    infoModalSpec: null,
   };
 
   function $(id) {
@@ -78,6 +96,26 @@
       .replaceAll(">", "&gt;")
       .replaceAll('"', "&quot;")
       .replaceAll("'", "&#39;");
+  }
+
+  function tHtml(key, htmlParams) {
+    const raw = t(key);
+    let out = "";
+    let lastIndex = 0;
+    const re = /\{([a-zA-Z0-9_]+)\}/g;
+    let m;
+    while ((m = re.exec(raw)) !== null) {
+      out += esc(raw.slice(lastIndex, m.index));
+      const name = m[1];
+      if (htmlParams && Object.prototype.hasOwnProperty.call(htmlParams, name)) {
+        out += htmlParams[name];
+      } else {
+        out += esc(m[0]);
+      }
+      lastIndex = re.lastIndex;
+    }
+    out += esc(raw.slice(lastIndex));
+    return out;
   }
 
   function loadRefreshMs() {
@@ -184,7 +222,7 @@
   // ==================== Formatters ====================
   function fmtInt(n) {
     if (n === null || n === undefined || Number.isNaN(Number(n))) return "—";
-    return Number(n).toLocaleString("en-US");
+    return Number(n).toLocaleString(I18N ? I18N.intlLocale() : "en-US");
   }
 
   function fmtCompact(n) {
@@ -248,6 +286,16 @@
     if (!isoStr) return "—";
     const d = new Date(isoStr);
     if (Number.isNaN(d.getTime())) return isoStr;
+    if (I18N && I18N.getLocale() === "en") {
+      return d.toLocaleString("en-US", {
+        month: "short",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      });
+    }
     return d.toLocaleString("zh-CN", {
       month: "2-digit",
       day: "2-digit",
@@ -265,15 +313,15 @@
   }
 
   function priceSourceBadge(src) {
-    const map = {
-      user: ["用户手动", "badge-accent"],
-      user_derived: ["用户派生", "badge-accent"],
-      preset: ["OpenCodex 预置", "badge-ok"],
-      preset_derived: ["预置派生", "badge-ok"],
-      unpriced: ["未定价", "badge-warn"],
+    const clsMap = {
+      user: "badge-accent",
+      user_derived: "badge-accent",
+      preset: "badge-ok",
+      preset_derived: "badge-ok",
+      unpriced: "badge-warn",
     };
-    const [label, cls] = map[src] || ["未定价", "badge-warn"];
-    return `<span class="badge ${cls}">${esc(label)}</span>`;
+    const key = Object.prototype.hasOwnProperty.call(clsMap, src) ? src : "unpriced";
+    return `<span class="badge ${clsMap[key]}">${esc(t(`priceSource.${key}`))}</span>`;
   }
 
   function statusBadge(status) {
@@ -281,6 +329,59 @@
     if (status === "failed") return `<span class="badge badge-danger">failed</span>`;
     if (status === "cancelled") return `<span class="badge badge-warn">cancelled</span>`;
     return `<span class="badge">${esc(status || "unknown")}</span>`;
+  }
+
+  // ==================== Language Switching ====================
+  async function applyLocaleAndRerender(nextLocale) {
+    if (!I18N) return;
+    await I18N.setLocale(nextLocale);
+    renderMetaControls();
+    renderSummary();
+    renderRecords();
+    renderPricing();
+    updateDiscountPreview();
+    renderService({ preserveInputs: true });
+    renderStorage({ preserveInputs: true });
+    if (state.drawerRecord && !$("detail-drawer").classList.contains("hidden")) {
+      renderDrawer(state.drawerRecord);
+    }
+    if (state.modalCtx && state.modalCtx.agent && !$("modal-backdrop").classList.contains("hidden")) {
+      $("modal-scope-label").textContent = t("pricing.modalScopeAgent", {
+        agent: agentLabel(state.modalCtx.agent),
+        scopedKey: state.modalCtx.scopedKey,
+      });
+    }
+    if (state.infoModalSpec && !$("info-modal-backdrop").classList.contains("hidden")) {
+      renderInfoModal();
+    }
+    if (state.serviceStopped) {
+      const badge = $("svc-state-badge");
+      badge.textContent = t("storage.stateStopped");
+      badge.className = "badge badge-warn";
+    }
+  }
+
+  async function switchLocale(targetLocale) {
+    if (!I18N) return;
+    const canonical = I18N.normalizeLocale(targetLocale);
+    if (canonical === I18N.getLocale() || state.localeSwitching) return;
+    state.localeSwitching = true;
+    const buttons = document.querySelectorAll("#lang-switch [data-locale]");
+    buttons.forEach((b) => {
+      b.disabled = true;
+    });
+    try {
+      const res = await apiMutate("PUT", "/api/preferences", { locale: canonical });
+      const saved = res?.preferences?.locale || canonical;
+      await applyLocaleAndRerender(saved);
+    } catch (err) {
+      showToast(t("toast.langSwitchFailed", { error: trBackend(err.message) }), true);
+    } finally {
+      state.localeSwitching = false;
+      buttons.forEach((b) => {
+        b.disabled = false;
+      });
+    }
   }
 
   // ==================== Agent / Model Selection ====================
@@ -341,15 +442,17 @@
   // ==================== Rendering: Meta Controls ====================
   function renderMetaControls() {
     if (!state.meta) return;
-    $("brand-meta").textContent =
-      `v${state.meta.version} · 本地回环地址 · 仅元数据（不含对话正文）· 账本 ${fmtInt(state.meta.total_records)} 条 · USD`;
+    $("brand-meta").textContent = t("app.brandMeta", {
+      version: state.meta.version,
+      records: fmtInt(state.meta.total_records),
+    });
 
     // Populate cwd dropdowns
     const cwds = state.meta.cwds || [];
     for (const selId of ["stats-cwd-select", "rec-cwd"]) {
       const sel = $(selId);
       const prev = sel.value;
-      sel.innerHTML = `<option value="">全部目录 (${cwds.length})</option>` +
+      sel.innerHTML = `<option value="">${esc(t("common.allDirectoriesCount", { count: cwds.length }))}</option>` +
         cwds.map((c) => `<option value="${esc(c)}">${esc(shortPath(c))}</option>`).join("");
       if (cwds.includes(prev)) sel.value = prev;
     }
@@ -357,7 +460,7 @@
     // Populate records agent dropdown and discount agent dropdown
     const recAgentSel = $("rec-agent");
     const prevRecAgent = recAgentSel.value;
-    recAgentSel.innerHTML = `<option value="">全部 Agent</option>` +
+    recAgentSel.innerHTML = `<option value="">${esc(t("common.allAgents"))}</option>` +
       state.meta.agents.map((a) => `<option value="${esc(a.name)}">${esc(agentLabel(a.name))} (${a.tasks})</option>`).join("");
     recAgentSel.value = prevRecAgent;
 
@@ -365,7 +468,7 @@
     const prevDiscAgent = discAgentSel.value;
     discAgentSel.innerHTML = state.meta.agents
       .map((a) => `<option value="${esc(a.name)}">${esc(agentLabel(a.name))}</option>`)
-      .join("") + `<option value="*">* (全部 Agent)</option>`;
+      .join("") + `<option value="*">${esc(t("common.allAgentsWildcard"))}</option>`;
     if (prevDiscAgent) discAgentSel.value = prevDiscAgent;
     else if (state.meta.agents.some((a) => a.name === "zcode")) discAgentSel.value = "zcode";
 
@@ -400,10 +503,12 @@
         )
       : available;
     const selectedCount = available.filter((x) => state.selectedModels.has(x.pair)).length;
-    $("stats-model-count").textContent = available.length ? `(已选 ${selectedCount}/${available.length})` : "(当前 Agent 暂无模型记录)";
+    $("stats-model-count").textContent = available.length
+      ? t("stats.modelsSelectedCount", { selected: selectedCount, total: available.length })
+      : t("stats.modelsEmptyCount");
 
     if (!available.length) {
-      wrap.innerHTML = `<span class="muted">当前所选 Agent 尚未在账本或定价表中出现模型</span>`;
+      wrap.innerHTML = `<span class="muted">${esc(t("stats.modelsEmptyList"))}</span>`;
       return;
     }
     const multiAgent = state.selectedAgents.size > 1;
@@ -451,8 +556,9 @@
     if (ov.tasks === 0 && state.meta && state.meta.total_records > 0) {
       const nonEmpty = state.meta.agents.filter((a) => a.tasks > 0);
       if (nonEmpty.length > 0) {
-        banner.innerHTML = `<span>当前筛选下暂无记录，但账本中共有 ${fmtInt(state.meta.total_records)} 条记录（${esc(nonEmpty.map((a) => `${agentLabel(a.name)}: ${a.tasks}`).join(" / "))}）。</span>
-          <button type="button" class="btn btn-primary btn-sm" id="btn-show-nonempty">切换到有数据的 Agent</button>`;
+        const breakdown = nonEmpty.map((a) => `${agentLabel(a.name)}: ${a.tasks}`).join(" / ");
+        banner.innerHTML = `<span>${esc(t("stats.emptyHintText", { total: fmtInt(state.meta.total_records), breakdown }))}</span>
+          <button type="button" class="btn btn-primary btn-sm" id="btn-show-nonempty">${esc(t("stats.emptyHintAction"))}</button>`;
         banner.classList.remove("hidden");
         $("btn-show-nonempty")?.addEventListener("click", () => {
           state.selectedAgents = new Set(nonEmpty.map((a) => a.name));
@@ -460,7 +566,7 @@
           for (const a of state.selectedAgents) selectAllModelsForAgent(a);
           renderAgentPills();
           renderModelPills();
-          loadSummary().catch((e) => showToast(e.message, true));
+          loadSummary().catch((e) => showToast(trBackend(e.message), true));
         });
       } else {
         banner.classList.add("hidden");
@@ -470,51 +576,59 @@
     }
 
     // KPI Cards
-    const covText = ov.coverage_ratio !== null ? `已计量 ${ov.measured_tasks}/${ov.tasks} (${fmtPct(ov.coverage_ratio)})` : "暂无任务";
-    const unpricedNote = ov.unpriced_tasks > 0 ? `已排除 ${ov.unpriced_tasks} 条未定价` : "全部已计价";
+    const covText =
+      ov.coverage_ratio !== null
+        ? t("stats.kpiCoverage", { measured: ov.measured_tasks, tasks: ov.tasks, pct: fmtPct(ov.coverage_ratio) })
+        : t("stats.kpiNoTasks");
+    const unpricedNote =
+      ov.unpriced_tasks > 0
+        ? t("stats.kpiUnpricedExcluded", { count: ov.unpriced_tasks })
+        : t("stats.kpiAllPriced");
     const listDiff =
       ov.list_cost_usd !== null && ov.effective_cost_usd !== null && Math.abs(ov.list_cost_usd - ov.effective_cost_usd) > 1e-6
-        ? `原价 ${fmtUsd(ov.list_cost_usd)} · `
+        ? t("stats.kpiListCostPrefix", { cost: fmtUsd(ov.list_cost_usd) })
         : "";
     const hitSub =
       ov.cache_hit_rate !== null
-        ? `综合命中率 ${fmtPct4(ov.cache_hit_rate)} · 缓存写入 ${fmtCompact(ov.cache_write_tokens)}`
-        : "所选记录未上报缓存明细";
+        ? t("stats.kpiCacheSub", { rate: fmtPct4(ov.cache_hit_rate), write: fmtCompact(ov.cache_write_tokens) })
+        : t("stats.kpiCacheUnreported");
     const outSub =
       ov.reasoning_tokens > 0
-        ? `含推理 ${fmtCompact(ov.reasoning_tokens)}${ov.tok_per_sec ? ` · ${ov.tok_per_sec} tok/s` : ""}`
+        ? ov.tok_per_sec
+          ? t("stats.kpiOutputReasoningTps", { reasoning: fmtCompact(ov.reasoning_tokens), tps: ov.tok_per_sec })
+          : t("stats.kpiOutputReasoning", { reasoning: fmtCompact(ov.reasoning_tokens) })
         : ov.tok_per_sec
-          ? `端到端 ${ov.tok_per_sec} tok/s (${ov.tps_samples} 样本)`
+          ? t("stats.kpiOutputTps", { tps: ov.tok_per_sec, samples: ov.tps_samples })
           : "—";
 
     $("stats-kpis").innerHTML = `
       <div class="kpi-card">
-        <div class="kpi-label">任务总数</div>
+        <div class="kpi-label">${esc(t("stats.kpiTasks"))}</div>
         <div class="kpi-value">${fmtInt(ov.tasks)}</div>
-        <div class="kpi-sub">${esc(covText)} · 活跃 ${ov.active_days} 天</div>
+        <div class="kpi-sub">${esc(t("stats.kpiTasksSub", { coverage: covText, days: ov.active_days }))}</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-label">Token 总数</div>
+        <div class="kpi-label">${esc(t("stats.kpiTotalTokens"))}</div>
         <div class="kpi-value">${fmtCompact(ov.total_tokens)}</div>
         <div class="kpi-sub mono">${fmtInt(ov.total_tokens)}</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-label">输入 (净非缓存)</div>
+        <div class="kpi-label">${esc(t("stats.kpiNetInput"))}</div>
         <div class="kpi-value">${fmtCompact(ov.uncached_input_tokens)}</div>
-        <div class="kpi-sub">总输入含缓存 ${fmtCompact(ov.input_tokens)}</div>
+        <div class="kpi-sub">${esc(t("stats.kpiTotalInputSub", { tokens: fmtCompact(ov.input_tokens) }))}</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-label">缓存命中</div>
+        <div class="kpi-label">${esc(t("stats.kpiCacheRead"))}</div>
         <div class="kpi-value">${ov.cache_read_tokens !== null ? fmtCompact(ov.cache_read_tokens) : "—"}</div>
         <div class="kpi-sub">${esc(hitSub)}</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-label">输出 Token</div>
+        <div class="kpi-label">${esc(t("stats.kpiOutputTokens"))}</div>
         <div class="kpi-value">${fmtCompact(ov.output_tokens)}</div>
         <div class="kpi-sub">${esc(outSub)}</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-label">API 标价折算 (USD)</div>
+        <div class="kpi-label">${esc(t("stats.kpiCost"))}</div>
         <div class="kpi-value">${fmtUsd(ov.effective_cost_usd)}</div>
         <div class="kpi-sub">${esc(listDiff + unpricedNote)}</div>
       </div>
@@ -533,17 +647,17 @@
 
     if (metric === "tokens") {
       legend.innerHTML = `
-        <span class="legend-item"><span class="legend-dot" style="background:var(--bar-cache)"></span>缓存命中</span>
-        <span class="legend-item"><span class="legend-dot" style="background:var(--bar-in)"></span>输入 (净)</span>
-        <span class="legend-item"><span class="legend-dot" style="background:var(--bar-out)"></span>输出</span>`;
+        <span class="legend-item"><span class="legend-dot" style="background:var(--bar-cache)"></span>${esc(t("stats.legendCacheRead"))}</span>
+        <span class="legend-item"><span class="legend-dot" style="background:var(--bar-in)"></span>${esc(t("stats.legendNetInput"))}</span>
+        <span class="legend-item"><span class="legend-dot" style="background:var(--bar-out)"></span>${esc(t("stats.legendOutput"))}</span>`;
     } else if (metric === "cost") {
-      legend.innerHTML = `<span class="legend-item"><span class="legend-dot" style="background:var(--bar-cost)"></span>折算费用 (USD)</span>`;
+      legend.innerHTML = `<span class="legend-item"><span class="legend-dot" style="background:var(--bar-cost)"></span>${esc(t("stats.legendCost"))}</span>`;
     } else {
-      legend.innerHTML = `<span class="legend-item"><span class="legend-dot" style="background:var(--bar-tasks)"></span>任务数</span>`;
+      legend.innerHTML = `<span class="legend-item"><span class="legend-dot" style="background:var(--bar-tasks)"></span>${esc(t("stats.legendTasks"))}</span>`;
     }
 
     if (!daily.length) {
-      stage.innerHTML = `<div class="chart-empty">当前筛选范围内没有可绘制的每日数据</div>`;
+      stage.innerHTML = `<div class="chart-empty">${esc(t("stats.chartEmpty"))}</div>`;
       return;
     }
 
@@ -585,7 +699,7 @@
           inner = `<div class="bar-seg-tasks" style="height:100%"></div>`;
         }
         const showLabel = idx % labelStep === 0 || idx === daily.length - 1;
-        return `<button type="button" class="bar-col" data-idx="${idx}" data-date="${esc(d.date)}" aria-label="${esc(d.date)}">
+        return `<button type="button" class="bar-col" data-idx="${idx}" data-date="${esc(d.date)}" aria-label="${esc(t("stats.chartBarAria", { date: d.date }))}">
           <div class="bar-stack" style="height:${totalPct.toFixed(2)}%">${inner}</div>
           ${showLabel ? `<span class="bar-date">${esc(d.date.slice(5))}</span>` : ""}
         </button>`;
@@ -608,13 +722,13 @@
               : null;
         tooltip.innerHTML = `
           <div class="tip-date">${esc(d.date)}</div>
-          <div class="tip-row"><span class="tip-k">任务数</span><span class="tip-v">${fmtInt(d.tasks)} (已计量 ${fmtInt(d.measured_tasks)})</span></div>
-          <div class="tip-row"><span class="tip-k">总 Token</span><span class="tip-v"><b>${fmtInt(d.total_tokens)}</b></span></div>
-          <div class="tip-row"><span class="tip-k">输入 (净)</span><span class="tip-v">${fmtInt(d.uncached_input_tokens)}</span></div>
-          <div class="tip-row"><span class="tip-k">缓存命中</span><span class="tip-v">${fmtInt(d.cache_read_tokens)}</span></div>
-          <div class="tip-row"><span class="tip-k">命中率</span><span class="tip-v">${fmtPct4(hitRatio)}</span></div>
-          <div class="tip-row"><span class="tip-k">输出</span><span class="tip-v">${fmtInt(d.output_tokens)}</span></div>
-          <div class="tip-row"><span class="tip-k">折算费用</span><span class="tip-v"><b>${d.priced_tasks > 0 ? fmtUsd(d.effective_cost_usd) : "未定价"}</b></span></div>`;
+          <div class="tip-row"><span class="tip-k">${esc(t("stats.tipTasks"))}</span><span class="tip-v">${esc(t("stats.tipTasksValue", { tasks: fmtInt(d.tasks), measured: fmtInt(d.measured_tasks) }))}</span></div>
+          <div class="tip-row"><span class="tip-k">${esc(t("stats.tipTotalTokens"))}</span><span class="tip-v"><b>${fmtInt(d.total_tokens)}</b></span></div>
+          <div class="tip-row"><span class="tip-k">${esc(t("stats.tipNetInput"))}</span><span class="tip-v">${fmtInt(d.uncached_input_tokens)}</span></div>
+          <div class="tip-row"><span class="tip-k">${esc(t("stats.tipCacheRead"))}</span><span class="tip-v">${fmtInt(d.cache_read_tokens)}</span></div>
+          <div class="tip-row"><span class="tip-k">${esc(t("stats.tipHitRate"))}</span><span class="tip-v">${fmtPct4(hitRatio)}</span></div>
+          <div class="tip-row"><span class="tip-k">${esc(t("stats.tipOutput"))}</span><span class="tip-v">${fmtInt(d.output_tokens)}</span></div>
+          <div class="tip-row"><span class="tip-k">${esc(t("stats.tipCost"))}</span><span class="tip-v"><b>${d.priced_tasks > 0 ? fmtUsd(d.effective_cost_usd) : esc(t("common.unpriced"))}</b></span></div>`;
         tooltip.classList.remove("hidden");
         positionTooltip(ev);
       });
@@ -657,20 +771,21 @@
     $("models-table-count").textContent = String(filtered.length);
 
     if (!filtered.length) {
-      body.innerHTML = `<tr><td colspan="13" class="muted" style="text-align:center;padding:24px">暂无匹配的模型统计记录</td></tr>`;
+      body.innerHTML = `<tr><td colspan="13" class="muted" style="text-align:center;padding:24px">${esc(t("stats.modelsTableEmpty"))}</td></tr>`;
       return;
     }
 
     body.innerHTML = filtered
       .map((r) => {
+        const discLabel = trDiscountLabel(r.discount_label || "");
         const discBadge =
           r.discount_multiplier !== 1
-            ? ` <span class="badge badge-accent" title="${esc(r.discount_label || "")}">×${Number(r.discount_multiplier).toFixed(3)}</span>`
+            ? ` <span class="badge badge-accent" title="${esc(discLabel)}">×${Number(r.discount_multiplier).toFixed(3)}</span>`
             : "";
         const costCell =
           r.effective_cost_usd !== null
-            ? `<span title="原价 ${fmtUsd(r.list_cost_usd)}">${fmtUsd(r.effective_cost_usd)}</span>${discBadge}`
-            : `<span class="badge badge-warn">未定价</span>`;
+            ? `<span title="${esc(t("stats.listPriceTitle", { cost: fmtUsd(r.list_cost_usd) }))}">${fmtUsd(r.effective_cost_usd)}</span>${discBadge}`
+            : `<span class="badge badge-warn">${esc(t("common.unpriced"))}</span>`;
         return `<tr>
           <td class="mono" title="${esc(r.model)}">${esc(r.model)}</td>
           <td><span class="badge" title="${esc(r.agent)}">${esc(agentLabel(r.agent))}</span></td>
@@ -689,7 +804,7 @@
           <td class="num">${costCell}</td>
           <td class="num">
             <button type="button" class="btn btn-ghost btn-sm btn-quick-price"
-              data-agent="${esc(r.agent)}" data-model="${esc(r.model)}">定价</button>
+              data-agent="${esc(r.agent)}" data-model="${esc(r.model)}">${esc(t("stats.btnPrice"))}</button>
           </td>
         </tr>`;
       })
@@ -700,7 +815,7 @@
     const body = $("agents-table-body");
     const rows = state.summary?.agents || [];
     if (!rows.length) {
-      body.innerHTML = `<tr><td colspan="10" class="muted" style="text-align:center;padding:18px">暂无数据</td></tr>`;
+      body.innerHTML = `<tr><td colspan="10" class="muted" style="text-align:center;padding:18px">${esc(t("common.noData"))}</td></tr>`;
       return;
     }
     body.innerHTML = rows
@@ -761,53 +876,67 @@
     if (!state.records) return;
     const dayWrap = $("rec-day-chip-wrap");
     dayWrap.innerHTML = state.recDay
-      ? `<span class="badge badge-accent">已锁定日期：${esc(state.recDay)} <button type="button" class="btn-link" id="btn-clear-day">×</button></span>`
-      : `<span class="muted">点击任意行查看任务详情抽屉（仅元数据，不含正文）</span>`;
+      ? `<span class="badge badge-accent">${esc(t("records.dayLocked", { day: state.recDay }))} <button type="button" class="btn-link" id="btn-clear-day" aria-label="${esc(t("records.clearDayAria"))}">×</button></span>`
+      : `<span class="muted">${esc(t("records.clickRowHint"))}</span>`;
     $("btn-clear-day")?.addEventListener("click", () => {
       state.recDay = "";
       state.recOffset = 0;
-      loadRecords().catch((e) => showToast(e.message, true));
+      loadRecords().catch((e) => showToast(trBackend(e.message), true));
     });
 
     const st = state.records.scope_totals;
     const exclParts = [];
-    if (st.unpriced_tasks > 0) exclParts.push(`${st.unpriced_tasks} 条未定价`);
-    if (st.unmeasured_tasks > 0) exclParts.push(`${st.unmeasured_tasks} 条未计量`);
+    if (st.unpriced_tasks > 0) exclParts.push(t("records.scopeExcludedUnpriced", { count: st.unpriced_tasks }));
+    if (st.unmeasured_tasks > 0) exclParts.push(t("records.scopeExcludedUnmeasured", { count: st.unmeasured_tasks }));
+    const scopeMainHtml = tHtml("records.scopeSummary", {
+      tasks: `<b>${esc(fmtInt(st.tasks))}</b>`,
+      tokens: `<b>${esc(fmtCompact(st.total_tokens))}</b>`,
+      cost: `<b>${esc(fmtUsd(st.effective_cost_usd))}</b>`,
+    });
+    const exclHtml = exclParts.length
+      ? ` <span class="muted">${esc(t("records.scopeExcludedWrap", { parts: exclParts.join(t("common.listJoiner")) }))}</span>`
+      : "";
     $("rec-scope-bar").innerHTML = `
-      <div>当前筛选合计：<b>${fmtInt(st.tasks)}</b> 次任务 · <b>${fmtCompact(st.total_tokens)}</b> tokens · <b>${fmtUsd(st.effective_cost_usd)}</b>${exclParts.length ? ` <span class="muted">（已排除 ${esc(exclParts.join("、"))}）</span>` : ""}</div>
-      <div class="muted">显示第 ${state.records.total ? state.records.offset + 1 : 0}–${Math.min(state.records.total, state.records.offset + state.records.items.length)} / 共 ${fmtInt(state.records.total)} 条</div>
+      <div>${scopeMainHtml}${exclHtml}</div>
+      <div class="muted">${esc(
+        t("records.scopeShowing", {
+          from: state.records.total ? state.records.offset + 1 : 0,
+          to: Math.min(state.records.total, state.records.offset + state.records.items.length),
+          total: fmtInt(state.records.total),
+        })
+      )}</div>
     `;
 
     const body = $("records-table-body");
     if (!state.records.items.length) {
-      body.innerHTML = `<tr><td colspan="10" class="muted" style="text-align:center;padding:24px">没有匹配的任务记录</td></tr>`;
+      body.innerHTML = `<tr><td colspan="10" class="muted" style="text-align:center;padding:24px">${esc(t("records.empty"))}</td></tr>`;
     } else {
       body.innerHTML = state.records.items
         .map((item) => {
-          const t = item.tokens;
+          const tok = item.tokens;
           const c = item.cost;
-          let tokHtml = `<span class="muted">未上报</span>`;
-          if (t.measured) {
+          let tokHtml = `<span class="muted">${esc(t("common.unreported"))}</span>`;
+          if (tok.measured) {
             const parts = [];
-            parts.push(`<span title="净输入">${fmtCompact(t.uncached_input_tokens)}</span>`);
-            if (t.cache_reported && t.cache_read_tokens !== null) {
-              parts.push(`<span class="tok-c" title="缓存命中">c:${fmtCompact(t.cache_read_tokens)}</span>`);
+            parts.push(`<span title="${esc(t("records.chipNetInputTitle"))}">${fmtCompact(tok.uncached_input_tokens)}</span>`);
+            if (tok.cache_reported && tok.cache_read_tokens !== null) {
+              parts.push(`<span class="tok-c" title="${esc(t("records.chipCacheReadTitle"))}">c:${fmtCompact(tok.cache_read_tokens)}</span>`);
             }
-            if (t.cache_write_tokens > 0) {
-              parts.push(`<span class="tok-w" title="缓存写入">w:${fmtCompact(t.cache_write_tokens)}</span>`);
+            if (tok.cache_write_tokens > 0) {
+              parts.push(`<span class="tok-w" title="${esc(t("records.chipCacheWriteTitle"))}">w:${fmtCompact(tok.cache_write_tokens)}</span>`);
             }
-            parts.push(`<span title="输出">→${fmtCompact(t.output_tokens)}</span>`);
-            if (t.reasoning_tokens > 0) {
-              parts.push(`<span class="tok-r" title="含推理 Token">r:${fmtCompact(t.reasoning_tokens)}</span>`);
+            parts.push(`<span title="${esc(t("records.chipOutputTitle"))}">→${fmtCompact(tok.output_tokens)}</span>`);
+            if (tok.reasoning_tokens > 0) {
+              parts.push(`<span class="tok-r" title="${esc(t("records.chipReasoningTitle"))}">r:${fmtCompact(tok.reasoning_tokens)}</span>`);
             }
             tokHtml = `<div class="tok-chips">${parts.join("")}</div>`;
           }
           const modelNote =
             item.observed_model && item.model && item.observed_model !== item.model
-              ? ` <span class="badge badge-warn" title="请求 ${esc(item.model)} → 实测 ${esc(item.observed_model)}">实测</span>`
+              ? ` <span class="badge badge-warn" title="${esc(t("records.observedTitle", { requested: item.model, observed: item.observed_model }))}">${esc(t("records.observedBadge"))}</span>`
               : "";
-          const deltaBadge = t.delta_from_conversation
-            ? ` <span class="badge" title="由 Antigravity 续接会话累计值做差换算">Δ</span>`
+          const deltaBadge = tok.delta_from_conversation
+            ? ` <span class="badge" title="${esc(t("records.deltaTitle"))}">Δ</span>`
             : "";
           const effortVal = item.observed_effort || item.effort || "—";
           const costStr = c.priced
@@ -832,7 +961,10 @@
         .join("");
     }
 
-    $("records-pager-info").textContent = `第 ${Math.floor(state.records.offset / state.records.limit) + 1} 页 · 每页 ${state.records.limit} 条`;
+    $("records-pager-info").textContent = t("records.pagerInfo", {
+      page: Math.floor(state.records.offset / state.records.limit) + 1,
+      limit: state.records.limit,
+    });
     $("btn-rec-prev").disabled = state.records.offset <= 0;
     $("btn-rec-next").disabled = state.records.offset + state.records.limit >= state.records.total;
     applyColumnVisibility();
@@ -842,54 +974,70 @@
     try {
       const res = await apiGet(`/api/records/${encodeURIComponent(taskId)}`);
       state.drawerTaskId = taskId;
+      state.drawerRecord = res.record;
       renderDrawer(res.record);
       $("drawer-backdrop").classList.remove("hidden");
       $("detail-drawer").classList.remove("hidden");
     } catch (err) {
-      showToast(`加载详情失败：${err.message}`, true);
+      showToast(t("toast.loadDetailFailed", { error: trBackend(err.message) }), true);
     }
   }
 
   function closeDrawer() {
     state.drawerTaskId = null;
+    state.drawerRecord = null;
     $("drawer-backdrop").classList.add("hidden");
     $("detail-drawer").classList.add("hidden");
   }
 
   function renderDrawer(r) {
     $("drawer-task-id").textContent = r.task_id;
-    const t = r.tokens;
+    const tok = r.tokens;
     const c = r.cost;
-    const scopeNote = t.delta_from_conversation
-      ? t.delta_reset_warning
-        ? "conversation（检测到计数器回退，已兜底取本轮快照）"
-        : "conversation（已自动减去同会话上一轮累计值）"
+    const scopeNote = tok.delta_from_conversation
+      ? tok.delta_reset_warning
+        ? t("drawer.scopeConvReset")
+        : t("drawer.scopeConvDelta")
       : r.usage_scope;
 
     let costSection = "";
     if (c.priced) {
+      const discDisplay = c.discount_label
+        ? t("drawer.discountApplied", {
+            label: trDiscountLabel(c.discount_label, c.discount_rule_id),
+            pct: c.discount_quota_boost_pct,
+            mult: c.discount_multiplier,
+          })
+        : t("drawer.discountNone");
       costSection = `
         <div class="kv-grid">
-          <div class="kv-k">匹配价格键</div><div class="kv-v mono">${esc(c.matched_price_key)} ${priceSourceBadge(c.price_source)}</div>
-          <div class="kv-k">单价 ($/1M)</div><div class="kv-v mono">输入 ${fmtRate(c.rate_input)} · 输出 ${fmtRate(c.rate_output)} · 缓存命中 ${fmtRate(c.rate_cache_read)} · 写入 ${fmtRate(c.rate_cache_write)}</div>
-          <div class="kv-k">分项费用</div><div class="kv-v mono"><span class="cost-term">输入 ${fmtUsd(c.input_cost_usd)}</span> + <span class="cost-term">缓存 ${fmtUsd(c.cache_read_cost_usd)}</span> + <span class="cost-term">写入 ${fmtUsd(c.cache_write_cost_usd)}</span> + <span class="cost-term">输出 ${fmtUsd(c.output_cost_usd)}</span></div>
-          <div class="kv-k">API 标价原价</div><div class="kv-v mono">${fmtUsd(c.list_cost_usd)}</div>
-          <div class="kv-k">Harness 折扣</div><div class="kv-v">${c.discount_label ? `${esc(c.discount_label)}（额度 ${c.discount_quota_boost_pct}% · 倍率 ×${c.discount_multiplier}）` : "无折扣（×1.0）"}</div>
-          <div class="kv-k">折算计费 (USD)</div><div class="kv-v mono"><b>${fmtUsd(c.effective_cost_usd)}</b></div>
+          <div class="kv-k">${esc(t("drawer.matchedPriceKey"))}</div><div class="kv-v mono">${esc(c.matched_price_key)} ${priceSourceBadge(c.price_source)}</div>
+          <div class="kv-k">${esc(t("drawer.unitRates"))}</div><div class="kv-v mono">${esc(
+            t("drawer.unitRatesValue", {
+              input: fmtRate(c.rate_input),
+              output: fmtRate(c.rate_output),
+              cacheRead: fmtRate(c.rate_cache_read),
+              cacheWrite: fmtRate(c.rate_cache_write),
+            })
+          )}</div>
+          <div class="kv-k">${esc(t("drawer.costBreakdown"))}</div><div class="kv-v mono"><span class="cost-term">${esc(t("drawer.costTermInput", { amount: fmtUsd(c.input_cost_usd) }))}</span> + <span class="cost-term">${esc(t("drawer.costTermCacheRead", { amount: fmtUsd(c.cache_read_cost_usd) }))}</span> + <span class="cost-term">${esc(t("drawer.costTermCacheWrite", { amount: fmtUsd(c.cache_write_cost_usd) }))}</span> + <span class="cost-term">${esc(t("drawer.costTermOutput", { amount: fmtUsd(c.output_cost_usd) }))}</span></div>
+          <div class="kv-k">${esc(t("drawer.listCost"))}</div><div class="kv-v mono">${fmtUsd(c.list_cost_usd)}</div>
+          <div class="kv-k">${esc(t("drawer.harnessDiscount"))}</div><div class="kv-v">${esc(discDisplay)}</div>
+          <div class="kv-k">${esc(t("drawer.effectiveCost"))}</div><div class="kv-v mono"><b>${fmtUsd(c.effective_cost_usd)}</b></div>
         </div>`;
     } else {
       const reasons = {
-        usage_missing: "该任务未上报 Token usage",
-        usage_breakdown_missing: "仅上报了 total_tokens，缺少输入/输出分项",
-        price_unmatched: "未匹配到该模型单价，请点击下方按钮手动设定",
+        usage_missing: t("drawer.reasonUsageMissing"),
+        usage_breakdown_missing: t("drawer.reasonBreakdownMissing"),
+        price_unmatched: t("drawer.reasonPriceUnmatched"),
       };
-      costSection = `<div class="muted">${esc(reasons[c.unavailable_reason] || c.unavailable_reason || "无法计价")}</div>`;
+      costSection = `<div class="muted">${esc(reasons[c.unavailable_reason] || c.unavailable_reason || t("drawer.reasonUnavailable"))}</div>`;
     }
 
     const alertsHtml =
       r.error || (r.warnings && r.warnings.length)
         ? `<div class="detail-sec">
-            <h4>错误与告警摘要</h4>
+            <h4>${esc(t("drawer.secAlerts"))}</h4>
             ${r.error ? `<div class="danger-text mono" style="font-size:12px;margin-bottom:6px">${esc(r.error)}</div>` : ""}
             ${(r.warnings || []).map((w) => `<div class="muted mono" style="font-size:12px">• ${esc(w)}</div>`).join("")}
           </div>`
@@ -897,48 +1045,48 @@
 
     $("drawer-body").innerHTML = `
       <div class="detail-sec">
-        <h4>基本信息</h4>
+        <h4>${esc(t("drawer.secBasic"))}</h4>
         <div class="kv-grid">
-          <div class="kv-k">Agent IDE/Harness</div><div class="kv-v"><span class="badge badge-accent" title="${esc(r.agent)}">${esc(agentLabel(r.agent))}</span></div>
-          <div class="kv-k">状态</div><div class="kv-v">${statusBadge(r.status)} ${r.stop_reason ? `<span class="muted mono">(${esc(r.stop_reason)})</span>` : ""}</div>
-          <div class="kv-k">模型</div><div class="kv-v mono">${esc(r.effective_model)}${r.model && r.observed_model && r.model !== r.observed_model ? ` <span class="muted">(请求 ${esc(r.model)})</span>` : ""}</div>
-          <div class="kv-k">推理强度</div><div class="kv-v mono">${esc(r.observed_effort || r.effort || "—")}</div>
-          <div class="kv-k">Session ID</div><div class="kv-v kv-v-path mono">${esc(r.session_id)}</div>
-          <div class="kv-k">原生会话 ID</div><div class="kv-v kv-v-path mono">${esc(r.native_session_id || "—")}</div>
-          <div class="kv-k">项目目录 (cwd)</div><div class="kv-v kv-v-path mono">${esc(r.cwd || "—")}</div>
-          <div class="kv-k">标题</div><div class="kv-v">${esc(r.title || "—")}</div>
-          <div class="kv-k">文件改动数</div><div class="kv-v mono">${fmtInt(r.files_changed_total)}${r.files_outside_cwd_total > 0 ? `（工作区外 ${r.files_outside_cwd_total}）` : ""}</div>
+          <div class="kv-k">${esc(t("common.agentHarness"))}</div><div class="kv-v"><span class="badge badge-accent" title="${esc(r.agent)}">${esc(agentLabel(r.agent))}</span></div>
+          <div class="kv-k">${esc(t("common.status"))}</div><div class="kv-v">${statusBadge(r.status)} ${r.stop_reason ? `<span class="muted mono">(${esc(r.stop_reason)})</span>` : ""}</div>
+          <div class="kv-k">${esc(t("common.model"))}</div><div class="kv-v mono">${esc(r.effective_model)}${r.model && r.observed_model && r.model !== r.observed_model ? ` <span class="muted">${esc(t("drawer.requestedModel", { model: r.model }))}</span>` : ""}</div>
+          <div class="kv-k">${esc(t("drawer.effort"))}</div><div class="kv-v mono">${esc(r.observed_effort || r.effort || "—")}</div>
+          <div class="kv-k">${esc(t("drawer.sessionId"))}</div><div class="kv-v kv-v-path mono">${esc(r.session_id)}</div>
+          <div class="kv-k">${esc(t("drawer.nativeSessionId"))}</div><div class="kv-v kv-v-path mono">${esc(r.native_session_id || "—")}</div>
+          <div class="kv-k">${esc(t("drawer.cwd"))}</div><div class="kv-v kv-v-path mono">${esc(r.cwd || "—")}</div>
+          <div class="kv-k">${esc(t("drawer.taskTitle"))}</div><div class="kv-v">${esc(r.title || "—")}</div>
+          <div class="kv-k">${esc(t("drawer.filesChanged"))}</div><div class="kv-v mono">${fmtInt(r.files_changed_total)}${r.files_outside_cwd_total > 0 ? esc(t("drawer.outsideCwd", { count: r.files_outside_cwd_total })) : ""}</div>
         </div>
       </div>
 
       <div class="detail-sec">
-        <h4>性能与时间</h4>
+        <h4>${esc(t("drawer.secPerf"))}</h4>
         <div class="kv-grid">
-          <div class="kv-k">开始时间</div><div class="kv-v mono">${esc(fmtTime(r.started_at || r.created_at))}</div>
-          <div class="kv-k">结束时间</div><div class="kv-v mono">${esc(fmtTime(r.finished_at))}</div>
-          <div class="kv-k">总耗时</div><div class="kv-v mono">${esc(fmtDuration(r.duration_ms))}</div>
-          <div class="kv-k">端到端输出</div><div class="kv-v mono">${r.tok_per_sec !== null ? `${r.tok_per_sec} tok/s` : "—"}</div>
+          <div class="kv-k">${esc(t("drawer.startedAt"))}</div><div class="kv-v mono">${esc(fmtTime(r.started_at || r.created_at))}</div>
+          <div class="kv-k">${esc(t("drawer.finishedAt"))}</div><div class="kv-v mono">${esc(fmtTime(r.finished_at))}</div>
+          <div class="kv-k">${esc(t("drawer.duration"))}</div><div class="kv-v mono">${esc(fmtDuration(r.duration_ms))}</div>
+          <div class="kv-k">${esc(t("drawer.endToEndOutput"))}</div><div class="kv-v mono">${r.tok_per_sec !== null ? `${r.tok_per_sec} tok/s` : "—"}</div>
         </div>
       </div>
 
       <div class="detail-sec">
-        <h4>Token 归一化明细</h4>
+        <h4>${esc(t("drawer.secTokens"))}</h4>
         <div class="kv-grid">
-          <div class="kv-k">总 Token</div><div class="kv-v mono"><b>${fmtInt(t.total_tokens)}</b></div>
-          <div class="kv-k">总输入（含缓存）</div><div class="kv-v mono">${fmtInt(t.input_tokens)}</div>
-          <div class="kv-k">输入（净非缓存）</div><div class="kv-v mono">${fmtInt(t.uncached_input_tokens)}</div>
-          <div class="kv-k">缓存命中 (c)</div><div class="kv-v mono">${t.cache_reported ? `${fmtInt(t.cache_read_tokens)} (${fmtPct4(r.cache_hit_rate)})` : "未上报"}</div>
-          <div class="kv-k">缓存写入 (w)</div><div class="kv-v mono">${t.cache_write_tokens !== null ? fmtInt(t.cache_write_tokens) : "—"}</div>
-          <div class="kv-k">输出（含推理）</div><div class="kv-v mono">${fmtInt(t.output_tokens)}</div>
-          <div class="kv-k">其中推理/思考</div><div class="kv-v mono">${fmtInt(t.reasoning_tokens)}</div>
-          <div class="kv-k">统计口径</div><div class="kv-v">${esc(scopeNote)}</div>
+          <div class="kv-k">${esc(t("drawer.totalTokens"))}</div><div class="kv-v mono"><b>${fmtInt(tok.total_tokens)}</b></div>
+          <div class="kv-k">${esc(t("drawer.totalInput"))}</div><div class="kv-v mono">${fmtInt(tok.input_tokens)}</div>
+          <div class="kv-k">${esc(t("drawer.netInput"))}</div><div class="kv-v mono">${fmtInt(tok.uncached_input_tokens)}</div>
+          <div class="kv-k">${esc(t("drawer.cacheRead"))}</div><div class="kv-v mono">${tok.cache_reported ? `${fmtInt(tok.cache_read_tokens)} (${fmtPct4(r.cache_hit_rate)})` : esc(t("common.unreported"))}</div>
+          <div class="kv-k">${esc(t("drawer.cacheWrite"))}</div><div class="kv-v mono">${tok.cache_write_tokens !== null ? fmtInt(tok.cache_write_tokens) : "—"}</div>
+          <div class="kv-k">${esc(t("drawer.outputInclReasoning"))}</div><div class="kv-v mono">${fmtInt(tok.output_tokens)}</div>
+          <div class="kv-k">${esc(t("drawer.reasoning"))}</div><div class="kv-v mono">${fmtInt(tok.reasoning_tokens)}</div>
+          <div class="kv-k">${esc(t("drawer.usageScope"))}</div><div class="kv-v">${esc(scopeNote)}</div>
         </div>
       </div>
 
       <div class="detail-sec">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-          <h4 style="margin:0">API 标价折算 (USD)</h4>
-          <button type="button" class="btn btn-ghost btn-sm" id="btn-drawer-edit-price">调整此模型定价</button>
+          <h4 style="margin:0">${esc(t("drawer.secCost"))}</h4>
+          <button type="button" class="btn btn-ghost btn-sm" id="btn-drawer-edit-price">${esc(t("drawer.editModelPrice"))}</button>
         </div>
         ${costSection}
       </div>
@@ -946,7 +1094,7 @@
       ${alertsHtml}
 
       <div class="detail-sec">
-        <h4>原始 usage 元数据（无正文）</h4>
+        <h4>${esc(t("drawer.secRawUsage"))}</h4>
         <pre class="json-pre">${esc(JSON.stringify(r.usage_raw || {}, null, 2))}</pre>
       </div>
     `;
@@ -972,20 +1120,20 @@
     const rules = state.pricing?.config?.harness_discounts || [];
     const body = $("discounts-table-body");
     if (!rules.length) {
-      body.innerHTML = `<tr><td colspan="8" class="muted" style="text-align:center;padding:18px">暂无 Harness 折扣规则（全部按原价 ×1.0 折算）</td></tr>`;
+      body.innerHTML = `<tr><td colspan="8" class="muted" style="text-align:center;padding:18px">${esc(t("pricing.discountsEmpty"))}</td></tr>`;
       return;
     }
     body.innerHTML = rules
       .map(
         (r, idx) => `<tr>
-        <td><input type="checkbox" class="disc-toggle" data-idx="${idx}" ${r.enabled ? "checked" : ""} /></td>
+        <td><input type="checkbox" class="disc-toggle" data-idx="${idx}" aria-label="${esc(t("pricing.toggleRuleAria"))}" ${r.enabled ? "checked" : ""} /></td>
         <td><span class="badge badge-accent" title="${esc(r.agent)}">${esc(agentLabel(r.agent))}</span></td>
         <td class="mono">${esc(r.model_pattern || "*")}</td>
-        <td>${r.mode === "quota_boost" ? "额度膨胀 %" : "计费倍率 ×"}</td>
+        <td>${esc(r.mode === "quota_boost" ? t("pricing.modeQuotaBoostShort") : t("pricing.modeMultiplierShort"))}</td>
         <td class="num">${Number(r.quota_boost_pct).toFixed(1)}%</td>
         <td class="num"><b>×${Number(r.cost_multiplier).toFixed(4)}</b></td>
-        <td>${esc(r.label || "—")} ${r.preset ? '<span class="badge">预置</span>' : ""}</td>
-        <td class="num"><button type="button" class="btn btn-ghost btn-sm disc-delete" data-idx="${idx}">删除</button></td>
+        <td>${esc(r.label ? trDiscountLabel(r.label, r.id) : "—")} ${r.preset ? `<span class="badge">${esc(t("pricing.presetBadge"))}</span>` : ""}</td>
+        <td class="num"><button type="button" class="btn btn-ghost btn-sm disc-delete" data-idx="${idx}">${esc(t("common.delete"))}</button></td>
       </tr>`
       )
       .join("");
@@ -1004,21 +1152,24 @@
         .map((m) => ({
           key: m.model,
           agent: m.agent,
-          subLabel: `${agentLabel(m.agent)} · ${m.tasks} 次任务`,
+          subLabel: t("pricing.subObserved", { agent: agentLabel(m.agent), tasks: m.tasks }),
           source: m.source,
           rate: m.rate,
-          discount: m.discount_multiplier !== 1 ? `${m.discount_label || ""} (×${Number(m.discount_multiplier).toFixed(3)})` : "—",
+          discount:
+            m.discount_multiplier !== 1
+              ? `${trDiscountLabel(m.discount_label || "")} (×${Number(m.discount_multiplier).toFixed(3)})`
+              : "—",
           hasUserOverride: Object.keys(userModels).some(
             (k) => k.toLowerCase() === m.model.toLowerCase() || k.toLowerCase() === `${m.agent}::${m.model}`.toLowerCase()
           ),
         }));
     } else if (view === "user") {
       rows = Object.entries(userModels).map(([k, rate]) => {
-        const [ag, md] = k.includes("::") ? k.split("::", 2) : ["*", k];
+        const [ag] = k.includes("::") ? k.split("::", 2) : ["*", k];
         return {
           key: k,
           agent: ag === "*" ? "" : ag,
-          subLabel: ag === "*" ? "全局模型覆盖" : `仅限 ${agentLabel(ag)}`,
+          subLabel: ag === "*" ? t("pricing.subGlobalOverride") : t("pricing.subAgentOnly", { agent: agentLabel(ag) }),
           source: "user",
           rate,
           discount: "—",
@@ -1035,12 +1186,12 @@
         return {
           key: p.key,
           agent: p.agent_hint,
-          subLabel: `参考归属：${agentLabel(p.agent_hint)}`,
+          subLabel: t("pricing.subPresetRef", { agent: agentLabel(p.agent_hint) }),
           source: hasOverride ? "user" : "preset",
           rate: effectiveRate,
           discount:
             p.discount_multiplier !== undefined && p.discount_multiplier !== 1
-              ? `${p.discount_label || ""} (×${Number(p.discount_multiplier).toFixed(3)})`
+              ? `${trDiscountLabel(p.discount_label || "")} (×${Number(p.discount_multiplier).toFixed(3)})`
               : "—",
           hasUserOverride: hasOverride,
         };
@@ -1054,7 +1205,7 @@
     }
 
     if (!rows.length) {
-      body.innerHTML = `<tr><td colspan="8" class="muted" style="text-align:center;padding:22px">暂无匹配的定价项</td></tr>`;
+      body.innerHTML = `<tr><td colspan="8" class="muted" style="text-align:center;padding:22px">${esc(t("pricing.ratesEmpty"))}</td></tr>`;
       return;
     }
 
@@ -1071,7 +1222,7 @@
           <td class="muted col-gap-left" style="font-size:12px">${esc(r.discount)}</td>
           <td class="num">
             <button type="button" class="btn btn-ghost btn-sm btn-edit-price-row"
-              data-agent="${esc(r.agent || "")}" data-key="${esc(r.exactKey || r.key)}">编辑</button>
+              data-agent="${esc(r.agent || "")}" data-key="${esc(r.exactKey || r.key)}">${esc(t("common.edit"))}</button>
           </td>
         </tr>`;
       })
@@ -1081,15 +1232,15 @@
   function updateDiscountPreview() {
     const mode = $("disc-mode").value;
     const val = Number($("disc-value").value);
-    $("disc-value-label").textContent = mode === "quota_boost" ? "额度百分比 (%)" : "计费倍率 (×)";
+    $("disc-value-label").textContent = mode === "quota_boost" ? t("pricing.formValueQuota") : t("pricing.formValueMultiplier");
     if (!Number.isFinite(val) || val <= 0) {
-      $("disc-preview").textContent = "无效";
+      $("disc-preview").textContent = t("pricing.previewInvalid");
       return;
     }
     if (mode === "quota_boost") {
-      $("disc-preview").textContent = `等效 ×${(100 / val).toFixed(4)}`;
+      $("disc-preview").textContent = t("pricing.previewMultiplier", { value: (100 / val).toFixed(4) });
     } else {
-      $("disc-preview").textContent = `等效额度 ${(100 / val).toFixed(1)}%`;
+      $("disc-preview").textContent = t("pricing.previewQuota", { value: (100 / val).toFixed(1) });
     }
   }
 
@@ -1115,7 +1266,10 @@
     state.modalCtx = { agent: scopedAgent, baseModel, scopedKey };
     $("modal-scope-wrap").classList.toggle("hidden", !scopedAgent);
     $("modal-scope-agent").checked = useScoped;
-    $("modal-scope-label").textContent = `仅覆盖当前 ${agentLabel(scopedAgent)} (${scopedAgent}::${baseModel})`;
+    $("modal-scope-label").textContent = t("pricing.modalScopeAgent", {
+      agent: agentLabel(scopedAgent),
+      scopedKey,
+    });
     $("modal-key").value = useScoped && scopedAgent ? scopedKey : baseModel;
     $("modal-in").value = activeRate ? String(activeRate.input) : "";
     $("modal-out").value = activeRate ? String(activeRate.output) : "";
@@ -1132,9 +1286,14 @@
   }
 
   // ==================== Info Modal ====================
-  function openInfoModal(title, message, detail = "") {
-    $("info-modal-title").textContent = title || "提示";
-    $("info-modal-message").textContent = message || "";
+  function renderInfoModal() {
+    const spec = state.infoModalSpec;
+    if (!spec) return;
+    const title = spec.titleKey ? t(spec.titleKey, spec.params) : spec.title || t("common.notice");
+    const message = spec.messageKey ? t(spec.messageKey, spec.params) : spec.message || "";
+    const detail = spec.detailKey ? t(spec.detailKey, spec.params) : spec.detail || "";
+    $("info-modal-title").textContent = title;
+    $("info-modal-message").textContent = message;
     const detailEl = $("info-modal-detail");
     if (detail) {
       detailEl.textContent = detail;
@@ -1143,10 +1302,20 @@
       detailEl.textContent = "";
       detailEl.classList.add("hidden");
     }
+  }
+
+  function openInfoModal(specOrTitle, message, detail = "") {
+    if (specOrTitle && typeof specOrTitle === "object") {
+      state.infoModalSpec = specOrTitle;
+    } else {
+      state.infoModalSpec = { title: specOrTitle, message: message || "", detail };
+    }
+    renderInfoModal();
     $("info-modal-backdrop").classList.remove("hidden");
   }
 
   function closeInfoModal() {
+    state.infoModalSpec = null;
     $("info-modal-backdrop").classList.add("hidden");
   }
 
@@ -1167,59 +1336,70 @@
   async function loadService() {
     const res = await apiGet("/api/service");
     state.service = res.service;
-    renderService();
+    state.serviceStopped = false;
+    renderService({ preserveInputs: false });
   }
 
-  function renderService() {
+  function renderService(opts = {}) {
     const svc = state.service;
     if (!svc) return;
+    const preserveInputs = Boolean(opts.preserveInputs);
     const badge = $("svc-state-badge");
-    badge.textContent = svc.running ? "运行中" : "已停止";
+    badge.textContent = svc.running ? t("storage.stateRunning") : t("storage.stateStopped");
     badge.className = svc.running ? "badge badge-ok" : "badge badge-warn";
 
     const metaBadges = [];
     if (svc.pid) metaBadges.push(`<span class="badge mono">PID ${esc(svc.pid)}</span>`);
     if (svc.is_checkout) {
-      metaBadges.push(`<span class="badge badge-warn">源码测试版</span>`);
+      metaBadges.push(`<span class="badge badge-warn">${esc(t("storage.badgeCheckout"))}</span>`);
     } else if (svc.install_kind) {
       metaBadges.push(`<span class="badge">${esc(svc.install_kind)}</span>`);
     }
     if (svc.autostart?.enabled && !svc.autostart?.matches_current) {
-      metaBadges.push(`<span class="badge badge-warn">自启路径待刷新</span>`);
+      metaBadges.push(`<span class="badge badge-warn">${esc(t("storage.badgeAutostartDrift"))}</span>`);
     }
     $("svc-meta-badges").innerHTML = metaBadges.join("");
 
     const autostartText = svc.windows_supported
-      ? (svc.autostart?.enabled ? "已开启" : "未开启")
-      : "仅 Windows";
+      ? svc.autostart?.enabled
+        ? t("storage.autostartEnabled")
+        : t("storage.autostartDisabled")
+      : t("storage.windowsOnly");
     const trayText = svc.windows_supported
-      ? (svc.tray_running ? "运行中" : "未运行")
-      : "仅 Windows";
+      ? svc.tray_running
+        ? t("storage.trayRunning")
+        : t("storage.trayNotRunning")
+      : t("storage.windowsOnly");
     $("svc-status-strip").innerHTML = `
-      <div><span class="muted">监听地址：</span><span class="mono">${esc(svc.url)}</span></div>
-      <div><span class="muted">运行时间：</span><span class="mono">${svc.running ? esc(fmtUptime(svc.uptime_sec)) : "—"}</span></div>
-      <div><span class="muted">托盘 / 自启：</span><span>${esc(trayText)} / ${esc(autostartText)}</span></div>
-      <div><span class="muted">日志文件：</span><span class="mono">${esc(svc.log_path)}</span></div>
+      <div><span class="muted">${esc(t("storage.stripListen"))}</span><span class="mono">${esc(svc.url)}</span></div>
+      <div><span class="muted">${esc(t("storage.stripUptime"))}</span><span class="mono">${svc.running ? esc(fmtUptime(svc.uptime_sec)) : "—"}</span></div>
+      <div><span class="muted">${esc(t("storage.stripTrayAutostart"))}</span><span>${esc(trayText)} / ${esc(autostartText)}</span></div>
+      <div><span class="muted">${esc(t("storage.stripLogFile"))}</span><span class="mono">${esc(svc.log_path)}</span></div>
     `;
 
     const winOk = Boolean(svc.windows_supported);
-    $("svc-autostart").checked = Boolean(svc.config?.auto_start);
+    if (!preserveInputs) {
+      $("svc-autostart").checked = Boolean(svc.config?.auto_start);
+      $("svc-tray").checked = Boolean(svc.config?.tray_enabled);
+      $("svc-port").value = String(svc.config?.port ?? svc.port ?? 8765);
+    }
     $("svc-autostart").disabled = !winOk;
     if (!winOk) {
-      $("svc-autostart-note").textContent = "当前非 Windows 平台，仅 Windows 支持用户级 HKCU\\Run 开机自启。";
+      $("svc-autostart-note").textContent = t("storage.autostartNoteNonWin");
     } else if (svc.is_checkout) {
-      $("svc-autostart-note").textContent = "当前处于测试源码目录，建议合并到正式安装后再开启开机自启；安装路径变更后重新保存一次即可刷新。";
+      $("svc-autostart-note").textContent = t("storage.autostartNoteCheckout");
     } else {
-      $("svc-autostart-note").textContent = "登录 Windows 时静默启动后台看板服务；正式安装路径变更后重新保存一次即可刷新。";
+      $("svc-autostart-note").textContent = t("storage.autostartNoteDefault");
     }
 
-    $("svc-tray").checked = Boolean(svc.config?.tray_enabled);
     $("svc-tray").disabled = !winOk;
     const trayBadge = $("svc-tray-badge");
-    trayBadge.textContent = !winOk ? "仅 Windows" : (svc.tray_running ? "运行中" : "未运行");
+    trayBadge.textContent = !winOk
+      ? t("storage.windowsOnly")
+      : svc.tray_running
+        ? t("storage.trayRunning")
+        : t("storage.trayNotRunning");
     trayBadge.className = winOk && svc.tray_running ? "badge badge-ok" : "badge";
-
-    $("svc-port").value = String(svc.config?.port ?? svc.port ?? 8765);
   }
 
   async function waitForServiceReconnect(targetUrl) {
@@ -1261,62 +1441,72 @@
       }
       await new Promise((r) => setTimeout(r, 700));
     }
-    showToast("服务重连超时，请检查日志或手动刷新页面", true);
+    showToast(t("toast.reconnectTimeout"), true);
   }
 
   async function loadStorage() {
     const res = await apiGet("/api/storage");
     state.storage = res.storage;
-    renderStorage();
+    renderStorage({ preserveInputs: false });
   }
 
-  function renderStorage() {
+  function renderStorage(opts = {}) {
     const st = state.storage;
     if (!st) return;
+    const preserveInputs = Boolean(opts.preserveInputs);
     const p = st.policy;
     const maxBytes = p.max_bytes;
     const pct = maxBytes ? Math.min(100, (st.ledger_bytes / maxBytes) * 100) : 0;
-    const capText = maxBytes ? `${fmtBytes(st.ledger_bytes)} / ${fmtBytes(maxBytes)} (${pct.toFixed(1)}%)` : `${fmtBytes(st.ledger_bytes)}（不限体积）`;
+    const capText = maxBytes
+      ? `${fmtBytes(st.ledger_bytes)} / ${fmtBytes(maxBytes)} (${pct.toFixed(1)}%)`
+      : t("storage.kpiUnlimitedSize", { used: fmtBytes(st.ledger_bytes) });
+    const healthText =
+      st.corrupt_lines > 0 ? t("storage.kpiCorruptSkipped", { count: st.corrupt_lines }) : t("storage.kpiFormatOk");
+    const retentionText = p.max_age_days
+      ? t("storage.kpiRetentionDays", { days: p.max_age_days })
+      : t("storage.kpiRetentionUnlimited");
 
     $("storage-kpis").innerHTML = `
       <div class="kpi-card">
-        <div class="kpi-label">独立账本占用</div>
+        <div class="kpi-label">${esc(t("storage.kpiLedgerSize"))}</div>
         <div class="kpi-value">${fmtBytes(st.ledger_bytes)}</div>
         <div class="kpi-sub">${esc(capText)}</div>
         ${maxBytes ? `<div class="progress-bar"><div class="progress-fill" style="width:${pct.toFixed(1)}%"></div></div>` : ""}
       </div>
       <div class="kpi-card">
-        <div class="kpi-label">账本记录条数</div>
+        <div class="kpi-label">${esc(t("storage.kpiLedgerCount"))}</div>
         <div class="kpi-value">${fmtInt(st.record_count)}</div>
-        <div class="kpi-sub">${st.corrupt_lines > 0 ? `跳过异常行 ${st.corrupt_lines}` : "格式完好"} · 本机 receipts ${fmtInt(st.receipts_on_disk)} 个</div>
+        <div class="kpi-sub">${esc(t("storage.kpiRecordsSub", { health: healthText, count: fmtInt(st.receipts_on_disk) }))}</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-label">最早记录时间</div>
+        <div class="kpi-label">${esc(t("storage.kpiEarliest"))}</div>
         <div class="kpi-value" style="font-size:16px">${esc(fmtTime(st.earliest_ts))}</div>
-        <div class="kpi-sub">保留策略：${p.max_age_days ? `${p.max_age_days} 天` : "不限天数"}</div>
+        <div class="kpi-sub">${esc(t("storage.kpiRetentionSub", { retention: retentionText }))}</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-label">最新记录时间</div>
+        <div class="kpi-label">${esc(t("storage.kpiLatest"))}</div>
         <div class="kpi-value" style="font-size:16px">${esc(fmtTime(st.latest_ts))}</div>
-        <div class="kpi-sub">配置总占用 ${fmtBytes(st.total_billing_bytes)}</div>
+        <div class="kpi-sub">${esc(t("storage.kpiTotalBytes", { bytes: fmtBytes(st.total_billing_bytes) }))}</div>
       </div>
     `;
 
-    $("st-enable-size").checked = p.max_bytes !== null;
-    $("st-max-mb").disabled = p.max_bytes === null;
-    $("st-max-mb").value = p.max_bytes !== null ? String(Math.max(1, Math.round(p.max_bytes / (1024 * 1024)))) : "100";
+    if (!preserveInputs) {
+      $("st-enable-size").checked = p.max_bytes !== null;
+      $("st-max-mb").disabled = p.max_bytes === null;
+      $("st-max-mb").value = p.max_bytes !== null ? String(Math.max(1, Math.round(p.max_bytes / (1024 * 1024)))) : "100";
 
-    $("st-enable-age").checked = p.max_age_days !== null;
-    $("st-max-days").disabled = p.max_age_days === null;
-    $("st-max-days").value = p.max_age_days !== null ? String(p.max_age_days) : "180";
+      $("st-enable-age").checked = p.max_age_days !== null;
+      $("st-max-days").disabled = p.max_age_days === null;
+      $("st-max-days").value = p.max_age_days !== null ? String(p.max_age_days) : "180";
 
-    $("st-auto-rotate").checked = Boolean(p.auto_rotate);
+      $("st-auto-rotate").checked = Boolean(p.auto_rotate);
+    }
 
     $("storage-paths").innerHTML = `
-      <div>目录：${esc(st.billing_dir)}</div>
-      <div>账本：${esc(st.ledger_path)}</div>
-      <div>定价：${esc(st.pricing_path)}</div>
-      <div>策略：${esc(st.storage_policy_path)}</div>
+      <div>${esc(t("storage.pathDir", { path: st.billing_dir }))}</div>
+      <div>${esc(t("storage.pathLedger", { path: st.ledger_path }))}</div>
+      <div>${esc(t("storage.pathPricing", { path: st.pricing_path }))}</div>
+      <div>${esc(t("storage.pathPolicy", { path: st.storage_policy_path }))}</div>
     `;
   }
 
@@ -1331,7 +1521,7 @@
     document.querySelectorAll(".tab-panel").forEach((panel) => {
       panel.classList.toggle("active", panel.id === `panel-${tabName}`);
     });
-    refreshActiveTab().catch((e) => showToast(e.message, true));
+    refreshActiveTab().catch((e) => showToast(trBackend(e.message), true));
   }
 
   async function refreshActiveTab() {
@@ -1343,6 +1533,9 @@
 
   async function refreshAll(firstLoad = false) {
     state.meta = await apiGet("/api/meta");
+    if (I18N && state.meta.locale && state.meta.locale !== I18N.getLocale() && !state.localeSwitching) {
+      await I18N.setLocale(state.meta.locale);
+    }
     syncModelsToMeta(firstLoad);
     renderMetaControls();
     await Promise.all([loadPricing(), refreshActiveTab()]);
@@ -1380,6 +1573,9 @@
     try {
       const ver = await apiGet("/api/version");
       syncAutoRefreshUI(true);
+      if (I18N && ver.locale && ver.locale !== I18N.getLocale() && !state.localeSwitching) {
+        await applyLocaleAndRerender(ver.locale);
+      }
       if (state.lastRevision === null) {
         state.lastRevision = ver.revision;
         return;
@@ -1392,7 +1588,7 @@
         state.lastRevision = ver.revision;
         await refreshAll(false);
         if (ver.imported_receipts > 0) {
-          showToast(`已自动同步 ${ver.imported_receipts} 条新回执`);
+          showToast(t("toast.autoSyncedReceipts", { count: ver.imported_receipts }));
         }
       }
     } catch {
@@ -1419,15 +1615,26 @@
       btn.addEventListener("click", () => switchTab(btn.getAttribute("data-tab")));
     });
     $("btn-theme").addEventListener("click", toggleTheme);
+    $("lang-switch")?.addEventListener("click", (ev) => {
+      const btn = ev.target.closest("[data-locale]");
+      if (!btn) return;
+      switchLocale(btn.getAttribute("data-locale"));
+    });
     $("btn-refresh").addEventListener("click", () => {
-      refreshAll(false).then(() => showToast("已刷新")).catch((e) => showToast(e.message, true));
+      refreshAll(false)
+        .then(() => showToast(t("toast.refreshed")))
+        .catch((e) => showToast(trBackend(e.message), true));
     });
     $("auto-refresh-select").addEventListener("change", (ev) => {
       const ms = Number(ev.target.value);
       state.autoRefreshMs = [0, 5000, 10000, 30000].includes(ms) ? ms : 10000;
       saveRefreshMs(state.autoRefreshMs);
       startAutoRefresh();
-      showToast(state.autoRefreshMs > 0 ? `已开启自动刷新 (${state.autoRefreshMs / 1000}s)` : "已关闭自动刷新");
+      showToast(
+        state.autoRefreshMs > 0
+          ? t("toast.autoRefreshEnabled", { sec: state.autoRefreshMs / 1000 })
+          : t("toast.autoRefreshDisabled")
+      );
     });
     document.addEventListener("visibilitychange", () => {
       syncAutoRefreshUI(true);
@@ -1450,7 +1657,7 @@
       }
       renderAgentPills();
       renderModelPills();
-      loadSummary().catch((e) => showToast(e.message, true));
+      loadSummary().catch((e) => showToast(trBackend(e.message), true));
     });
 
     $("btn-agent-agy").addEventListener("click", () => {
@@ -1459,7 +1666,7 @@
       for (const a of state.selectedAgents) selectAllModelsForAgent(a);
       renderAgentPills();
       renderModelPills();
-      loadSummary().catch((e) => showToast(e.message, true));
+      loadSummary().catch((e) => showToast(trBackend(e.message), true));
     });
 
     $("btn-agent-all").addEventListener("click", () => {
@@ -1468,7 +1675,7 @@
       for (const a of state.selectedAgents) selectAllModelsForAgent(a);
       renderAgentPills();
       renderModelPills();
-      loadSummary().catch((e) => showToast(e.message, true));
+      loadSummary().catch((e) => showToast(trBackend(e.message), true));
     });
 
     $("btn-agent-clear").addEventListener("click", () => {
@@ -1476,7 +1683,7 @@
       state.selectedModels.clear();
       renderAgentPills();
       renderModelPills();
-      loadSummary().catch((e) => showToast(e.message, true));
+      loadSummary().catch((e) => showToast(trBackend(e.message), true));
     });
 
     // Model pills
@@ -1487,7 +1694,7 @@
       if (state.selectedModels.has(pair)) state.selectedModels.delete(pair);
       else state.selectedModels.add(pair);
       renderModelPills();
-      loadSummary().catch((e) => showToast(e.message, true));
+      loadSummary().catch((e) => showToast(trBackend(e.message), true));
     });
 
     $("stats-model-search").addEventListener("input", (ev) => {
@@ -1498,13 +1705,13 @@
     $("btn-model-all").addEventListener("click", () => {
       for (const x of modelsForSelectedAgents()) state.selectedModels.add(x.pair);
       renderModelPills();
-      loadSummary().catch((e) => showToast(e.message, true));
+      loadSummary().catch((e) => showToast(trBackend(e.message), true));
     });
 
     $("btn-model-none").addEventListener("click", () => {
       for (const x of modelsForSelectedAgents()) state.selectedModels.delete(x.pair);
       renderModelPills();
-      loadSummary().catch((e) => showToast(e.message, true));
+      loadSummary().catch((e) => showToast(trBackend(e.message), true));
     });
 
     // Time range & cwd
@@ -1514,18 +1721,18 @@
       state.statsRange = btn.getAttribute("data-range");
       $("stats-range-group").querySelectorAll(".seg").forEach((s) => s.classList.toggle("active", s === btn));
       $("stats-custom-range").classList.toggle("hidden", state.statsRange !== "custom");
-      if (state.statsRange !== "custom") loadSummary().catch((e) => showToast(e.message, true));
+      if (state.statsRange !== "custom") loadSummary().catch((e) => showToast(trBackend(e.message), true));
     });
 
     $("btn-stats-apply-range").addEventListener("click", () => {
       state.statsStart = $("stats-start").value;
       state.statsEnd = $("stats-end").value;
-      loadSummary().catch((e) => showToast(e.message, true));
+      loadSummary().catch((e) => showToast(trBackend(e.message), true));
     });
 
     $("stats-cwd-select").addEventListener("change", (ev) => {
       state.statsCwd = ev.target.value;
-      loadSummary().catch((e) => showToast(e.message, true));
+      loadSummary().catch((e) => showToast(trBackend(e.message), true));
     });
 
     $("chart-metric-group").addEventListener("click", (ev) => {
@@ -1550,7 +1757,7 @@
     // Records filters
     const reloadRecs = () => {
       state.recOffset = 0;
-      loadRecords().catch((e) => showToast(e.message, true));
+      loadRecords().catch((e) => showToast(trBackend(e.message), true));
     };
     $("rec-agent").addEventListener("change", (e) => { state.recAgent = e.target.value; reloadRecs(); });
     $("rec-status").addEventListener("change", (e) => { state.recStatus = e.target.value; reloadRecs(); });
@@ -1591,7 +1798,7 @@
       $("rec-cwd").value = "";
       $("rec-session").value = "";
       $("rec-query").value = "";
-      loadRecords().catch((e) => showToast(e.message, true));
+      loadRecords().catch((e) => showToast(trBackend(e.message), true));
     });
 
     $("records-table-body").addEventListener("click", (ev) => {
@@ -1602,11 +1809,11 @@
 
     $("btn-rec-prev").addEventListener("click", () => {
       state.recOffset = Math.max(0, state.recOffset - state.recLimit);
-      loadRecords().catch((e) => showToast(e.message, true));
+      loadRecords().catch((e) => showToast(trBackend(e.message), true));
     });
     $("btn-rec-next").addEventListener("click", () => {
       state.recOffset += state.recLimit;
-      loadRecords().catch((e) => showToast(e.message, true));
+      loadRecords().catch((e) => showToast(trBackend(e.message), true));
     });
 
     // Drawer
@@ -1616,9 +1823,9 @@
       if (!state.drawerTaskId) return;
       try {
         await navigator.clipboard.writeText(state.drawerTaskId);
-        showToast("已复制任务 ID");
+        showToast(t("toast.copiedTaskId"));
       } catch {
-        showToast("剪贴板不可用", true);
+        showToast(t("toast.clipboardUnavailable"), true);
       }
     });
 
@@ -1653,9 +1860,9 @@
         $("disc-pattern").value = "";
         $("disc-label").value = "";
         renderPricing();
-        showToast("已添加 Harness 折扣规则");
+        showToast(t("toast.discountAdded"));
       } catch (err) {
-        showToast(`保存失败：${err.message}`, true);
+        showToast(t("toast.saveFailed", { error: trBackend(err.message) }), true);
       }
     });
 
@@ -1669,9 +1876,9 @@
       try {
         state.pricing = await apiMutate("PUT", "/api/pricing", { harness_discounts: rules });
         renderPricing();
-        showToast("已更新折扣开关");
+        showToast(t("toast.discountUpdated"));
       } catch (err) {
-        showToast(`更新失败：${err.message}`, true);
+        showToast(t("toast.updateFailed", { error: trBackend(err.message) }), true);
       }
     });
 
@@ -1684,9 +1891,9 @@
       try {
         state.pricing = await apiMutate("PUT", "/api/pricing", { harness_discounts: rules });
         renderPricing();
-        showToast("已删除折扣规则");
+        showToast(t("toast.discountDeleted"));
       } catch (err) {
-        showToast(`删除失败：${err.message}`, true);
+        showToast(t("toast.deleteFailed", { error: trBackend(err.message) }), true);
       }
     });
 
@@ -1720,9 +1927,9 @@
         $("price-new-cr").value = "";
         $("price-new-cw").value = "";
         await refreshAll(false);
-        showToast(`已保存 ${key} 单价`);
+        showToast(t("toast.priceSaved", { key }));
       } catch (err) {
-        showToast(`保存失败：${err.message}`, true);
+        showToast(t("toast.saveFailed", { error: trBackend(err.message) }), true);
       }
     });
 
@@ -1733,13 +1940,13 @@
     });
 
     $("btn-pricing-reset").addEventListener("click", async () => {
-      if (!window.confirm("确认清除所有手动模型定价并恢复默认 Harness 折扣预置？")) return;
+      if (!window.confirm(t("dialogs.confirmPricingReset"))) return;
       try {
         state.pricing = await apiMutate("POST", "/api/pricing/reset", {});
         await refreshAll(false);
-        showToast("已恢复默认预置定价与折扣");
+        showToast(t("toast.pricingReset"));
       } catch (err) {
-        showToast(`重置失败：${err.message}`, true);
+        showToast(t("toast.resetFailed", { error: trBackend(err.message) }), true);
       }
     });
 
@@ -1764,9 +1971,9 @@
         state.pricing = await apiMutate("PUT", "/api/pricing", { upsert_model: { key, rate } });
         closePriceModal();
         await refreshAll(false);
-        showToast(`已更新 ${key} 价格`);
+        showToast(t("toast.priceUpdated", { key }));
       } catch (err) {
-        showToast(`保存失败：${err.message}`, true);
+        showToast(t("toast.saveFailed", { error: trBackend(err.message) }), true);
       }
     });
     $("btn-modal-delete").addEventListener("click", async () => {
@@ -1775,9 +1982,9 @@
         state.pricing = await apiMutate("PUT", "/api/pricing", { delete_model: key });
         closePriceModal();
         await refreshAll(false);
-        showToast(`已移除 ${key} 手动覆盖`);
+        showToast(t("toast.priceDeleted", { key }));
       } catch (err) {
-        showToast(`删除失败：${err.message}`, true);
+        showToast(t("toast.deleteFailed", { error: trBackend(err.message) }), true);
       }
     });
 
@@ -1793,10 +2000,11 @@
         };
         const res = await apiMutate("PUT", "/api/service", payload);
         state.service = res.service;
-        renderService();
-        showToast(res.message || "已保存服务设置");
+        state.serviceStopped = false;
+        renderService({ preserveInputs: false });
+        showToast(res.message ? trBackend(res.message) : t("toast.serviceSaved"));
       } catch (err) {
-        showToast(`保存失败：${err.message}`, true);
+        showToast(t("toast.saveFailed", { error: trBackend(err.message) }), true);
       }
     });
 
@@ -1805,46 +2013,48 @@
       btn.disabled = true;
       try {
         const res = await apiMutate("POST", "/api/service/restart", {});
-        showToast(res.message || "正在重启服务…");
-        await waitForServiceReconnect(res.url || window.location.origin);
+        const targetUrl = res.url || window.location.origin;
+        showToast(t("toast.restartingService", { url: targetUrl }));
+        await waitForServiceReconnect(targetUrl);
       } catch (err) {
         btn.disabled = false;
-        showToast(`重启失败：${err.message}`, true);
+        showToast(t("toast.restartFailed", { error: trBackend(err.message) }), true);
       }
     });
 
     // 看板更新暂不启用，原实现见 5c2596c。
     $("btn-svc-update").addEventListener("click", () => {
-      openInfoModal("更新提示", "最新，别搞");
+      openInfoModal({ titleKey: "dialogs.updateTitle", messageKey: "dialogs.updateMessage" });
     });
 
     $("btn-svc-folder").addEventListener("click", async () => {
       try {
         const res = await apiMutate("POST", "/api/service/open-folder", {});
-        if (res.ok) showToast(`已打开日志目录：${res.path}`);
-        else showToast(res.message || "无法打开目录", true);
+        if (res.ok) showToast(t("toast.openedLogsFolder", { path: res.path }));
+        else showToast(res.message ? trBackend(res.message) : t("toast.cannotOpenFolder"), true);
       } catch (err) {
-        showToast(`打开目录失败：${err.message}`, true);
+        showToast(t("toast.openFolderFailed", { error: trBackend(err.message) }), true);
       }
     });
 
     $("btn-svc-stop").addEventListener("click", async () => {
-      if (!window.confirm("确认停止本地看板服务？停止后当前页面将断开，可随时通过托盘或 CLI 重新启动。")) return;
+      if (!window.confirm(t("dialogs.confirmServiceStop"))) return;
       try {
         await apiMutate("POST", "/api/service/stop", {});
         clearInterval(state.autoRefreshTimer);
         state.autoRefreshTimer = null;
         syncAutoRefreshUI(false);
+        state.serviceStopped = true;
         const badge = $("svc-state-badge");
-        badge.textContent = "已停止";
+        badge.textContent = t("storage.stateStopped");
         badge.className = "badge badge-warn";
-        openInfoModal(
-          "服务已停止",
-          "本地看板服务已停止，当前页面已断开连接。",
-          "如需再次查看，请运行 agent-bridge dashboard start 或从系统托盘点击「启动服务」。"
-        );
+        openInfoModal({
+          titleKey: "dialogs.stoppedTitle",
+          messageKey: "dialogs.stoppedMessage",
+          detailKey: "dialogs.stoppedDetail",
+        });
       } catch (err) {
-        showToast(`停止失败：${err.message}`, true);
+        showToast(t("toast.stopFailed", { error: trBackend(err.message) }), true);
       }
     });
 
@@ -1865,10 +2075,10 @@
         };
         const res = await apiMutate("PUT", "/api/storage", payload);
         state.storage = res.storage;
-        renderStorage();
-        showToast("已保存磁盘留存策略");
+        renderStorage({ preserveInputs: false });
+        showToast(t("toast.policySaved"));
       } catch (err) {
-        showToast(`保存失败：${err.message}`, true);
+        showToast(t("toast.saveFailed", { error: trBackend(err.message) }), true);
       }
     });
 
@@ -1876,16 +2086,16 @@
       try {
         const res = await apiMutate("POST", "/api/storage/prune", {});
         state.storage = res.storage;
-        renderStorage();
+        renderStorage({ preserveInputs: false });
         const r = res.result;
         if (r.changed) {
-          showToast(`已清理：超期 ${r.removed_by_age} 条，超体积 ${r.removed_by_size} 条，释放 ${fmtBytes(r.removed_bytes)}`);
+          showToast(t("toast.prunedResult", { age: r.removed_by_age, size: r.removed_by_size, bytes: fmtBytes(r.removed_bytes) }));
         } else {
-          showToast("当前账本未超限，无需裁剪");
+          showToast(t("toast.prunedNone"));
         }
         await refreshAll(false);
       } catch (err) {
-        showToast(`清理失败：${err.message}`, true);
+        showToast(t("toast.pruneFailed", { error: trBackend(err.message) }), true);
       }
     });
 
@@ -1893,12 +2103,12 @@
       try {
         const res = await apiMutate("POST", "/api/storage/backfill", {});
         state.storage = res.storage;
-        renderStorage();
+        renderStorage({ preserveInputs: false });
         const r = res.result;
-        showToast(`回填完成：扫描 ${r.scanned} 条，新增 ${r.imported} 条，跳过已有 ${r.skipped_existing} 条`);
+        showToast(t("toast.backfillResult", { scanned: r.scanned, imported: r.imported, skipped: r.skipped_existing }));
         await refreshAll(false);
       } catch (err) {
-        showToast(`回填失败：${err.message}`, true);
+        showToast(t("toast.backfillFailed", { error: trBackend(err.message) }), true);
       }
     });
 
@@ -1918,18 +2128,23 @@
       ev.preventDefault();
       const word = $("clear-confirm-input").value.trim();
       if (word !== "CLEAR") {
-        showToast("请输入大写 CLEAR 以确认清空", true);
+        showToast(t("toast.enterClearConfirm"), true);
         return;
       }
       try {
         const res = await apiMutate("POST", "/api/storage/clear", { confirm: "CLEAR" });
         state.storage = res.storage;
         closeClearModal();
-        renderStorage();
+        renderStorage({ preserveInputs: false });
         await refreshAll(false);
-        showToast(`已清空账本（移除 ${fmtInt(res.result.cleared_records)} 条，释放 ${fmtBytes(res.result.cleared_bytes)}）`);
+        showToast(
+          t("toast.clearedResult", {
+            records: fmtInt(res.result.cleared_records),
+            bytes: fmtBytes(res.result.cleared_bytes),
+          })
+        );
       } catch (err) {
-        showToast(`清空失败：${err.message}`, true);
+        showToast(t("toast.clearFailed", { error: trBackend(err.message) }), true);
       }
     });
 
@@ -1948,17 +2163,23 @@
   initTheme();
   wireEvents();
   syncAutoRefreshUI(true);
-  updateDiscountPreview();
-  refreshAll(true)
-    .then(() =>
-      apiGet("/api/version")
-        .then((v) => {
-          state.lastRevision = v.revision;
-        })
-        .catch(() => {})
-    )
-    .catch((err) => showToast(`初始化加载失败：${err.message}`, true))
-    .finally(() => {
+  (async () => {
+    if (I18N) {
+      await I18N.init(INITIAL_LOCALE);
+    } else {
+      document.documentElement.setAttribute("data-i18n-ready", "1");
+    }
+    updateDiscountPreview();
+    try {
+      await refreshAll(true);
+      const v = await apiGet("/api/version").catch(() => null);
+      if (v && v.revision) {
+        state.lastRevision = v.revision;
+      }
+    } catch (err) {
+      showToast(t("toast.initFailed", { error: trBackend(err.message) }), true);
+    } finally {
       startAutoRefresh();
-    });
+    }
+  })();
 })();

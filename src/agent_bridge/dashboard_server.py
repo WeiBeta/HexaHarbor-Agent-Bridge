@@ -55,6 +55,13 @@ from agent_bridge.billing_store import (
     storage_stats,
 )
 from agent_bridge.config import load_config
+from agent_bridge.dashboard_i18n import (
+    SUPPORTED_LOCALES,
+    load_dashboard_locale,
+    load_dashboard_preferences,
+    normalize_locale,
+    save_dashboard_preferences,
+)
 from agent_bridge.dashboard_service import (
     DASHBOARD_LAUNCH_ID_ENV,
     LOOPBACK_HOSTS,
@@ -92,6 +99,9 @@ MAX_REQUEST_BODY_BYTES = 1024 * 1024  # 1 MiB
 _STATIC_ALLOWLIST = {
     "app.css": "text/css; charset=utf-8",
     "app.js": "application/javascript; charset=utf-8",
+    "i18n.js": "application/javascript; charset=utf-8",
+    "locales/zh-CN.json": "application/json; charset=utf-8",
+    "locales/en.json": "application/json; charset=utf-8",
 }
 
 
@@ -282,6 +292,7 @@ def _meta_payload(home: Path) -> dict[str, Any]:
 
     return {
         "version": package_version(),
+        "locale": load_dashboard_locale(home),
         "currency": "USD",
         "default_agents": ["antigravity"] if "antigravity" in all_agents else (all_agents[:1] if all_agents else []),
         "agents": [
@@ -417,7 +428,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         try:
             if path in {"/", "/index.html"}:
                 index_file = dashboard_assets_dir() / "index.html"
-                html = index_file.read_text(encoding="utf-8").replace("__AB_CSRF_TOKEN__", self.server.csrf_token)
+                locale = load_dashboard_locale(self.server.home)
+                html = (
+                    index_file.read_text(encoding="utf-8")
+                    .replace("__AB_CSRF_TOKEN__", self.server.csrf_token)
+                    .replace("__AB_LOCALE__", locale)
+                )
                 self._send_bytes(html.encode("utf-8"), "text/html; charset=utf-8")
                 return
 
@@ -451,7 +467,24 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 return
 
             if path == "/api/version":
-                self._send_json({"ok": True, **self.server.data_revision()})
+                self._send_json(
+                    {
+                        "ok": True,
+                        **self.server.data_revision(),
+                        "locale": load_dashboard_locale(self.server.home),
+                    }
+                )
+                return
+
+            if path == "/api/preferences":
+                prefs = load_dashboard_preferences(self.server.home)
+                self._send_json(
+                    {
+                        "ok": True,
+                        "preferences": prefs.model_dump(mode="json"),
+                        "supported_locales": list(SUPPORTED_LOCALES),
+                    }
+                )
                 return
 
             if path == "/api/service":
@@ -529,6 +562,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/service":
                 self._handle_put_service(body)
+                return
+            if path == "/api/preferences":
+                self._handle_put_preferences(body)
                 return
             self._send_json({"ok": False, "error": f"not found: {path}"}, status=HTTPStatus.NOT_FOUND)
         except (ValidationError, ValueError) as exc:
@@ -779,6 +815,20 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         )
         save_storage_policy(updated, home=self.server.home)
         self._send_json({"ok": True, "storage": storage_stats(self.server.home)})
+
+    def _handle_put_preferences(self, body: dict[str, Any]) -> None:
+        if "locale" in body:
+            locale = normalize_locale(body["locale"], strict=True)
+            updated = save_dashboard_preferences(home=self.server.home, locale=locale)
+        else:
+            updated = save_dashboard_preferences(home=self.server.home)
+        self._send_json(
+            {
+                "ok": True,
+                "preferences": updated.model_dump(mode="json"),
+                "supported_locales": list(SUPPORTED_LOCALES),
+            }
+        )
 
     def _handle_put_service(self, body: dict[str, Any]) -> None:
         current = load_service_config(self.server.home)
