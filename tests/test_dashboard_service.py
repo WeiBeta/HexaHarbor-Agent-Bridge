@@ -165,6 +165,9 @@ def test_first_use_reload_preserves_defaults_and_explicit_false(tmp_path: Path, 
 def test_saved_switch_combinations_round_trip_without_upgrade(tmp_path: Path, monkeypatch, auto_start, tray_enabled):
     fake_reg = _FakeRegistry()
     monkeypatch.setattr(dashboard_service, "os", _OsNameProxy("nt"))
+    monkeypatch.setattr(dashboard_server, "os", _OsNameProxy("nt"))
+    # The handler also reads registry state when composing its status response.
+    monkeypatch.setattr(dashboard_service, "_WinRegBackend", lambda: fake_reg)
     save_service_config(ServiceConfig(auto_start=auto_start, tray_enabled=tray_enabled), tmp_path)
     if auto_start:
         set_autostart(True, tmp_path, platform_is_windows=True, registry=fake_reg)
@@ -183,12 +186,14 @@ def test_saved_switch_combinations_round_trip_without_upgrade(tmp_path: Path, mo
     monkeypatch.setattr(dashboard_server, "set_autostart", lambda enabled, home=None, **kw: seen.append(enabled))
     monkeypatch.setattr(dashboard_server, "start_tray", lambda *a, **kw: {"message": "tray"})
     monkeypatch.setattr(dashboard_server, "stop_tray", lambda *a, **kw: {"message": "stop"})
+    responses = []
     handler = types.SimpleNamespace(
         server=types.SimpleNamespace(home=tmp_path, bound_host="127.0.0.1", bound_port=8765, started_monotonic=1),
-        _send_json=lambda value: None,
+        _send_json=responses.append,
     )
     dashboard_server.DashboardRequestHandler._handle_put_service(handler, {"tray_enabled": not other})
     assert seen == []
+    assert responses[0]["service"]["autostart"]["enabled"] is auto_start
     assert load_service_config(tmp_path).auto_start is auto_start
 
 
