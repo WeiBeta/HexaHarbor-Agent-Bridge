@@ -639,11 +639,135 @@
     renderAgentsTable();
   }
 
-  function renderBarChart() {
-    const daily = state.summary?.daily || [];
-    const stage = $("chart-stage");
-    const legend = $("chart-legend");
-    const metric = state.chartMetric;
+  function parseIsoDateUtc(isoDate) {
+    if (typeof isoDate !== "string") return null;
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate.trim());
+    if (!m) return null;
+    const year = Number(m[1]);
+    const month = Number(m[2]);
+    const day = Number(m[3]);
+    const dt = new Date(Date.UTC(year, month - 1, day));
+    if (dt.getUTCFullYear() !== year || dt.getUTCMonth() !== month - 1 || dt.getUTCDate() !== day) {
+      return null;
+    }
+    return dt;
+  }
+
+  function formatIsoDateUtc(dt) {
+    const year = String(dt.getUTCFullYear()).padStart(4, "0");
+    const month = String(dt.getUTCMonth() + 1).padStart(2, "0");
+    const day = String(dt.getUTCDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
+
+  function enumerateIsoDates(startIso, endIso) {
+    const start = parseIsoDateUtc(startIso);
+    const end = parseIsoDateUtc(endIso);
+    if (!start || !end || start.getTime() > end.getTime()) return null;
+    const spanDays = Math.round((end.getTime() - start.getTime()) / 86400000) + 1;
+    if (spanDays < 1 || spanDays > 400) return null;
+    const dates = [];
+    const cursor = new Date(start.getTime());
+    for (let i = 0; i < spanDays; i += 1) {
+      dates.push(formatIsoDateUtc(cursor));
+      cursor.setUTCDate(cursor.getUTCDate() + 1);
+    }
+    return dates;
+  }
+
+  function buildDailyChartSlots(summary) {
+    const rawDaily = Array.isArray(summary?.daily) ? summary.daily : [];
+    const axis = summary?.daily_axis;
+    const axisDates = axis ? enumerateIsoDates(axis.start_date, axis.end_date) : null;
+    if (!axisDates) {
+      const slots = rawDaily.map((d) => ({
+        ...d,
+        empty: !(d.tasks > 0),
+        usageUnknown: d.tasks > 0 && !(d.measured_tasks > 0),
+      }));
+      return {
+        isFiniteAxis: false,
+        hasAnyTasks: slots.some((d) => !d.empty),
+        slots,
+      };
+    }
+
+    const byDate = new Map();
+    for (const point of rawDaily) {
+      if (point && typeof point.date === "string") {
+        byDate.set(point.date, point);
+      }
+    }
+
+    const slots = axisDates.map((dateStr) => {
+      const existing = byDate.get(dateStr);
+      if (existing && existing.tasks > 0) {
+        return {
+          ...existing,
+          empty: false,
+          usageUnknown: !(existing.measured_tasks > 0),
+        };
+      }
+      return {
+        date: dateStr,
+        tasks: 0,
+        measured_tasks: 0,
+        uncached_input_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        list_cost_usd: 0,
+        effective_cost_usd: 0,
+        priced_tasks: 0,
+        unpriced_tasks: 0,
+        cache_hit_rate: null,
+        empty: true,
+        usageUnknown: false,
+      };
+    });
+
+    return {
+      isFiniteAxis: true,
+      hasAnyTasks: slots.some((d) => !d.empty),
+      slots,
+    };
+  }
+
+  function buildDailyTooltipHtml(d) {
+    if (d.empty) {
+      return `
+        <div class="tip-date">${esc(d.date)}</div>
+        <div class="tip-row"><span class="tip-k">${esc(t("stats.chartNoMatchingTasks"))}</span></div>`;
+    }
+    if (d.usageUnknown) {
+      return `
+        <div class="tip-date">${esc(d.date)}</div>
+        <div class="tip-row"><span class="tip-k">${esc(t("stats.tipTasks"))}</span><span class="tip-v">${esc(t("stats.tipTasksValue", { tasks: fmtInt(d.tasks), measured: fmtInt(d.measured_tasks) }))}</span></div>
+        <div class="tip-row"><span class="tip-k">${esc(t("stats.tipUsageStatus"))}</span><span class="tip-v">${esc(t("stats.tipUsageUnknown"))}</span></div>
+        <div class="tip-row"><span class="tip-k">${esc(t("stats.tipTotalTokens"))}</span><span class="tip-v"><b>—</b></span></div>
+        <div class="tip-row"><span class="tip-k">${esc(t("stats.tipCost"))}</span><span class="tip-v"><b>${d.priced_tasks > 0 ? fmtUsd(d.effective_cost_usd) : esc(t("common.unpriced"))}</b></span></div>`;
+    }
+    const hitDenom = (d.uncached_input_tokens || 0) + (d.cache_read_tokens || 0);
+    const hitRatio =
+      d.cache_hit_rate !== undefined && d.cache_hit_rate !== null
+        ? d.cache_hit_rate
+        : hitDenom > 0 && d.cache_read_tokens > 0
+          ? d.cache_read_tokens / hitDenom
+          : null;
+    return `
+      <div class="tip-date">${esc(d.date)}</div>
+      <div class="tip-row"><span class="tip-k">${esc(t("stats.tipTasks"))}</span><span class="tip-v">${esc(t("stats.tipTasksValue", { tasks: fmtInt(d.tasks), measured: fmtInt(d.measured_tasks) }))}</span></div>
+      <div class="tip-row"><span class="tip-k">${esc(t("stats.tipTotalTokens"))}</span><span class="tip-v"><b>${fmtInt(d.total_tokens)}</b></span></div>
+      <div class="tip-row"><span class="tip-k">${esc(t("stats.tipNetInput"))}</span><span class="tip-v">${fmtInt(d.uncached_input_tokens)}</span></div>
+      <div class="tip-row"><span class="tip-k">${esc(t("stats.tipCacheRead"))}</span><span class="tip-v">${fmtInt(d.cache_read_tokens)}</span></div>
+      <div class="tip-row"><span class="tip-k">${esc(t("stats.tipHitRate"))}</span><span class="tip-v">${fmtPct4(hitRatio)}</span></div>
+      <div class="tip-row"><span class="tip-k">${esc(t("stats.tipOutput"))}</span><span class="tip-v">${fmtInt(d.output_tokens)}</span></div>
+      <div class="tip-row"><span class="tip-k">${esc(t("stats.tipCost"))}</span><span class="tip-v"><b>${d.priced_tasks > 0 ? fmtUsd(d.effective_cost_usd) : esc(t("common.unpriced"))}</b></span></div>`;
+  }
+
+  function renderDailyBarChart({ summary, metric, stage, legend, tooltip, onSelectDate }) {
+    if (tooltip) tooltip.classList.add("hidden");
 
     if (metric === "tokens") {
       legend.innerHTML = `
@@ -656,99 +780,141 @@
       legend.innerHTML = `<span class="legend-item"><span class="legend-dot" style="background:var(--bar-tasks)"></span>${esc(t("stats.legendTasks"))}</span>`;
     }
 
-    if (!daily.length) {
+    const { isFiniteAxis, hasAnyTasks, slots } = buildDailyChartSlots(summary);
+
+    if (!slots.length) {
       stage.innerHTML = `<div class="chart-empty">${esc(t("stats.chartEmpty"))}</div>`;
-      return;
+      return { isFiniteAxis, hasAnyTasks, slots };
     }
 
-    const values = daily.map((d) =>
-      metric === "tokens" ? d.total_tokens : metric === "cost" ? d.effective_cost_usd : d.tasks
+    const values = slots.map((d) =>
+      d.empty ? 0 : metric === "tokens" ? d.total_tokens : metric === "cost" ? d.effective_cost_usd : d.tasks
     );
     const maxVal = Math.max(...values, 0);
     const safeMax = maxVal > 0 ? maxVal : 1;
     const fmtAxis = (v) => (metric === "cost" ? fmtUsd(v) : metric === "tasks" ? String(Math.round(v)) : fmtCompact(v));
 
     const gridLines = [1, 0.75, 0.5, 0.25, 0]
-      .map(
-        (ratio) => `<div class="chart-grid-line"><span class="chart-grid-label">${esc(fmtAxis(safeMax * ratio))}</span></div>`
-      )
+      .map((ratio) => {
+        const label = maxVal > 0 || ratio === 0 ? fmtAxis(safeMax * ratio) : "";
+        return `<div class="chart-grid-line"><span class="chart-grid-label">${esc(label)}</span></div>`;
+      })
       .join("");
 
-    const labelStep = Math.max(1, Math.ceil(daily.length / 10));
-    const barsHtml = daily
+    const labelStep = slots.length <= 10 ? 1 : Math.max(2, Math.ceil(slots.length / 8));
+    const minTailGap = Math.ceil(labelStep / 2);
+    const barsHtml = slots
       .map((d, idx) => {
         const val = values[idx];
-        const totalPct = maxVal > 0 ? Math.max(val > 0 ? 2 : 0, (val / safeMax) * 100) : 0;
+        const showLabel =
+          idx === 0 || idx === slots.length - 1 || (idx % labelStep === 0 && slots.length - 1 - idx >= minTailGap);
+        const dayState = d.empty ? "empty" : d.usageUnknown ? "unmeasured" : "active";
+        const unknownMetric =
+          !d.empty &&
+          ((metric === "tokens" && d.usageUnknown) || (metric === "cost" && !(d.priced_tasks > 0)));
+
+        let stackClass = "bar-stack";
+        let stackStyle = "";
         let inner = "";
-        if (metric === "tokens") {
-          const denom = d.uncached_input_tokens + d.cache_read_tokens + d.output_tokens;
-          if (denom > 0) {
-            const pCache = (d.cache_read_tokens / denom) * 100;
-            const pIn = (d.uncached_input_tokens / denom) * 100;
-            const pOut = Math.max(0, 100 - pCache - pIn);
-            inner = `
-              <div class="bar-seg-cache" style="height:${pCache.toFixed(2)}%"></div>
-              <div class="bar-seg-in" style="height:${pIn.toFixed(2)}%"></div>
-              <div class="bar-seg-out" style="height:${pOut.toFixed(2)}%"></div>`;
-          } else {
-            inner = `<div class="bar-seg-in" style="height:100%"></div>`;
-          }
-        } else if (metric === "cost") {
-          inner = `<div class="bar-seg-cost" style="height:100%"></div>`;
+        if (d.empty) {
+          stackClass = "bar-stack bar-stack-empty";
+          stackStyle = "height:0;min-height:0";
+        } else if (unknownMetric) {
+          stackClass = "bar-stack bar-stack-unmeasured";
+          stackStyle = "height:4px;min-height:4px;background:transparent;border:1px dashed var(--fg-subtle);border-bottom:none";
         } else {
-          inner = `<div class="bar-seg-tasks" style="height:100%"></div>`;
+          const totalPct = maxVal > 0 ? Math.max(val > 0 ? 2 : 0, (val / safeMax) * 100) : 0;
+          stackStyle = val > 0 ? `height:${totalPct.toFixed(2)}%` : "height:2px;min-height:2px";
+          if (metric === "tokens") {
+            const denom = d.uncached_input_tokens + d.cache_read_tokens + d.output_tokens;
+            if (denom > 0) {
+              const pCache = (d.cache_read_tokens / denom) * 100;
+              const pIn = (d.uncached_input_tokens / denom) * 100;
+              const pOut = Math.max(0, 100 - pCache - pIn);
+              inner = `
+                <div class="bar-seg-cache" style="height:${pCache.toFixed(2)}%"></div>
+                <div class="bar-seg-in" style="height:${pIn.toFixed(2)}%"></div>
+                <div class="bar-seg-out" style="height:${pOut.toFixed(2)}%"></div>`;
+            } else {
+              inner = `<div class="bar-seg-in" style="height:100%"></div>`;
+            }
+          } else if (metric === "cost") {
+            inner = `<div class="bar-seg-cost" style="height:100%"></div>`;
+          } else {
+            inner = `<div class="bar-seg-tasks" style="height:100%"></div>`;
+          }
         }
-        const showLabel = idx % labelStep === 0 || idx === daily.length - 1;
-        return `<button type="button" class="bar-col" data-idx="${idx}" data-date="${esc(d.date)}" aria-label="${esc(t("stats.chartBarAria", { date: d.date }))}">
-          <div class="bar-stack" style="height:${totalPct.toFixed(2)}%">${inner}</div>
+
+        const ariaLabel = d.empty
+          ? t("stats.chartBarEmptyAria", { date: d.date })
+          : d.usageUnknown
+            ? t("stats.chartBarUnmeasuredAria", { date: d.date, tasks: fmtInt(d.tasks) })
+            : t("stats.chartBarAria", { date: d.date });
+        const btnClass = d.empty
+          ? "bar-col bar-col-empty"
+          : d.usageUnknown
+            ? "bar-col bar-col-unmeasured"
+            : "bar-col";
+        const extraAttrs = d.empty ? ' aria-disabled="true" style="cursor:default"' : "";
+
+        return `<button type="button" class="${btnClass}" data-idx="${idx}" data-date="${esc(d.date)}" data-day-state="${dayState}" data-empty="${d.empty ? "1" : "0"}" data-usage-unknown="${d.usageUnknown ? "1" : "0"}" aria-label="${esc(ariaLabel)}"${extraAttrs}>
+          <div class="${stackClass}" style="${stackStyle}">${inner}</div>
           ${showLabel ? `<span class="bar-date">${esc(d.date.slice(5))}</span>` : ""}
         </button>`;
       })
       .join("");
 
-    stage.innerHTML = `<div class="chart-grid">${gridLines}</div><div class="chart-bars">${barsHtml}</div>`;
+    const emptyOverlayHtml =
+      isFiniteAxis && !hasAnyTasks
+        ? `<div class="chart-empty" data-chart-empty-overlay="1" style="position:absolute;inset:14px 10px 28px 50px;height:auto;pointer-events:none;z-index:1;">${esc(t("stats.chartNoMatchingTasks"))}</div>`
+        : "";
+    const barsStyle = slots.length >= 20 ? ' style="gap:4px"' : "";
+    stage.innerHTML = `<div class="chart-grid">${gridLines}</div>${emptyOverlayHtml}<div class="chart-bars"${barsStyle}>${barsHtml}</div>`;
 
-    const tooltip = $("chart-tooltip");
     stage.querySelectorAll(".bar-col").forEach((btn) => {
       const idx = Number(btn.getAttribute("data-idx"));
-      const d = daily[idx];
+      const d = slots[idx];
+      if (!d) return;
       btn.addEventListener("pointerenter", (ev) => {
-        const hitDenom = (d.uncached_input_tokens || 0) + (d.cache_read_tokens || 0);
-        const hitRatio =
-          d.cache_hit_rate !== undefined && d.cache_hit_rate !== null
-            ? d.cache_hit_rate
-            : hitDenom > 0 && d.cache_read_tokens > 0
-              ? d.cache_read_tokens / hitDenom
-              : null;
-        tooltip.innerHTML = `
-          <div class="tip-date">${esc(d.date)}</div>
-          <div class="tip-row"><span class="tip-k">${esc(t("stats.tipTasks"))}</span><span class="tip-v">${esc(t("stats.tipTasksValue", { tasks: fmtInt(d.tasks), measured: fmtInt(d.measured_tasks) }))}</span></div>
-          <div class="tip-row"><span class="tip-k">${esc(t("stats.tipTotalTokens"))}</span><span class="tip-v"><b>${fmtInt(d.total_tokens)}</b></span></div>
-          <div class="tip-row"><span class="tip-k">${esc(t("stats.tipNetInput"))}</span><span class="tip-v">${fmtInt(d.uncached_input_tokens)}</span></div>
-          <div class="tip-row"><span class="tip-k">${esc(t("stats.tipCacheRead"))}</span><span class="tip-v">${fmtInt(d.cache_read_tokens)}</span></div>
-          <div class="tip-row"><span class="tip-k">${esc(t("stats.tipHitRate"))}</span><span class="tip-v">${fmtPct4(hitRatio)}</span></div>
-          <div class="tip-row"><span class="tip-k">${esc(t("stats.tipOutput"))}</span><span class="tip-v">${fmtInt(d.output_tokens)}</span></div>
-          <div class="tip-row"><span class="tip-k">${esc(t("stats.tipCost"))}</span><span class="tip-v"><b>${d.priced_tasks > 0 ? fmtUsd(d.effective_cost_usd) : esc(t("common.unpriced"))}</b></span></div>`;
+        if (!tooltip) return;
+        tooltip.innerHTML = buildDailyTooltipHtml(d);
         tooltip.classList.remove("hidden");
-        positionTooltip(ev);
+        positionTooltip(ev, tooltip);
       });
-      btn.addEventListener("pointermove", positionTooltip);
-      btn.addEventListener("pointerleave", () => tooltip.classList.add("hidden"));
+      btn.addEventListener("pointermove", (ev) => positionTooltip(ev, tooltip));
+      btn.addEventListener("pointerleave", () => tooltip && tooltip.classList.add("hidden"));
       btn.addEventListener("click", () => {
-        tooltip.classList.add("hidden");
-        state.recDay = d.date;
+        if (tooltip) tooltip.classList.add("hidden");
+        if (d.empty) return;
+        if (typeof onSelectDate === "function") onSelectDate(d.date);
+      });
+    });
+
+    return { isFiniteAxis, hasAnyTasks, slots };
+  }
+
+  function renderBarChart() {
+    renderDailyBarChart({
+      summary: state.summary,
+      metric: state.chartMetric,
+      stage: $("chart-stage"),
+      legend: $("chart-legend"),
+      tooltip: $("chart-tooltip"),
+      onSelectDate: (date) => {
+        state.recDay = date;
         state.recOffset = 0;
         if (state.selectedAgents.size === 1) {
           state.recAgent = Array.from(state.selectedAgents)[0];
           $("rec-agent").value = state.recAgent;
         }
         switchTab("records");
-      });
+      },
     });
   }
 
-  function positionTooltip(ev) {
-    const tooltip = $("chart-tooltip");
+  function positionTooltip(ev, tooltipEl) {
+    const tooltip = tooltipEl || $("chart-tooltip");
+    if (!tooltip) return;
     const pad = 14;
     const x = Math.min(window.innerWidth - tooltip.offsetWidth - pad, ev.clientX + pad);
     const y = Math.max(pad, ev.clientY - tooltip.offsetHeight - 10);
@@ -2159,27 +2325,36 @@
     });
   }
 
+  window.AbDashboardDailyChart = {
+    enumerateIsoDates,
+    buildDailyChartSlots,
+    buildDailyTooltipHtml,
+    renderDailyBarChart,
+  };
+
   // ==================== Boot ====================
-  initTheme();
-  wireEvents();
-  syncAutoRefreshUI(true);
-  (async () => {
-    if (I18N) {
-      await I18N.init(INITIAL_LOCALE);
-    } else {
-      document.documentElement.setAttribute("data-i18n-ready", "1");
-    }
-    updateDiscountPreview();
-    try {
-      await refreshAll(true);
-      const v = await apiGet("/api/version").catch(() => null);
-      if (v && v.revision) {
-        state.lastRevision = v.revision;
+  if (!window.__AB_DISABLE_AUTO_BOOT__) {
+    initTheme();
+    wireEvents();
+    syncAutoRefreshUI(true);
+    (async () => {
+      if (I18N) {
+        await I18N.init(INITIAL_LOCALE);
+      } else {
+        document.documentElement.setAttribute("data-i18n-ready", "1");
       }
-    } catch (err) {
-      showToast(t("toast.initFailed", { error: trBackend(err.message) }), true);
-    } finally {
-      startAutoRefresh();
-    }
-  })();
+      updateDiscountPreview();
+      try {
+        await refreshAll(true);
+        const v = await apiGet("/api/version").catch(() => null);
+        if (v && v.revision) {
+          state.lastRevision = v.revision;
+        }
+      } catch (err) {
+        showToast(t("toast.initFailed", { error: trBackend(err.message) }), true);
+      } finally {
+        startAutoRefresh();
+      }
+    })();
+  }
 })();

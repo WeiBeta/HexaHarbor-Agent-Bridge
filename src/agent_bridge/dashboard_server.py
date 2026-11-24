@@ -17,6 +17,7 @@ import threading
 import time
 import webbrowser
 from collections import Counter
+from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -103,6 +104,39 @@ _STATIC_ALLOWLIST = {
     "locales/zh-CN.json": "application/json; charset=utf-8",
     "locales/en.json": "application/json; charset=utf-8",
 }
+
+_FINITE_DAILY_AXIS_DAYS: dict[str, int] = {
+    "7d": 7,
+    "30d": 30,
+}
+
+
+def _current_local_now() -> datetime:
+    """Return the server's current local timezone-aware timestamp."""
+    return datetime.now().astimezone()
+
+
+def _finite_daily_axis(
+    range_name: str,
+    *,
+    now: datetime,
+    day_filter: str | None = None,
+) -> dict[str, Any] | None:
+    """Return inclusive local-calendar day bounds for finite daily chart ranges."""
+    if day_filter and day_filter.strip():
+        return None
+    key = (range_name or "all").strip().lower()
+    days = _FINITE_DAILY_AXIS_DAYS.get(key)
+    if days is None:
+        return None
+    end_day = now.date()
+    start_day = end_day - timedelta(days=days - 1)
+    return {
+        "range": key,
+        "start_date": start_day.isoformat(),
+        "end_date": end_day.isoformat(),
+        "days": days,
+    }
 
 
 class DashboardHTTPServer(ThreadingHTTPServer):
@@ -641,26 +675,34 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         pricing = load_pricing(self.server.home)
         agents = _parse_csv_param(query, "agents", "agents_filter")
         models = _parse_csv_param(query, "models", "models_filter")
+        now = _current_local_now()
+        range_name = _first(query, "range", "all")
+        start_iso = _first(query, "start") or None
+        end_iso = _first(query, "end") or None
+        day_filter = _first(query, "day") or None
         filtered = filter_records(
             records,
             agents=agents,
             models=models,
             cwd=_first(query, "cwd") or None,
-            range_name=_first(query, "range", "all"),
-            start_iso=_first(query, "start") or None,
-            end_iso=_first(query, "end") or None,
-            day_filter=_first(query, "day") or None,
+            range_name=range_name,
+            start_iso=start_iso,
+            end_iso=end_iso,
+            day_filter=day_filter,
+            now=now,
         )
-        summary = compute_summary(filtered, pricing)
-        self._send_json(
-            {
-                "ok": True,
-                "total_ledger_records": len(records),
-                "filtered_records": len(filtered),
-                "corrupt_lines": corrupt,
-                **summary,
-            }
-        )
+        summary = compute_summary(filtered, pricing, now=now)
+        daily_axis = _finite_daily_axis(range_name, now=now, day_filter=day_filter)
+        payload: dict[str, Any] = {
+            "ok": True,
+            "total_ledger_records": len(records),
+            "filtered_records": len(filtered),
+            "corrupt_lines": corrupt,
+            **summary,
+        }
+        if daily_axis is not None:
+            payload["daily_axis"] = daily_axis
+        self._send_json(payload)
 
     def _handle_records(self, query: dict[str, list[str]]) -> None:
         records, _ = load_ledger(self.server.home)
