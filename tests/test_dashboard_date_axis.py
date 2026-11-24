@@ -81,7 +81,7 @@ function parseButtons(stageHtml) {
   while ((m = btnRe.exec(stageHtml)) !== null) {
     const attrs = parseAttrs(m[1]);
     const inner = m[2];
-    const stackMatch = /<div\s+class="([^"]*bar-stack[^"]*)"\s+style="([^"]*)">([\s\S]*?)<\/div>/.exec(inner);
+    const stackMatch = /<div\s+class="([^"]*bar-stack[^"]*)"\s+style="([^"]*)">([\s\S]*)<\/div>/.exec(inner);
     const dateMatch = /<span\s+class="bar-date">([^<]*)<\/span>/.exec(inner);
     const listeners = {};
     buttons.push({
@@ -112,6 +112,23 @@ function parseEmptyElements(stageHtml) {
       attrs: parseAttrs(m[1]),
       text: stripTags(m[2]),
     });
+  }
+  return out;
+}
+
+function parseChartBarsStyle(stageHtml) {
+  const m = /<div\s+class="chart-bars"([^>]*)>/.exec(stageHtml);
+  if (!m) return null;
+  const attrs = parseAttrs(m[1]);
+  return attrs.style || null;
+}
+
+function parseGridLabels(stageHtml) {
+  const out = [];
+  const re = /<span\s+class="chart-grid-label">([^<]*)<\/span>/g;
+  let m;
+  while ((m = re.exec(stageHtml)) !== null) {
+    out.push(unescapeHtml(m[1]));
   }
   return out;
 }
@@ -221,6 +238,8 @@ vm.runInContext(fs.readFileSync(path.join(assetsDir, "app.js"), "utf8"), sandbox
       metric: job.metric || "tokens",
       dailyMutated: JSON.stringify(summaryCopy.daily || []) !== originalDailySnapshot,
       legendText: stripTags(legend.innerHTML),
+      chartBarsStyle: parseChartBarsStyle(stage.innerHTML),
+      gridLabels: parseGridLabels(stage.innerHTML),
       emptyElements: parseEmptyElements(stage.innerHTML),
       bars: parsedButtons.map((b) => ({
         date: b.attrs["data-date"],
@@ -875,3 +894,156 @@ def test_finite_axis_aligns_to_server_moment_and_timezone_not_client_tz(tmp_path
         "2026-11-24",
     ]
     assert rendered_tokyo["bars"][-1]["empty"] == "0"
+
+
+def test_all_range_30_measured_days_matches_v013_labels_and_bars(tmp_path: Path, monkeypatch):
+    """Long-sequence comparison for non-axis 'all' range (10/01..10/30, 1 measured task/day).
+
+    v0.1.3 (69196f5) computes labelStep = max(1, ceil(30 / 10)) = 3 and displays a label
+    when idx % labelStep === 0 || idx === daily.length - 1, yielding 11 labels
+    (10-01, 10-04, 10-07, 10-10, 10-13, 10-16, 10-19, 10-22, 10-25, 10-28, 10-30).
+    The first-round candidate (c2bb4db) wrongly applied the finite-axis thinning rule here
+    and emitted only 8 labels; non-axis summaries must match v0.1.3 labels and bar drawing.
+    """
+    fixed_now = datetime(2026, 11, 24, 16, 30, 0, tzinfo=timezone(timedelta(hours=8)))
+    monkeypatch.setattr(dashboard_server, "_current_local_now", lambda: fixed_now)
+
+    _seed_pricing(tmp_path)
+    for day in range(1, 31):
+        _append_task(
+            tmp_path,
+            task_id=f"t_oct_{day:02d}",
+            started_at=f"2026-10-{day:02d}T12:00:00+08:00",
+            input_tokens=day * 10_000,
+            output_tokens=day * 5_000,
+        )
+
+    server, thread = _start_server(tmp_path)
+    try:
+        status, summary = _json_get(server.bound_port, "/api/summary?range=all")
+    finally:
+        _stop_server(server, thread)
+
+    assert status == 200 and summary["ok"] is True
+    assert "daily_axis" not in summary
+    expected_dates = [f"2026-10-{day:02d}" for day in range(1, 31)]
+    assert [d["date"] for d in summary["daily"]] == expected_dates
+    assert summary["overview"]["tasks"] == 30
+    assert summary["overview"]["measured_tasks"] == 30
+
+    rendered = _run_chart_jobs(
+        [
+            {
+                "id": "zh",
+                "locale": "zh-CN",
+                "metric": "tokens",
+                "summary": summary,
+                "inspectDates": ["2026-10-01", "2026-10-28", "2026-10-30"],
+                "clickDates": ["2026-10-01", "2026-10-30"],
+            },
+            {
+                "id": "en",
+                "locale": "en",
+                "metric": "tokens",
+                "summary": summary,
+                "inspectDates": ["2026-10-01", "2026-10-28", "2026-10-30"],
+                "clickDates": ["2026-10-01", "2026-10-30"],
+            },
+        ]
+    )
+
+    expected_labels = [
+        "10-01",
+        "10-04",
+        "10-07",
+        "10-10",
+        "10-13",
+        "10-16",
+        "10-19",
+        "10-22",
+        "10-25",
+        "10-28",
+        "10-30",
+    ]
+    expected_label_indices = [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 29]
+
+    for loc, first_aria, last_aria in (
+        ("zh", "2026-10-01\uff0c点击查看当日明细", "2026-10-30\uff0c点击查看当日明细"),
+        ("en", "2026-10-01, view daily records", "2026-10-30, view daily records"),
+    ):
+        res = rendered[loc]
+        assert res["dailyMutated"] is False
+        assert res["emptyElements"] == []
+        # v0.1.3 did not inject inline gap:4px on .chart-bars for non-axis ranges.
+        assert res["chartBarsStyle"] is None
+        assert len(res["bars"]) == 30
+        assert [b["date"] for b in res["bars"]] == expected_dates
+
+        visible_labels = [b["dateLabel"] for b in res["bars"] if b["dateLabel"] is not None]
+        # Must be exactly 11 labels matching v0.1.3 (not the 8 labels from the first-round candidate).
+        assert len(visible_labels) == 11
+        assert len(visible_labels) != 8
+        assert visible_labels == expected_labels
+        assert [idx for idx, b in enumerate(res["bars"]) if b["dateLabel"] is not None] == expected_label_indices
+
+        assert all(b["stackClass"] == "bar-stack" for b in res["bars"])
+        assert all(b["dayState"] == "active" and b["empty"] == "0" and b["usageUnknown"] == "0" for b in res["bars"])
+        assert all(b["ariaDisabled"] is None for b in res["bars"])
+        # 15,000 / 450,000 = 3.33%, 450,000 / 450,000 = 100.00%
+        assert res["bars"][0]["stackStyle"] == "height:3.33%"
+        assert res["bars"][-1]["stackStyle"] == "height:100.00%"
+        assert "bar-seg-in" in res["bars"][0]["stackInner"]
+        assert "bar-seg-out" in res["bars"][0]["stackInner"]
+        assert res["bars"][0]["ariaLabel"] == first_aria
+        assert res["bars"][-1]["ariaLabel"] == last_aria
+        assert "15,000" in res["tooltipsByDate"]["2026-10-01"]["text"]
+        assert "450,000" in res["tooltipsByDate"]["2026-10-30"]["text"]
+        assert res["clickedDates"] == ["2026-10-01", "2026-10-30"]
+
+
+def test_non_finite_unmeasured_day_keeps_v013_bar_grid_and_tooltip(tmp_path: Path, monkeypatch):
+    """Non-axis ranges must preserve v0.1.3 bar styling, grid labels, and tooltips even on unmeasured/zero days."""
+    fixed_now = datetime(2026, 11, 24, 16, 30, 0, tzinfo=timezone(timedelta(hours=8)))
+    monkeypatch.setattr(dashboard_server, "_current_local_now", lambda: fixed_now)
+
+    _append_task(tmp_path, task_id="t_all_unk", started_at="2026-11-22T11:00:00+08:00")
+    server, thread = _start_server(tmp_path)
+    try:
+        status, summary = _json_get(server.bound_port, "/api/summary?range=all")
+    finally:
+        _stop_server(server, thread)
+
+    assert status == 200 and summary["ok"] is True
+    assert "daily_axis" not in summary
+    assert [d["date"] for d in summary["daily"]] == ["2026-11-22"]
+
+    rendered = _run_chart_jobs(
+        [
+            {"id": "zh_tokens", "locale": "zh-CN", "metric": "tokens", "summary": summary},
+            {"id": "en_tokens", "locale": "en", "metric": "tokens", "summary": summary},
+            {"id": "en_cost", "locale": "en", "metric": "cost", "summary": summary},
+        ]
+    )
+
+    for job_id, expected_aria, unk_marker in (
+        ("zh_tokens", "2026-11-22\uff0c点击查看当日明细", "用量未知"),
+        ("en_tokens", "2026-11-22, view daily records", "Usage unknown"),
+    ):
+        res = rendered[job_id]
+        assert len(res["bars"]) == 1
+        bar = res["bars"][0]
+        # v0.1.3 rendered height:0.00% with standard bar-stack & bar-seg-in (no dashed 4px unmeasured stub).
+        assert bar["stackClass"] == "bar-stack"
+        assert bar["stackStyle"] == "height:0.00%"
+        assert 'class="bar-seg-in"' in bar["stackInner"]
+        assert bar["ariaLabel"] == expected_aria
+        assert res["gridLabels"] == ["1", "1", "1", "0", "0"]
+        tip_text = res["tooltipsByDate"]["2026-11-22"]["text"]
+        assert "2026-11-22" in tip_text
+        assert unk_marker not in tip_text
+
+    cost_bar = rendered["en_cost"]["bars"][0]
+    assert cost_bar["stackClass"] == "bar-stack"
+    assert cost_bar["stackStyle"] == "height:0.00%"
+    assert 'class="bar-seg-cost"' in cost_bar["stackInner"]
+

@@ -682,12 +682,12 @@
     if (!axisDates) {
       const slots = rawDaily.map((d) => ({
         ...d,
-        empty: !(d.tasks > 0),
-        usageUnknown: d.tasks > 0 && !(d.measured_tasks > 0),
+        empty: false,
+        usageUnknown: false,
       }));
       return {
         isFiniteAxis: false,
-        hasAnyTasks: slots.some((d) => !d.empty),
+        hasAnyTasks: slots.length > 0,
         slots,
       };
     }
@@ -734,13 +734,93 @@
     };
   }
 
-  function buildDailyTooltipHtml(d) {
-    if (d.empty) {
+  function shouldShowDailyLabel(idx, total, isFiniteAxis) {
+    if (total <= 0 || idx < 0 || idx >= total) return false;
+    if (!isFiniteAxis) {
+      // Preserve v0.1.3 label selection for non-axis ranges ("all", "today", "custom").
+      const labelStep = Math.max(1, Math.ceil(total / 10));
+      return idx % labelStep === 0 || idx === total - 1;
+    }
+    const labelStep = total <= 10 ? 1 : Math.max(2, Math.ceil(total / 8));
+    const minTailGap = Math.ceil(labelStep / 2);
+    return idx === 0 || idx === total - 1 || (idx % labelStep === 0 && total - 1 - idx >= minTailGap);
+  }
+
+  function renderDailyBarInner(d, metric) {
+    if (metric === "tokens") {
+      const denom = d.uncached_input_tokens + d.cache_read_tokens + d.output_tokens;
+      if (denom > 0) {
+        const pCache = (d.cache_read_tokens / denom) * 100;
+        const pIn = (d.uncached_input_tokens / denom) * 100;
+        const pOut = Math.max(0, 100 - pCache - pIn);
+        return `
+          <div class="bar-seg-cache" style="height:${pCache.toFixed(2)}%"></div>
+          <div class="bar-seg-in" style="height:${pIn.toFixed(2)}%"></div>
+          <div class="bar-seg-out" style="height:${pOut.toFixed(2)}%"></div>`;
+      }
+      return `<div class="bar-seg-in" style="height:100%"></div>`;
+    }
+    if (metric === "cost") {
+      return `<div class="bar-seg-cost" style="height:100%"></div>`;
+    }
+    return `<div class="bar-seg-tasks" style="height:100%"></div>`;
+  }
+
+  function renderDailyBarColumn({ d, idx, total, val, maxVal, safeMax, metric, isFiniteAxis }) {
+    const showLabel = shouldShowDailyLabel(idx, total, isFiniteAxis);
+    const totalPct = maxVal > 0 ? Math.max(val > 0 ? 2 : 0, (val / safeMax) * 100) : 0;
+
+    let dayState = "active";
+    let stackClass = "bar-stack";
+    let stackStyle = `height:${totalPct.toFixed(2)}%`;
+    let inner = "";
+    let ariaLabel = t("stats.chartBarAria", { date: d.date });
+    let btnClass = "bar-col";
+    let extraAttrs = "";
+
+    if (!isFiniteAxis) {
+      inner = renderDailyBarInner(d, metric);
+    } else {
+      dayState = d.empty ? "empty" : d.usageUnknown ? "unmeasured" : "active";
+      const unknownMetric =
+        !d.empty &&
+        ((metric === "tokens" && d.usageUnknown) || (metric === "cost" && !(d.priced_tasks > 0)));
+      if (d.empty) {
+        stackClass = "bar-stack bar-stack-empty";
+        stackStyle = "height:0;min-height:0";
+      } else if (unknownMetric) {
+        stackClass = "bar-stack bar-stack-unmeasured";
+        stackStyle = "height:4px;min-height:4px;background:transparent;border:1px dashed var(--fg-subtle);border-bottom:none";
+      } else {
+        stackStyle = val > 0 ? `height:${totalPct.toFixed(2)}%` : "height:2px;min-height:2px";
+        inner = renderDailyBarInner(d, metric);
+      }
+
+      if (d.empty) {
+        ariaLabel = t("stats.chartBarEmptyAria", { date: d.date });
+        btnClass = "bar-col bar-col-empty";
+        extraAttrs = ' aria-disabled="true" style="cursor:default"';
+      } else if (d.usageUnknown) {
+        ariaLabel = t("stats.chartBarUnmeasuredAria", { date: d.date, tasks: fmtInt(d.tasks) });
+        btnClass = "bar-col bar-col-unmeasured";
+      }
+    }
+
+    const isEmpty = isFiniteAxis && d.empty;
+    const isUsageUnknown = isFiniteAxis && d.usageUnknown;
+    return `<button type="button" class="${btnClass}" data-idx="${idx}" data-date="${esc(d.date)}" data-day-state="${dayState}" data-empty="${isEmpty ? "1" : "0"}" data-usage-unknown="${isUsageUnknown ? "1" : "0"}" aria-label="${esc(ariaLabel)}"${extraAttrs}>
+      <div class="${stackClass}" style="${stackStyle}">${inner}</div>
+      ${showLabel ? `<span class="bar-date">${esc(d.date.slice(5))}</span>` : ""}
+    </button>`;
+  }
+
+  function buildDailyTooltipHtml(d, isFiniteAxis = true) {
+    if (isFiniteAxis && d.empty) {
       return `
         <div class="tip-date">${esc(d.date)}</div>
         <div class="tip-row"><span class="tip-k">${esc(t("stats.chartNoMatchingTasks"))}</span></div>`;
     }
-    if (d.usageUnknown) {
+    if (isFiniteAxis && d.usageUnknown) {
       return `
         <div class="tip-date">${esc(d.date)}</div>
         <div class="tip-row"><span class="tip-k">${esc(t("stats.tipTasks"))}</span><span class="tip-v">${esc(t("stats.tipTasksValue", { tasks: fmtInt(d.tasks), measured: fmtInt(d.measured_tasks) }))}</span></div>
@@ -788,7 +868,7 @@
     }
 
     const values = slots.map((d) =>
-      d.empty ? 0 : metric === "tokens" ? d.total_tokens : metric === "cost" ? d.effective_cost_usd : d.tasks
+      isFiniteAxis && d.empty ? 0 : metric === "tokens" ? d.total_tokens : metric === "cost" ? d.effective_cost_usd : d.tasks
     );
     const maxVal = Math.max(...values, 0);
     const safeMax = maxVal > 0 ? maxVal : 1;
@@ -796,79 +876,31 @@
 
     const gridLines = [1, 0.75, 0.5, 0.25, 0]
       .map((ratio) => {
-        const label = maxVal > 0 || ratio === 0 ? fmtAxis(safeMax * ratio) : "";
+        const label = !isFiniteAxis || maxVal > 0 || ratio === 0 ? fmtAxis(safeMax * ratio) : "";
         return `<div class="chart-grid-line"><span class="chart-grid-label">${esc(label)}</span></div>`;
       })
       .join("");
 
-    const labelStep = slots.length <= 10 ? 1 : Math.max(2, Math.ceil(slots.length / 8));
-    const minTailGap = Math.ceil(labelStep / 2);
     const barsHtml = slots
-      .map((d, idx) => {
-        const val = values[idx];
-        const showLabel =
-          idx === 0 || idx === slots.length - 1 || (idx % labelStep === 0 && slots.length - 1 - idx >= minTailGap);
-        const dayState = d.empty ? "empty" : d.usageUnknown ? "unmeasured" : "active";
-        const unknownMetric =
-          !d.empty &&
-          ((metric === "tokens" && d.usageUnknown) || (metric === "cost" && !(d.priced_tasks > 0)));
-
-        let stackClass = "bar-stack";
-        let stackStyle = "";
-        let inner = "";
-        if (d.empty) {
-          stackClass = "bar-stack bar-stack-empty";
-          stackStyle = "height:0;min-height:0";
-        } else if (unknownMetric) {
-          stackClass = "bar-stack bar-stack-unmeasured";
-          stackStyle = "height:4px;min-height:4px;background:transparent;border:1px dashed var(--fg-subtle);border-bottom:none";
-        } else {
-          const totalPct = maxVal > 0 ? Math.max(val > 0 ? 2 : 0, (val / safeMax) * 100) : 0;
-          stackStyle = val > 0 ? `height:${totalPct.toFixed(2)}%` : "height:2px;min-height:2px";
-          if (metric === "tokens") {
-            const denom = d.uncached_input_tokens + d.cache_read_tokens + d.output_tokens;
-            if (denom > 0) {
-              const pCache = (d.cache_read_tokens / denom) * 100;
-              const pIn = (d.uncached_input_tokens / denom) * 100;
-              const pOut = Math.max(0, 100 - pCache - pIn);
-              inner = `
-                <div class="bar-seg-cache" style="height:${pCache.toFixed(2)}%"></div>
-                <div class="bar-seg-in" style="height:${pIn.toFixed(2)}%"></div>
-                <div class="bar-seg-out" style="height:${pOut.toFixed(2)}%"></div>`;
-            } else {
-              inner = `<div class="bar-seg-in" style="height:100%"></div>`;
-            }
-          } else if (metric === "cost") {
-            inner = `<div class="bar-seg-cost" style="height:100%"></div>`;
-          } else {
-            inner = `<div class="bar-seg-tasks" style="height:100%"></div>`;
-          }
-        }
-
-        const ariaLabel = d.empty
-          ? t("stats.chartBarEmptyAria", { date: d.date })
-          : d.usageUnknown
-            ? t("stats.chartBarUnmeasuredAria", { date: d.date, tasks: fmtInt(d.tasks) })
-            : t("stats.chartBarAria", { date: d.date });
-        const btnClass = d.empty
-          ? "bar-col bar-col-empty"
-          : d.usageUnknown
-            ? "bar-col bar-col-unmeasured"
-            : "bar-col";
-        const extraAttrs = d.empty ? ' aria-disabled="true" style="cursor:default"' : "";
-
-        return `<button type="button" class="${btnClass}" data-idx="${idx}" data-date="${esc(d.date)}" data-day-state="${dayState}" data-empty="${d.empty ? "1" : "0"}" data-usage-unknown="${d.usageUnknown ? "1" : "0"}" aria-label="${esc(ariaLabel)}"${extraAttrs}>
-          <div class="${stackClass}" style="${stackStyle}">${inner}</div>
-          ${showLabel ? `<span class="bar-date">${esc(d.date.slice(5))}</span>` : ""}
-        </button>`;
-      })
+      .map((d, idx) =>
+        renderDailyBarColumn({
+          d,
+          idx,
+          total: slots.length,
+          val: values[idx],
+          maxVal,
+          safeMax,
+          metric,
+          isFiniteAxis,
+        })
+      )
       .join("");
 
     const emptyOverlayHtml =
       isFiniteAxis && !hasAnyTasks
         ? `<div class="chart-empty" data-chart-empty-overlay="1" style="position:absolute;inset:14px 10px 28px 50px;height:auto;pointer-events:none;z-index:1;">${esc(t("stats.chartNoMatchingTasks"))}</div>`
         : "";
-    const barsStyle = slots.length >= 20 ? ' style="gap:4px"' : "";
+    const barsStyle = isFiniteAxis && slots.length >= 20 ? ' style="gap:4px"' : "";
     stage.innerHTML = `<div class="chart-grid">${gridLines}</div>${emptyOverlayHtml}<div class="chart-bars"${barsStyle}>${barsHtml}</div>`;
 
     stage.querySelectorAll(".bar-col").forEach((btn) => {
@@ -877,7 +909,7 @@
       if (!d) return;
       btn.addEventListener("pointerenter", (ev) => {
         if (!tooltip) return;
-        tooltip.innerHTML = buildDailyTooltipHtml(d);
+        tooltip.innerHTML = buildDailyTooltipHtml(d, isFiniteAxis);
         tooltip.classList.remove("hidden");
         positionTooltip(ev, tooltip);
       });
@@ -885,7 +917,7 @@
       btn.addEventListener("pointerleave", () => tooltip && tooltip.classList.add("hidden"));
       btn.addEventListener("click", () => {
         if (tooltip) tooltip.classList.add("hidden");
-        if (d.empty) return;
+        if (isFiniteAxis && d.empty) return;
         if (typeof onSelectDate === "function") onSelectDate(d.date);
       });
     });
@@ -2328,6 +2360,9 @@
   window.AbDashboardDailyChart = {
     enumerateIsoDates,
     buildDailyChartSlots,
+    shouldShowDailyLabel,
+    renderDailyBarInner,
+    renderDailyBarColumn,
     buildDailyTooltipHtml,
     renderDailyBarChart,
   };
