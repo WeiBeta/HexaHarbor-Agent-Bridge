@@ -1046,4 +1046,3 @@ def test_non_finite_unmeasured_day_keeps_v013_bar_grid_and_tooltip(tmp_path: Pat
     assert cost_bar["stackClass"] == "bar-stack"
     assert cost_bar["stackStyle"] == "height:0.00%"
     assert 'class="bar-seg-cost"' in cost_bar["stackInner"]
-
