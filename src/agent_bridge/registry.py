@@ -19,7 +19,15 @@ import psutil
 
 from agent_bridge.adapters import build_adapter
 from agent_bridge.adapters.acp import AcpError
+from agent_bridge.adapters.antigravity import agy_projects_dir
 from agent_bridge.adapters.base import Adapter
+from agent_bridge.agy_slots import (
+    SlotGuardError,
+    admit_slot_turn,
+    bound_slot,
+    validate_slot_state,
+    verify_unused_slot_home,
+)
 from agent_bridge.billing_store import record_receipt_to_ledger
 from agent_bridge.config import (
     COORDINATOR_MODE_HINTS,
@@ -165,6 +173,7 @@ class Registry:
     ) -> None:
         self.home = home
         self.config = config
+        self._slot_rotation = any(a.protocol == "agy" and a.agy_slots.enabled for a in config.agents.values())
         self.sessions: dict[str, Session] = {}
         self.tasks: dict[str, Task] = {}
         # request_id -> (request fingerprint, task_id). Fingerprints instead
@@ -249,7 +258,10 @@ class Registry:
             owner_create_time = raw.get("owner_create_time")
             if self._is_mine(owner_pid, owner_create_time):
                 continue
-            if self._foreign_live(owner_pid, owner_create_time) or key not in mine:
+            foreign = self._foreign_live(owner_pid, owner_create_time)
+            if foreign and key in mine and (raw.get("agy_project_id") or mine[key].get("agy_project_id")):
+                raise SlotGuardError("slot session is owned by a different running Registry")
+            if foreign or key not in mine:
                 merged[key] = raw
         merged.update(mine)
         return list(merged.values())
@@ -292,12 +304,20 @@ class Registry:
         for attempt in range(STATE_WRITE_ATTEMPTS):
             try:
                 with file_lock(lock_path, timeout_sec=STATE_LOCK_TIMEOUT_SEC):
-                    disk = read_json_strict(path, {})
+                    missing = object()
+                    disk = read_json_strict(path, missing)
+                    if disk is missing and self._slot_rotation:
+                        verify_unused_slot_home(self.home)
+                    if disk is not missing and (
+                        self._slot_rotation or (isinstance(disk, dict) and "agy_slot_epoch" in disk)
+                    ):
+                        validate_slot_state(disk)
                     if not isinstance(disk, dict):
                         disk = {}
                     atomic_write_json(
                         path,
                         {
+                            **({"agy_slot_epoch": disk["agy_slot_epoch"]} if "agy_slot_epoch" in disk else {}),
                             "sessions": self._merge_owned(
                                 disk.get("sessions") or [],
                                 {row["session_id"]: row for row in own["sessions"]},
@@ -450,8 +470,17 @@ class Registry:
         lock_path = path.with_name(f"{path.name}.lock")
         with file_lock(lock_path, timeout_sec=STATE_LOCK_TIMEOUT_SEC):
             try:
-                payload = read_json_strict(path, {})
+                missing = object()
+                payload = read_json_strict(path, missing)
+                if payload is missing:
+                    if self._slot_rotation:
+                        verify_unused_slot_home(self.home)
+                    return {}
+                if self._slot_rotation:
+                    validate_slot_state(payload)
             except (json.JSONDecodeError, UnicodeDecodeError):
+                if self._slot_rotation:
+                    raise SlotGuardError("Bridge state is unreadable; slot rotation requires recovery") from None
                 # The lock only serialises concurrent writers, not a later start
                 # that finds a fresh state.json corrupt again within the same
                 # second, so the name needs a unique suffix of its own.
@@ -728,6 +757,40 @@ class Registry:
             )
         return {"coordinator": self.coordinator_status(), "path": str(path), "notes": notes}
 
+    async def _admit_agy_turn(
+        self, admissions: contextlib.AsyncExitStack, agent: AgentConfig, session: Session
+    ) -> bool:
+        if agent.protocol != "agy":
+            return False
+        if not agent.agy_slots.enabled:
+            if not session.native_session_id:
+                # A failed first turn has no native conversation to protect. A retry
+                # after opting out follows the normal cwd route.
+                session.agy_slot = session.agy_project_id = None
+            if session.agy_slot is None and session.agy_project_id is None:
+                return False
+
+        prepared = session.model_copy()
+        try:
+            self._adapter_for(prepared).prepare_turn(prepared)
+            slot = bound_slot(prepared, agent.agy_slots)
+            if slot is not None:
+                targets = [slot]
+            elif prepared.native_session_id:
+                # A legacy continuation has no project metadata. Protect its queued
+                # turn against every configured slot until the native turn finishes.
+                targets = agent.agy_slots.slots
+            else:
+                raise SlotGuardError("AGY session has no provable project binding")
+            for target in sorted(targets, key=lambda s: s.project_id):
+                await admit_slot_turn(admissions, self.home, target, agy_projects_dir())
+        except (OSError, SlotGuardError, asyncio.CancelledError):
+            if session.session_id not in self.sessions:
+                self._adapters.pop(session.session_id, None)
+            raise
+        session.agy_slot, session.agy_project_id = prepared.agy_slot, prepared.agy_project_id
+        return True
+
     async def dispatch_task(
         self,
         agent: str,
@@ -769,7 +832,7 @@ class Registry:
         effort = normalize_effort(effort, agent=agent, allow_xhigh=allow_xhigh)
         # Compare supplied arguments, not selections inherited from a mutable session.
         request = (agent, message, str(cwd_path.resolve()), session_id, model, effort, title, user_requested)
-        async with self._lock:
+        async with self._lock, contextlib.AsyncExitStack() as admissions:
             if request_id is not None and request_id in self._requests:
                 previous_fp, task_id = self._requests[request_id]
                 if previous_fp != _request_fingerprint(request):
@@ -814,6 +877,8 @@ class Registry:
                     proc_state=ProcState.spawning,
                 )
                 self._stamp_owner(session)
+            guarded = await self._admit_agy_turn(admissions, agent_cfg, session)
+            if session_id is None:
                 self.sessions[session.session_id] = session
             if model:
                 session.model = model
@@ -852,11 +917,18 @@ class Registry:
                 session.session_id,
                 agent,
             )
+            persisted = False
             try:
                 persisted = await self.flush_state()
             finally:
                 if task.status == TaskStatus.queued:
-                    if self._stopping:
+                    if guarded and not persisted:
+                        task.status = TaskStatus.failed
+                        task.error = "AGY slot admission was not persisted; worker was not started"
+                        task.finished_at = iso()
+                        session.proc_state = ProcState.idle_unloaded
+                        await self._finish_receipt(task, session)
+                    elif self._stopping:
                         self._mark_task_cancelled(task, session)
                         await self._finish_receipt(task, session)
                     else:
@@ -879,7 +951,8 @@ class Registry:
         task = self.tasks[task_id]
         session = self.sessions[task.session_id]
         adapter = self._adapter_for(session)
-        adapter.prepare_turn(session)
+        if not session.agy_project_id:
+            adapter.prepare_turn(session)
         task.status = TaskStatus.running
         task.started_at = iso()
         session.proc_state = ProcState.busy
@@ -1292,6 +1365,7 @@ class Registry:
             session
             for session in self.sessions.values()
             if session.proc_state in {ProcState.dead, ProcState.idle_unloaded}
+            and not (session.agy_project_id and session.proc_state == ProcState.idle_unloaded)
             and session.session_id not in self._adapters
             and self._busy_task(session.session_id) is None
         ]

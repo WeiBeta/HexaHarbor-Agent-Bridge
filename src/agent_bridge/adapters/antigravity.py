@@ -14,7 +14,7 @@ from typing import Any
 from urllib.parse import unquote
 
 from agent_bridge.adapters.base import STDIO_LIMIT, Adapter
-from agent_bridge.agy_slots import select_active_slot
+from agent_bridge.agy_slots import bound_slot, require_empty_project, select_active_slot
 from agent_bridge.config import AgentConfig
 from agent_bridge.diagnostics import redact_diagnostic
 from agent_bridge.models import Session, Task, TurnResult, agy_effort
@@ -280,32 +280,29 @@ class AgyAdapter(Adapter):
         # Stopping the process makes agy stdout hit EOF, which is otherwise
         # indistinguishable from a normal end of stream.
         self._cancelled: set[str] = set()
-        # Pin a fresh session's chosen slot across prepare_turn -> _build_cmd so
-        # a midnight tick between them never splits persisted metadata from argv.
-        self._pending_slots: dict[str, tuple[str, str]] = {}
-
-    def _select_and_record_slot(self, session: Session) -> tuple[str, str] | None:
-        if session.native_session_id or not self.agent.agy_slots.enabled:
-            return None
-        cached = self._pending_slots.get(session.session_id)
-        if cached is not None:
-            session.agy_slot, session.agy_project_id = cached
-            return cached
-        slot = select_active_slot(self.agent.agy_slots)
-        if slot is None:
-            return None
-        chosen = (slot.name, slot.project_id)
-        session.agy_slot, session.agy_project_id = chosen
-        self._pending_slots[session.session_id] = chosen
-        return chosen
+        self._prepared_session_id: str | None = None
 
     def prepare_turn(self, session: Session) -> None:
-        self._select_and_record_slot(session)
+        if not session.native_session_id and self.agent.agy_slots.enabled:
+            slot = select_active_slot(self.agent.agy_slots)
+            if slot is None:
+                raise ValueError("no active AGY slot")
+            require_empty_project(slot, agy_projects_dir())
+            session.agy_slot, session.agy_project_id = slot.name, slot.project_id
+            self._prepared_session_id = session.session_id
 
     async def ensure_session(self, session: Session) -> None:
         return None
 
     def _build_cmd(self, session: Session, task: Task) -> list[str]:
+        if not session.native_session_id and self.agent.agy_slots.enabled:
+            if self._prepared_session_id != session.session_id:
+                self.prepare_turn(session)
+            # Consume this attempt before command resolution or any spawn can fail.
+            self._prepared_session_id = None
+        slot = bound_slot(session, self.agent.agy_slots)
+        if slot is not None:
+            require_empty_project(slot, agy_projects_dir())
         fallbacks = [*self.agent.fallback_commands, *discovered_agy_commands()]
         cmd = resolve_command(self.agent.command, fallbacks)
         model = task.model or session.model
@@ -326,9 +323,10 @@ class AgyAdapter(Adapter):
         if session.native_session_id:
             cmd += ["--conversation", session.native_session_id]
         else:
-            slot_choice = self._select_and_record_slot(session)
-            if slot_choice is not None:
-                cmd += ["--project", slot_choice[1]]
+            if self.agent.agy_slots.enabled:
+                if slot is None:
+                    raise ValueError("AGY session has no slot binding")
+                cmd += ["--project", slot.project_id]
             else:
                 # Reuse the cwd's existing project so each dispatch does not add a
                 # duplicate to Antigravity's project list; --new-project only when none exists.
@@ -599,7 +597,6 @@ class AgyAdapter(Adapter):
                 await stderr_task
             self._procs.pop(session.session_id, None)
             self._cancelled.discard(session.session_id)
-            self._pending_slots.pop(session.session_id, None)
             drop_pid(self.home, session.session_id)
 
     async def cancel(self, session: Session) -> None:

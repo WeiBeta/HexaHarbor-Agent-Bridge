@@ -7,6 +7,7 @@ import tomllib
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field, model_validator
@@ -185,8 +186,15 @@ class AgySlotSpec(BaseModel):
                 "use 1..64 ASCII letters, digits, '.', '_' or '-'"
             )
         if not self.project_id or any(ch.isspace() or ord(ch) < 32 for ch in self.project_id):
-            raise ValueError(f"invalid agy slot project_id {self.project_id!r}")
+            raise ValueError("invalid agy slot project_id")
         return self
+
+    def with_canonical_id(self) -> AgySlotSpec:
+        try:
+            canonical = str(UUID(self.project_id))
+        except ValueError:
+            raise ValueError("invalid agy slot project_id; expected a UUID") from None
+        return self.model_copy(update={"project_id": canonical})
 
 
 class AgySlotConfig(BaseModel):
@@ -216,6 +224,10 @@ class AgySlotConfig(BaseModel):
             )
         self.cleaner_mode = mode
         self.cleaner_model = (self.cleaner_model or DEFAULT_AGY_CLEANER_MODEL).strip() or DEFAULT_AGY_CLEANER_MODEL
+        if self.enabled:
+            # Disabled overlays keep their historical validation and never route
+            # through these values. Normalize identities before enabling any use.
+            self.slots = [slot.with_canonical_id() for slot in self.slots]
         seen_names: set[str] = set()
         seen_projects: set[str] = set()
         for slot in self.slots:

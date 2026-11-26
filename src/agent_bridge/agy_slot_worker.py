@@ -1,30 +1,16 @@
-"""Pure-stdlib worker executed inside ``agy -p`` ``run_command`` for slot cleanup.
-
-This module intentionally imports ONLY the Python standard library so it can be
-copied verbatim into an ephemeral runner workspace and executed by whatever
-``python`` binary ``agy`` resolves on ``PATH`` (without needing Agent Bridge's
-virtualenv).
-
-Security invariants:
-- Never prints, logs, or persists ``ANTIGRAVITY_CSRF_TOKEN``.
-- Refuses any ``project_id`` not present in ``allowed_project_ids``.
-- Refuses any ``ANTIGRAVITY_LS_ADDRESS`` that is not a loopback ``host:port``.
-- Only invokes official ``product.v1.ConversationService`` Connect RPCs
-  (``ListConversations`` and, when ``dry_run`` is False, ``DeleteConversation``).
-- Never deletes ``ANTIGRAVITY_CONVERSATION_ID`` (the cleaner's own control
-  conversation under Scheme A), never deletes non-``RUN_STATE_IDLE`` sessions,
-  and never deletes conversations whose ``updateTime`` is missing, unparseable,
-  or at/after ``cutoff_utc``.
+"""Standalone AGY slot inventory worker. The evidenced delete API accepts only an ID.
+A listed item may change before deletion, so live requests stop before any RPC.
+This module is copied into the isolated CLI workspace and uses only the standard library.
 """
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
 import sys
-import urllib.error
-import urllib.request
+import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,19 +22,32 @@ RPC_TIMEOUT_SEC = 15
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
 _FRACTIONAL_RE = re.compile(r"(\.\d+)(?=(?:Z|[+-]\d{2}:\d{2})$)")
-_SECRET_KV_RE = re.compile(
-    r"(?i)(x-antigravity-csrf-token|antigravity_csrf_token|authorization|access_token|token|secret|password)"
-    r"(\s*[:=]\s*)\S+"
+_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+WORKER_ERRORS = frozenset(
+    {
+        "invalid_request",
+        "invalid_mode",
+        "invalid_cutoff",
+        "invalid_whitelist",
+        "missing_identity",
+        "missing_credentials",
+        "invalid_address",
+        "list_failed",
+        "invalid_list",
+        "pagination_limit",
+        "unexpected_project",
+        "conditional_delete_unavailable",
+    }
 )
 
 
-def redact_text(text: str, *, secrets: tuple[str, ...] = ()) -> str:
-    """Scrub secret values and header-like tokens before recording diagnostics."""
-    cleaned = _SECRET_KV_RE.sub(r"\1\2<redacted>", text)
-    for secret in secrets:
-        if secret:
-            cleaned = cleaned.replace(secret, "<redacted>")
-    return cleaned[:1000]
+def is_canonical_uuid(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(uuid.UUID(value)) == value
+    except ValueError:
+        return False
 
 
 def parse_rfc3339(raw: str | None) -> datetime | None:
@@ -68,11 +67,9 @@ def parse_rfc3339(raw: str | None) -> datetime | None:
         text = text[:-1] + "+00:00"
     try:
         dt = datetime.fromisoformat(text)
-    except ValueError:
+        return dt.astimezone(UTC) if dt.tzinfo is not None else None
+    except (ValueError, OverflowError):
         return None
-    if dt.tzinfo is None:
-        return None
-    return dt.astimezone(UTC)
 
 
 def validate_loopback_address(address: str) -> str:
@@ -86,7 +83,7 @@ def validate_loopback_address(address: str) -> str:
     port = int(port_str)
     if port <= 0 or port > 65535:
         raise ValueError("ANTIGRAVITY_LS_ADDRESS port out of range")
-    return f"{host}:{port}"
+    return f"{host.lower()}:{port}"
 
 
 def _call_rpc(
@@ -97,36 +94,34 @@ def _call_rpc(
     *,
     timeout_sec: int = RPC_TIMEOUT_SEC,
 ) -> dict[str, Any]:
-    url = f"http://{address}/product.v1.ConversationService/{method}"
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Connect-Protocol-Version": "1",
-            "x-antigravity-csrf-token": csrf_token,
-        },
-        method="POST",
-    )
+    endpoint = validate_loopback_address(address)
+    host, _, port = endpoint.rpartition(":")
+    # Direct numeric loopback connection: no proxy, DNS alias or redirect handling.
+    host = "127.0.0.1" if host == "localhost" else host.strip("[]")
+    if method != "ListConversations":
+        raise ValueError("unsupported ConversationService operation")
+    conn = http.client.HTTPConnection(host, int(port), timeout=timeout_sec)
     try:
-        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            body = json.loads(raw) if raw.strip() else {}
-            if not isinstance(body, dict):
-                return {"ok": False, "http_status": resp.status, "error": "non-object JSON response"}
-            return {"ok": True, "http_status": resp.status, "body": body}
-    except urllib.error.HTTPError as exc:
-        err_body = exc.read().decode("utf-8", errors="replace")
-        return {
-            "ok": False,
-            "http_status": exc.code,
-            "error": redact_text(f"HTTP {exc.code}: {err_body}", secrets=(csrf_token,)),
-        }
-    except Exception as exc:
-        return {
-            "ok": False,
-            "error": redact_text(f"{type(exc).__name__}: {exc}", secrets=(csrf_token,)),
-        }
+        conn.request(
+            "POST",
+            f"/product.v1.ConversationService/{method}",
+            json.dumps(payload).encode(),
+            {
+                "Content-Type": "application/json",
+                "Connect-Protocol-Version": "1",
+                "x-antigravity-csrf-token": csrf_token,
+            },
+        )
+        resp = conn.getresponse()
+        if resp.status != 200:
+            return {"ok": False}
+        raw = resp.read()
+        body = json.loads(raw) if raw else {}
+        return {"ok": isinstance(body, dict), "body": body}
+    except (OSError, ValueError, http.client.HTTPException):
+        return {"ok": False}
+    finally:
+        conn.close()
 
 
 def run_cleanup_request(
@@ -135,145 +130,102 @@ def run_cleanup_request(
     env: Mapping[str, str] | None = None,
     timeout_sec: int = RPC_TIMEOUT_SEC,
 ) -> dict[str, Any]:
-    """Execute one validated slot cleanup against official ConversationService."""
+    """Inventory the validated slot and report eligible IDs without deleting conversations."""
     source_env = os.environ if env is None else env
-    slot = str(request.get("slot") or "").strip()
-    project_id = str(request.get("project_id") or "").strip()
-    raw_allowed = request.get("allowed_project_ids")
-    allowed_ids = {
-        str(item).strip()
-        for item in (raw_allowed if isinstance(raw_allowed, list) else [])
-        if isinstance(item, str) and item.strip()
-    }
-    dry_run = bool(request.get("dry_run", True))
-    cutoff_raw = str(request.get("cutoff_utc") or "").strip()
-    cutoff_utc = parse_rfc3339(cutoff_raw)
-
+    slot = request.get("slot")
+    project_id = request.get("project_id")
+    allowed = request.get("allowed_project_ids")
+    dry_run = request.get("dry_run")
+    operation_id = request.get("operation_id")
+    cutoff = parse_rfc3339(request.get("cutoff_utc"))
     result: dict[str, Any] = {
         "ok": False,
-        "slot": slot,
-        "project_id": project_id,
-        "dry_run": dry_run,
+        "operation_id": operation_id if is_canonical_uuid(operation_id) else None,
+        "slot": slot if isinstance(slot, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", slot) else None,
+        "project_id": project_id if is_canonical_uuid(project_id) else None,
+        "dry_run": dry_run if type(dry_run) is bool else None,
         "checked": 0,
         "deleted": 0,
         "would_delete": 0,
         "deleted_ids": [],
         "would_delete_ids": [],
+        "eligible_ids": [],
         "skipped_running": 0,
         "skipped_recent": 0,
+        "skipped_unverified": 0,
         "errors": [],
     }
 
-    if not project_id or not allowed_ids or project_id not in allowed_ids:
-        result["errors"].append(f"whitelist rejected project_id {project_id!r}: not in configured AGY slot project IDs")
-        return result
-    if cutoff_utc is None:
-        result["errors"].append(f"invalid cutoff_utc timestamp: {cutoff_raw!r}")
+    def fail(code: str) -> dict[str, Any]:
+        result["errors"].append(code)
         return result
 
-    raw_addr = str(source_env.get("ANTIGRAVITY_LS_ADDRESS") or "").strip()
-    csrf_token = str(source_env.get("ANTIGRAVITY_CSRF_TOKEN") or "").strip()
-    self_conv_id = str(source_env.get("ANTIGRAVITY_CONVERSATION_ID") or "").strip()
-
-    if not raw_addr or not csrf_token:
-        result["errors"].append(
-            "ConversationService credentials missing in environment "
-            f"(ANTIGRAVITY_LS_ADDRESS={bool(raw_addr)}, ANTIGRAVITY_CSRF_TOKEN={bool(csrf_token)})"
-        )
-        return result
-
+    if type(dry_run) is not bool:
+        return fail("invalid_mode")
+    if not result["operation_id"] or not result["slot"]:
+        return fail("invalid_request")
+    if not result["project_id"] or not isinstance(allowed, list) or allowed != [project_id]:
+        return fail("invalid_whitelist")
+    if cutoff is None:
+        return fail("invalid_cutoff")
+    token = source_env.get("ANTIGRAVITY_CSRF_TOKEN", "").strip()
+    own_id = source_env.get("ANTIGRAVITY_CONVERSATION_ID", "").strip()
+    if not token:
+        return fail("missing_credentials")
+    if not _ID_RE.fullmatch(own_id):
+        return fail("missing_identity")
+    if not dry_run:
+        return fail("conditional_delete_unavailable")
     try:
-        address = validate_loopback_address(raw_addr)
-    except ValueError as exc:
-        result["errors"].append(str(exc))
-        return result
+        address = validate_loopback_address(source_env.get("ANTIGRAVITY_LS_ADDRESS", ""))
+    except ValueError:
+        return fail("invalid_address")
 
-    conversations: list[dict[str, Any]] = []
-    seen_conv_ids: set[str] = set()
     seen_tokens: set[str] = set()
+    seen_ids: set[str] = set()
     page_token = ""
     for _page in range(MAX_LIST_PAGES):
-        payload: dict[str, Any] = {
-            "projectId": project_id,
-            "includeArchived": True,
-            "pageSize": LIST_PAGE_SIZE,
-        }
+        payload: dict[str, Any] = {"projectId": project_id, "includeArchived": True, "pageSize": LIST_PAGE_SIZE}
         if page_token:
             payload["pageToken"] = page_token
-        listed = _call_rpc(address, csrf_token, "ListConversations", payload, timeout_sec=timeout_sec)
-        if not listed.get("ok"):
-            result["errors"].append(f"ListConversations failed: {listed.get('error', 'unknown error')}")
+        response = _call_rpc(address, token, "ListConversations", payload, timeout_sec=timeout_sec)
+        if response.get("ok") is not True:
+            return fail("list_failed")
+        body = response["body"]
+        items = body.get("conversations", [])
+        if not isinstance(items, list):
+            return fail("invalid_list")
+        for item in items:
+            if not isinstance(item, dict):
+                return fail("invalid_list")
+            cid = item.get("id")
+            if not isinstance(cid, str) or not _ID_RE.fullmatch(cid) or token in cid:
+                return fail("invalid_list")
+            if cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+            result["checked"] += 1
+            meta = item.get("metadata")
+            state = item.get("state")
+            if not isinstance(meta, dict) or meta.get("projectId") != project_id:
+                result["skipped_unverified"] += 1
+                if "unexpected_project" not in result["errors"]:
+                    result["errors"].append("unexpected_project")
+            elif cid == own_id or not isinstance(state, dict) or state.get("runState") != "RUN_STATE_IDLE":
+                result["skipped_running"] += 1
+            elif (updated := parse_rfc3339(state.get("updateTime"))) is None or updated >= cutoff:
+                result["skipped_recent"] += 1
+            else:
+                result["eligible_ids"].append(cid)
+                result["skipped_unverified"] += 1
+        page_token = body.get("nextPageToken", "")
+        if not isinstance(page_token, str) or page_token in seen_tokens:
+            return fail("invalid_list")
+        if not page_token:
+            result["ok"] = not result["errors"]
             return result
-        body = listed.get("body") or {}
-        raw_items = body.get("conversations")
-        if isinstance(raw_items, list):
-            for item in raw_items:
-                if not isinstance(item, dict):
-                    continue
-                cid = str(item.get("id") or "").strip()
-                if not cid or cid in seen_conv_ids:
-                    continue
-                seen_conv_ids.add(cid)
-                conversations.append(item)
-        next_token = str(body.get("nextPageToken") or "").strip()
-        if not next_token:
-            break
-        if next_token in seen_tokens:
-            result["errors"].append("ListConversations returned a repeating pageToken; aborting pagination")
-            return result
-        seen_tokens.add(next_token)
-        page_token = next_token
-    else:
-        result["errors"].append(f"ListConversations exceeded {MAX_LIST_PAGES} pages; aborting")
-        return result
-
-    for conv in conversations:
-        result["checked"] += 1
-        cid = str(conv.get("id") or "").strip()
-        raw_meta = conv.get("metadata")
-        meta: dict[str, Any] = raw_meta if isinstance(raw_meta, dict) else {}
-        raw_state = conv.get("state")
-        state: dict[str, Any] = raw_state if isinstance(raw_state, dict) else {}
-        conv_project_id = str(meta.get("projectId") or "").strip()
-
-        # Defense-in-depth: refuse any conversation outside the target whitelisted slot.
-        if conv_project_id != project_id or conv_project_id not in allowed_ids:
-            result["errors"].append(
-                f"skipped conversation {cid}: unexpected projectId {conv_project_id!r} (expected {project_id!r})"
-            )
-            continue
-
-        run_state = str(state.get("runState") or "").strip()
-        # Scheme A: always skip our own control conversation and any non-IDLE conversation.
-        if (self_conv_id and cid == self_conv_id) or run_state != "RUN_STATE_IDLE":
-            result["skipped_running"] += 1
-            continue
-
-        update_dt = parse_rfc3339(state.get("updateTime"))
-        if update_dt is None or update_dt >= cutoff_utc:
-            result["skipped_recent"] += 1
-            continue
-
-        if dry_run:
-            result["would_delete"] += 1
-            result["would_delete_ids"].append(cid)
-            continue
-
-        deleted = _call_rpc(
-            address,
-            csrf_token,
-            "DeleteConversation",
-            {"conversationId": cid},
-            timeout_sec=timeout_sec,
-        )
-        if deleted.get("ok"):
-            result["deleted"] += 1
-            result["deleted_ids"].append(cid)
-        else:
-            result["errors"].append(f"DeleteConversation({cid}) failed: {deleted.get('error', 'unknown error')}")
-
-    result["ok"] = len(result["errors"]) == 0
-    return result
+        seen_tokens.add(page_token)
+    return fail("pagination_limit")
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -289,26 +241,20 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     req_path = Path(args[0])
     out_path = Path(args[1])
+    # Retried commands cannot overwrite an earlier result or start another inventory.
+    try:
+        with out_path.with_suffix(".started").open("x", encoding="utf-8"):
+            pass
+    except FileExistsError:
+        sys.stdout.write("AGY_SLOT_CLEANUP_ERR\n")
+        return 1
+
     try:
         request = json.loads(req_path.read_text(encoding="utf-8"))
         if not isinstance(request, dict):
-            raise ValueError("request payload must be a JSON object")
-    except Exception as exc:
-        err = {
-            "ok": False,
-            "slot": "",
-            "project_id": "",
-            "dry_run": True,
-            "checked": 0,
-            "deleted": 0,
-            "would_delete": 0,
-            "deleted_ids": [],
-            "would_delete_ids": [],
-            "skipped_running": 0,
-            "skipped_recent": 0,
-            "errors": [redact_text(f"failed to read request: {exc}")],
-        }
-        _atomic_write_json(out_path, err)
+            raise ValueError("invalid request")
+    except (OSError, ValueError):
+        _atomic_write_json(out_path, {"ok": False, "errors": ["invalid_request"]})
         sys.stdout.write("AGY_SLOT_CLEANUP_ERR\n")
         return 1
 

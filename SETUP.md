@@ -28,6 +28,26 @@ Terminal receipts are written atomically to `$AGENT_BRIDGE_HOME/receipts/<task_i
 
 For Antigravity, `[agents.antigravity]` accepts `agy_mode` (default `"auto"`), `agy_sandbox` (default `false`), and `skip_permissions` (default `false`). These select CLI flags; they do not impose a filesystem boundary. The worker's own settings can still allow automatic execution. Inspect `observed_permission_mode` when reported; a missing value means unknown. The task `cwd` and changed-file tracking are not a sandbox. `[server] enabled_agents = ["antigravity", "codex"]` can restrict available workers; an empty list exposes all configured workers.
 
+### Antigravity empty-project slots
+
+Slot rotation is off by default. When enabled through `[agents.antigravity.agy_slots]`, the first turn selects today's configured project in `rotation_tz`. Each slot needs its own UUID and a registration with the matching document ID. Bridge accepts the explicit empty resource forms `{}` and `{"resources": []}`. Resuming a native conversation keeps its existing identity. An attempt that fails before obtaining a native ID selects the current slot again on retry.
+
+All participating Bridge processes must use this admission protocol. The first admission binds a project to one Bridge home and its state generation under the OS profile's `.agent-bridge/agy_slot_owners/`. A queued turn must reach disk before its worker starts. A bound session stays protected across restarts until `end_session`. Unreadable state, a mismatched owner or an unconfirmed cleanup blocks conflicting work. A new Bridge home needs a successful Registry startup to establish its initial state.
+
+**Dashboard API.** `GET /api/agy/slots` reports the daily schedule and guard state. A slot can also have `status: "unknown"`. Use `guard_error` for the reason and treat a null `bound_sessions_count` as unknown. `cleaner.available` describes the listing runner. The shipped runner has `conditional_delete_available: false`. The available delete request accepts a conversation ID alone. A listing cannot guarantee that a conversation remains idle when a later delete reaches the service.
+
+`POST /api/agy/slots/cleanup` requires the dashboard's exact HTTP origin, loopback Host and `X-Bridge-CSRF`. Send `{"slot": "<name>", "dry_run": true}` for an inventory. This launches an AGY control conversation in the verified empty project. `eligible_ids` lists older, idle items observed in the target project after excluding that control conversation. These items are included in `skipped_unverified`. The shipped runner reports `would_delete: 0` and sends no delete requests. A live request with a matching confirmation returns 409 before launching AGY. UI clients should leave the live action disabled while conditional deletion is unavailable.
+
+| Response | Consumer behavior |
+| --- | --- |
+| 200, `completed` or `partial` | Display the confirmed counts, IDs and structured errors. A partial listing can contain confirmed IDs from earlier pages. |
+| 400 / 403 | Correct the input or supply a matching Origin and CSRF token. |
+| 409, `not_started` | Display the indicated guard, capability or admission conflict. |
+| 502, `failed` | A known execution failure occurred. Display the safe cause. |
+| 502, `unknown` | Completion is unconfirmed. Check `counts_confirmed`. Unknown counts are JSON null. A verified worker receipt at timeout can supply counts even when the project must stay held. |
+
+The server records an `operation_id` before launching. Reconnect with GET to view `last_cleanup`, each slot's latest receipt and any `unconfirmed_operation_id`. Concurrent receipt updates commit under a shared lock. An interrupted server leaves `outcome: "unconfirmed"` until reconciled. If a matching worker receipt arrives later, GET includes its confirmed counts and `late_worker_receipt: true` while keeping the project held. Closing a page does not cancel execution. If `receipt_saved` is false, keep the terminal response and surface `receipt_error`. For an unresolved hold, preserve the operation receipt and its workspace under `$AGENT_BRIDGE_HOME/agy_slots/runs/` for local inspection. Establish the worker outcome and process termination before releasing the hold. The server does not automatically retry or release it on age. A pre-upgrade cleanup receipt is displayed as `historical_unverified`.
+
 ## Resolve the Agent Bridge executable
 
 Hosts must launch a real executable. A PowerShell function named `agent-bridge` is not resolved by ZCode or Grok child processes.

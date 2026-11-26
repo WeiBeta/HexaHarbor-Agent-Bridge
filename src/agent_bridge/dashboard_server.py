@@ -970,6 +970,15 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         self._send_json(payload)
 
     def _handle_post_agy_slots_cleanup(self, body: dict[str, Any]) -> None:
+        origin = (self.headers.get("Origin") or "").strip().lower()
+        host = (self.headers.get("Host") or "").strip().lower()
+        hostname = host.split(":", 1)[0]
+        authorities = {f"{hostname}:{self.server.bound_port}"}
+        if self.server.bound_port == 80:
+            authorities.add(hostname)
+        if host not in authorities or origin not in {f"http://{authority}" for authority in authorities}:
+            self._send_json({"ok": False, "error": "matching dashboard Origin required"}, status=HTTPStatus.FORBIDDEN)
+            return
         raw_slot = body.get("slot")
         if not isinstance(raw_slot, str) or not raw_slot.strip():
             self._send_json(
@@ -1025,7 +1034,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         status = (
             HTTPStatus.OK
-            if result.get("ok") or int(result.get("checked") or 0) > 0
+            if result["outcome"] in {"completed", "partial"}
             else HTTPStatus.BAD_GATEWAY
         )
         self._send_json(result, status=status)
