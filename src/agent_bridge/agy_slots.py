@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import ntpath
 import os
 import re
 import shutil
@@ -16,7 +17,9 @@ from contextlib import AsyncExitStack, contextmanager, suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeGuard
+
+import psutil
 
 from agent_bridge import agy_slot_worker
 from agent_bridge.config import (
@@ -97,6 +100,8 @@ class CleanerExecutionResult:
     skipped_unverified: int = 0
     outcome_unknown: bool = False
     worker_receipt_valid: bool = False
+    rejected_delete_ids: tuple[str, ...] = ()
+    unconfirmed_delete_ids: tuple[str, ...] = ()
 
 
 class CleanerRunner(Protocol):
@@ -384,6 +389,9 @@ def _display_receipt(home: Path, row: dict[str, Any] | None) -> dict[str, Any] |
             *_COUNT_FIELDS,
         )
         public = {key: row[key] for key in fields}
+        for key in ("rejected_delete_ids", "unconfirmed_delete_ids"):
+            if key in row:
+                public[key] = row[key]
         public["blocked_sessions"] = [
             {k: item.get(k) for k in ("session_id", "native_session_id", "proc_state", "last_active_at", "reason")}
             for item in row["blocked_sessions"]
@@ -402,6 +410,8 @@ def _display_receipt(home: Path, row: dict[str, Any] | None) -> dict[str, Any] |
                     "deleted_ids": list(result.deleted_ids),
                     "would_delete_ids": list(result.would_delete_ids),
                     "eligible_ids": list(result.eligible_ids),
+                    "rejected_delete_ids": list(result.rejected_delete_ids),
+                    "unconfirmed_delete_ids": list(result.unconfirmed_delete_ids),
                     "skipped_unverified": result.skipped_unverified,
                     "skipped_running": result.skipped_running,
                     "skipped_recent": result.skipped_recent,
@@ -442,6 +452,7 @@ def _safe_runner_error(value: str) -> str:
             "cleaner timed out; execution unconfirmed",
             "cleaner completion unconfirmed",
             "cleaner_failed",
+            "conditional_delete_unavailable",  # historical inventory-only receipts
             _MISSING_REGISTRATION,
             "project registration is unreadable",
             "project registration location is unreadable",
@@ -454,6 +465,64 @@ def _safe_runner_error(value: str) -> str:
     ):
         return value
     return "cleaner_failed"
+
+
+def _valid_receipt_ids(ids: Any) -> TypeGuard[list[str]]:
+    return (
+        isinstance(ids, list)
+        and all(isinstance(cid, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", cid) for cid in ids)
+        and len(set(ids)) == len(ids)
+    )
+
+
+def _valid_cleanup_counts(raw: dict[str, Any], *, legacy_preview: bool) -> bool:
+    if not all(type(raw.get(k)) is int and raw[k] >= 0 for k in _COUNT_FIELDS):
+        return False
+    if not all(_valid_receipt_ids(raw.get(k)) for k in ("eligible_ids", "would_delete_ids", "deleted_ids")):
+        return False
+    eligible, preview, deleted = raw["eligible_ids"], raw["would_delete_ids"], raw["deleted_ids"]
+    rejected = raw.get("rejected_delete_ids", [] if legacy_preview else None)
+    unconfirmed = raw.get("unconfirmed_delete_ids", [] if legacy_preview else None)
+    if not _valid_receipt_ids(rejected) or not _valid_receipt_ids(unconfirmed):
+        return False
+    if len(deleted) != raw["deleted"] or len(preview) != raw["would_delete"]:
+        return False
+    skipped = raw["skipped_running"] + raw["skipped_recent"] + raw["skipped_unverified"]
+    if legacy_preview:
+        # Older inventory workers counted eligible candidates as skipped.
+        return (
+            skipped == raw["checked"]
+            and len(eligible) <= raw["skipped_unverified"]
+            and not any((preview, deleted, rejected, unconfirmed))
+        )
+    if skipped + len(eligible) != raw["checked"]:
+        return False
+    errors = raw["errors"]
+    if raw["dry_run"]:
+        return (
+            preview == eligible
+            and not any((deleted, rejected, unconfirmed))
+            and not {"delete_rejected", "delete_unconfirmed"}.intersection(errors)
+        )
+
+    accounted = [*deleted, *rejected, *unconfirmed]
+    if (
+        preview
+        or len(set(accounted)) != len(accounted)
+        or len(unconfirmed) > 1
+        or bool(rejected) != ("delete_rejected" in errors)
+        or bool(unconfirmed) != ("delete_unconfirmed" in errors)
+        or (raw["ok"] and deleted != eligible)
+    ):
+        return False
+    if {"invalid_list", "list_failed", "pagination_limit"}.intersection(errors):
+        return not accounted  # Live mutation begins after the final page.
+    if unconfirmed:
+        # A lost acknowledgement terminates deletion at this candidate.
+        if unconfirmed[0] not in eligible:
+            return False
+        eligible = eligible[: eligible.index(unconfirmed[0]) + 1]
+    return set(accounted) == set(eligible)
 
 
 def _valid_stored_receipt(name: str, row: Any) -> bool:
@@ -482,14 +551,17 @@ def _valid_stored_receipt(name: str, row: Any) -> bool:
         or not all(isinstance(e, str) and _safe_runner_error(e) == e for e in row["errors"])
     ):
         return False
-    for key in ("eligible_ids", "deleted_ids", "would_delete_ids"):
-        if not isinstance(row.get(key), list) or not all(
-            isinstance(cid, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", cid) for cid in row[key]
-        ):
-            return False
+    legacy_preview = row["dry_run"] and "unconfirmed_delete_ids" not in row and "rejected_delete_ids" not in row
     if row["counts_confirmed"]:
-        return all(type(row.get(k)) is int and row[k] >= 0 for k in _COUNT_FIELDS)
-    return row["outcome"] in {"unconfirmed", "unknown"} and all(k in row and row[k] is None for k in _COUNT_FIELDS)
+        return _valid_cleanup_counts(row, legacy_preview=legacy_preview) and (
+            not row.get("unconfirmed_delete_ids") or row["outcome"] == "unknown"
+        )
+    return (
+        row["outcome"] in {"unconfirmed", "unknown"}
+        and all(k in row and row[k] is None for k in _COUNT_FIELDS)
+        and all(row.get(k) == [] for k in ("eligible_ids", "deleted_ids", "would_delete_ids"))
+        and all(row.get(k, []) == [] for k in ("rejected_delete_ids", "unconfirmed_delete_ids"))
+    )
 
 
 def _load_cleanup_receipts(home: Path) -> dict[str, Any]:
@@ -519,6 +591,8 @@ def _load_cleanup_receipts(home: Path) -> dict[str, Any]:
 
 
 def _save_cleanup_receipt(home: Path, slot_name: str, receipt: dict[str, Any]) -> None:
+    if not _valid_stored_receipt(slot_name, receipt):
+        raise SlotGuardError("cleanup receipt store is invalid")
     path = agy_slot_receipts_path(home)
     with file_lock(path.with_suffix(".lock"), timeout_sec=CLEANUP_LOCK_TIMEOUT_SEC):
         store = _load_cleanup_receipts(home)
@@ -742,7 +816,8 @@ def describe_slots(
         "active_project_id": active_project_id,
         "cleaner": {
             "conditional_delete_available": False,
-            "live_block_reason": "conditional_delete_unavailable",
+            "live_cleanup_available": avail,
+            "live_block_reason": reason if not avail else None,
             "mode": slot_cfg.cleaner_mode,
             "model": slot_cfg.cleaner_model,
             "available": avail,
@@ -827,34 +902,31 @@ def parse_worker_receipt(raw: Any, expected: dict[str, Any]) -> CleanerExecution
         or type(raw.get("ok")) is not bool
     ):
         return invalid
-    counts = _COUNT_FIELDS
-    if not all(type(raw.get(k)) is int and raw[k] >= 0 for k in counts):
-        return invalid
-    # No conditional delete is available on this worker's wire protocol.
-    for count in ("deleted", "would_delete"):
-        if raw[count] != 0 or raw.get(count + "_ids") != []:
-            return invalid
-    eligible_ids = raw.get("eligible_ids")
-    if (
-        not isinstance(eligible_ids, list)
-        or len(eligible_ids) > raw["skipped_unverified"]
-        or not all(isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", x) for x in eligible_ids)
-        or len(set(eligible_ids)) != len(eligible_ids)
-    ):
-        return invalid
     errors = raw.get("errors")
     if (
         not isinstance(errors, list)
         or not all(isinstance(e, str) and e in agy_slot_worker.WORKER_ERRORS for e in errors)
         or raw["ok"] == bool(errors)
-        or sum(raw[k] for k in counts[1:]) != raw["checked"]
     ):
+        return invalid
+    legacy_preview = (
+        expected["dry_run"] is True
+        and expected.get("outcome") in ("unknown", "unconfirmed")
+        and "unconfirmed_delete_ids" not in expected
+        and "unconfirmed_delete_ids" not in raw
+    )
+    if not _valid_cleanup_counts(raw, legacy_preview=legacy_preview):
         return invalid
     return CleanerExecutionResult(
         ok=raw["ok"],
-        **{k: raw[k] for k in counts},
+        **{k: raw[k] for k in _COUNT_FIELDS},
         errors=tuple(errors),
-        eligible_ids=tuple(eligible_ids),
+        eligible_ids=tuple(raw["eligible_ids"]),
+        would_delete_ids=tuple(raw["would_delete_ids"]),
+        deleted_ids=tuple(raw["deleted_ids"]),
+        rejected_delete_ids=tuple(raw.get("rejected_delete_ids", [])),
+        unconfirmed_delete_ids=tuple(raw.get("unconfirmed_delete_ids", [])),
+        outcome_unknown=bool(raw.get("unconfirmed_delete_ids")),
         worker_receipt_valid=True,
     )
 
@@ -874,7 +946,7 @@ def execute_tier3_cleanup(
     home: Path,
     env_config: EnvConfig | None = None,
 ) -> CleanerExecutionResult:
-    """Run the list-only slot worker under the selected project and its one-command allowlist."""
+    """Run the requested slot operation under the selected project and its one-command allowlist."""
     from agent_bridge.adapters.antigravity import agy_projects_dir, discovered_agy_commands, stream_json_prompt
 
     slots = agent_cfg.agy_slots
@@ -888,8 +960,6 @@ def execute_tier3_cleanup(
         or set(request.allowed_project_ids) != {s.project_id for s in slots.slots}
     ):
         return CleanerExecutionResult(False, errors=("invalid cleanup target or mode",))
-    if not request.dry_run:
-        return CleanerExecutionResult(False, errors=("conditional_delete_unavailable",))
     try:
         require_empty_project(spec, agy_projects_dir())
     except SlotGuardError as exc:
@@ -1001,6 +1071,31 @@ def execute_tier3_cleanup(
                 log.warning("could not remove completed AGY cleanup workspace")
 
 
+def _running_agy_cli_processes() -> tuple[list[dict[str, Any]], bool]:
+    """Snapshot matching process names; an exiting PID is an ordinary enumeration race."""
+    try:
+        pids = psutil.pids()
+    except (OSError, psutil.Error):
+        raise SlotGuardError("agy_cli_process_list_failed") from None
+    matches = []
+    complete = True
+    for pid in sorted(pids):
+        try:
+            name = psutil.Process(pid).name()
+        except psutil.NoSuchProcess:
+            continue
+        except (OSError, psutil.Error):
+            complete = False
+            continue
+        if not name:
+            complete = False
+            continue
+        basename = ntpath.basename(name)
+        if basename.casefold() == "agy.exe":
+            matches.append({"pid": pid, "name": basename})
+    return matches, complete
+
+
 def cleanup_agy_slot(
     home: Path,
     slot_name: str,
@@ -1061,6 +1156,8 @@ def cleanup_agy_slot(
         "deleted_ids": [],
         "would_delete_ids": [],
         "eligible_ids": [],
+        "rejected_delete_ids": [],
+        "unconfirmed_delete_ids": [],
         "blocked_sessions": [],
         "errors": [],
         "outcome": "not_started",
@@ -1090,8 +1187,10 @@ def cleanup_agy_slot(
             if info["guard_error"] or (not dry_run and status != "releasable"):
                 raise SlotGuardError(info["guard_error"] or f"slot is {status}")
             if not dry_run:
-                # The supported service request has no atomic idle/version precondition.
-                raise SlotGuardError("conditional_delete_unavailable")
+                matches, complete = _running_agy_cli_processes()
+                if matches or not complete:
+                    payload["blocking_processes"] = matches
+                    raise SlotGuardError("agy_cli_running" if complete else "agy_cli_process_name_unavailable")
             request = CleanerRequest(
                 target_spec.name,
                 target_spec.project_id,
@@ -1124,15 +1223,24 @@ def cleanup_agy_slot(
             unknown = payload.pop("outcome_unknown")
             counts_confirmed = payload.pop("worker_receipt_valid") or not unknown
             payload["counts_confirmed"] = counts_confirmed
-            for key in ("deleted_ids", "would_delete_ids", "eligible_ids"):
-                payload[key] = list(payload[key])
+            for key in (
+                "deleted_ids",
+                "would_delete_ids",
+                "eligible_ids",
+                "rejected_delete_ids",
+                "unconfirmed_delete_ids",
+            ):
+                payload[key] = list(payload[key]) if counts_confirmed else []
             payload["errors"] = [_safe_runner_error(e) for e in result.errors]
             if unknown:
                 payload["outcome"] = "unknown"
                 if not counts_confirmed:
                     payload.update(dict.fromkeys(_COUNT_FIELDS))
+            elif result.ok:
+                payload["outcome"] = "completed"
             else:
-                payload["outcome"] = "completed" if result.ok else "partial" if result.checked else "failed"
+                progress = result.checked if dry_run else result.deleted
+                payload["outcome"] = "partial" if progress else "failed"
             try:
                 _save_cleanup_receipt(home, target_spec.name, {**payload, "receipt_saved": True})
                 payload["receipt_saved"] = True

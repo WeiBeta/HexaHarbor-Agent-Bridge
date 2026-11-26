@@ -1,5 +1,4 @@
-"""Standalone AGY slot inventory worker. The evidenced delete API accepts only an ID.
-A listed item may change before deletion, so live requests stop before any RPC.
+"""Standalone AGY slot worker. The service deletes by ID after a separate inventory.
 This module is copied into the isolated CLI workspace and uses only the standard library.
 """
 
@@ -36,7 +35,8 @@ WORKER_ERRORS = frozenset(
         "invalid_list",
         "pagination_limit",
         "unexpected_project",
-        "conditional_delete_unavailable",
+        "delete_rejected",
+        "delete_unconfirmed",
     }
 )
 
@@ -98,7 +98,7 @@ def _call_rpc(
     host, _, port = endpoint.rpartition(":")
     # Direct numeric loopback connection: no proxy, DNS alias or redirect handling.
     host = "127.0.0.1" if host == "localhost" else host.strip("[]")
-    if method != "ListConversations":
+    if method not in {"ListConversations", "DeleteConversation"}:
         raise ValueError("unsupported ConversationService operation")
     conn = http.client.HTTPConnection(host, int(port), timeout=timeout_sec)
     try:
@@ -114,10 +114,14 @@ def _call_rpc(
         )
         resp = conn.getresponse()
         if resp.status != 200:
+            # An explicit client-error rejection differs from losing an
+            # acknowledgement after the server may have performed the delete.
+            if method == "DeleteConversation" and resp.status in {400, 401, 403, 404, 409, 412, 422, 429}:
+                return {"ok": False, "rejected": True}
             return {"ok": False}
         raw = resp.read()
         body = json.loads(raw) if raw else {}
-        return {"ok": isinstance(body, dict), "body": body}
+        return {"ok": isinstance(body, dict) and "error" not in body and "code" not in body, "body": body}
     except (OSError, ValueError, http.client.HTTPException):
         return {"ok": False}
     finally:
@@ -130,7 +134,7 @@ def run_cleanup_request(
     env: Mapping[str, str] | None = None,
     timeout_sec: int = RPC_TIMEOUT_SEC,
 ) -> dict[str, Any]:
-    """Inventory the validated slot and report eligible IDs without deleting conversations."""
+    """List the target, then perform at most one requested deletion per eligible ID."""
     source_env = os.environ if env is None else env
     slot = request.get("slot")
     project_id = request.get("project_id")
@@ -150,15 +154,27 @@ def run_cleanup_request(
         "deleted_ids": [],
         "would_delete_ids": [],
         "eligible_ids": [],
+        "rejected_delete_ids": [],
+        "unconfirmed_delete_ids": [],
         "skipped_running": 0,
         "skipped_recent": 0,
         "skipped_unverified": 0,
         "errors": [],
     }
 
+    # Keep insertion order for the receipt; a repeated observation may disqualify an ID.
+    eligible: dict[str, None] = {}
+
+    def finish() -> dict[str, Any]:
+        result["eligible_ids"] = list(eligible)
+        if dry_run is True:
+            result["would_delete_ids"] = list(eligible)
+            result["would_delete"] = len(eligible)
+        return result
+
     def fail(code: str) -> dict[str, Any]:
         result["errors"].append(code)
-        return result
+        return finish()
 
     if type(dry_run) is not bool:
         return fail("invalid_mode")
@@ -174,8 +190,6 @@ def run_cleanup_request(
         return fail("missing_credentials")
     if not _ID_RE.fullmatch(own_id):
         return fail("missing_identity")
-    if not dry_run:
-        return fail("conditional_delete_unavailable")
     try:
         address = validate_loopback_address(source_env.get("ANTIGRAVITY_LS_ADDRESS", ""))
     except ValueError:
@@ -201,10 +215,11 @@ def run_cleanup_request(
             cid = item.get("id")
             if not isinstance(cid, str) or not _ID_RE.fullmatch(cid) or token in cid:
                 return fail("invalid_list")
-            if cid in seen_ids:
+            if cid in seen_ids and cid not in eligible:
                 continue
-            seen_ids.add(cid)
-            result["checked"] += 1
+            if cid not in seen_ids:
+                seen_ids.add(cid)
+                result["checked"] += 1
             meta = item.get("metadata")
             state = item.get("state")
             if not isinstance(meta, dict) or meta.get("projectId") != project_id:
@@ -216,16 +231,34 @@ def run_cleanup_request(
             elif (updated := parse_rfc3339(state.get("updateTime"))) is None or updated >= cutoff:
                 result["skipped_recent"] += 1
             else:
-                result["eligible_ids"].append(cid)
-                result["skipped_unverified"] += 1
+                eligible[cid] = None
+                continue
+            eligible.pop(cid, None)
         page_token = body.get("nextPageToken", "")
         if not isinstance(page_token, str) or page_token in seen_tokens:
             return fail("invalid_list")
         if not page_token:
-            result["ok"] = not result["errors"]
-            return result
+            break
         seen_tokens.add(page_token)
-    return fail("pagination_limit")
+    else:
+        return fail("pagination_limit")
+
+    # Finish paging before mutating the collection used by the page tokens.
+    if not dry_run:
+        for cid in eligible:
+            reply = _call_rpc(address, token, "DeleteConversation", {"conversationId": cid}, timeout_sec=timeout_sec)
+            if reply.get("ok") is True:
+                result["deleted_ids"].append(cid)
+                result["deleted"] += 1
+            elif reply.get("rejected") is True:
+                result["rejected_delete_ids"].append(cid)
+                if "delete_rejected" not in result["errors"]:
+                    result["errors"].append("delete_rejected")
+            else:
+                result["unconfirmed_delete_ids"].append(cid)
+                return fail("delete_unconfirmed")
+    result["ok"] = not result["errors"]
+    return finish()
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -241,7 +274,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     req_path = Path(args[0])
     out_path = Path(args[1])
-    # Retried commands cannot overwrite an earlier result or start another inventory.
+    # A repeated command cannot run the same operation twice or replace its receipt.
     try:
         with out_path.with_suffix(".started").open("x", encoding="utf-8"):
             pass

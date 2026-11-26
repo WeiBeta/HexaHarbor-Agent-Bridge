@@ -116,6 +116,7 @@ def isolated_profile(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: profile))
     _write_projects(agy_projects_dir())
     monkeypatch.setattr("agent_bridge.adapters.antigravity.discovered_agy_commands", lambda: [])
+    monkeypatch.setattr(agy_slots.psutil, "pids", lambda: [])
     monkeypatch.setattr(
         "agent_bridge.agy_slots.build_worker_env",
         lambda *a, **kw: {
@@ -412,7 +413,7 @@ def test_drain_guard_three_locks_and_session_lifecycle(tmp_path: Path):
     def fake_runner(req: CleanerRequest, **_kw: Any) -> CleanerExecutionResult:
         nonlocal called
         called = True
-        assert req.dry_run
+        assert req.slot == rel_slot.name
         return CleanerExecutionResult(ok=True, checked=1, skipped_recent=1)
 
     # Lock 1: active & cooling refused for live cleanup without invoking cleaner
@@ -460,7 +461,7 @@ def test_drain_guard_three_locks_and_session_lifecycle(tmp_path: Path):
     assert [b["session_id"] for b in preview["blocked_sessions"]] == ["sess_unclosed"]
     assert called is True
 
-    # Closing the Bridge session clears its drain guard. The independent service capability is still absent.
+    # Closing the Bridge session clears its drain guard for the confirmed live operation.
     atomic_write_json(
         state_path(tmp_path),
         {
@@ -485,17 +486,16 @@ def test_drain_guard_three_locks_and_session_lifecycle(tmp_path: Path):
     assert by_name_after[rel_slot.name]["status"] == "releasable"
 
     called = False
-    with pytest.raises(SlotCleanupConflictError) as unavailable:
-        cleanup_agy_slot(
-            tmp_path,
-            rel_slot.name,
-            dry_run=False,
-            confirm=rel_slot.name,
-            now=now,
-            projects_dir=projects_dir,
-            cleaner_runner=fake_runner,
-        )
-    assert unavailable.value.payload["errors"] == ["conditional_delete_unavailable"] and not called
+    live = cleanup_agy_slot(
+        tmp_path,
+        rel_slot.name,
+        dry_run=False,
+        confirm=rel_slot.name,
+        now=now,
+        projects_dir=projects_dir,
+        cleaner_runner=fake_runner,
+    )
+    assert live["outcome"] == "completed" and called
 
 
 def test_whitelist_and_confirm_guards_reject_external_targets(tmp_path: Path):
@@ -583,8 +583,12 @@ def test_worker_protocol_filters_whitelist_self_running_recent_and_redacts_token
     ]
 
     list_calls = []
+    delete_calls = []
 
     def list_page(address, marker, method, body, **kw):
+        if method == "DeleteConversation":
+            delete_calls.append(body["conversationId"])
+            return {"ok": False, "rejected": True} if body["conversationId"] == "conv-old-fail" else {"ok": True}
         assert method == "ListConversations"
         list_calls.append(body)
         index = int(body.get("pageToken", 0))
@@ -630,13 +634,14 @@ def test_worker_protocol_filters_whitelist_self_running_recent_and_redacts_token
     assert list_calls[0]["includeArchived"] is True
     assert dry["checked"] == 6
     assert dry["deleted"] == 0
-    assert dry["would_delete"] == 0 and dry["would_delete_ids"] == []
+    assert dry["would_delete"] == 2 and dry["would_delete_ids"] == dry["eligible_ids"]
+    assert not delete_calls
     assert dry["eligible_ids"] == ["conv-old-idle-1", "conv-old-fail"]
     assert dry["skipped_running"] == 2
     assert dry["skipped_recent"] == 1
     assert len(dry["errors"]) == 1  # rogue external projectId flagged
 
-    # No conditional service contract: report eligible candidates as skipped.
+    # Only same-project, old, idle non-self IDs are submitted; count confirmed successes only.
     live = run_cleanup_request(
         {
             "operation_id": str(uuid.uuid4()),
@@ -648,10 +653,11 @@ def test_worker_protocol_filters_whitelist_self_running_recent_and_redacts_token
         },
         env=env,
     )
-    assert live["checked"] == 0 and len(list_calls) == 2
-    assert "conditional_delete_unavailable" in live["errors"]
-    assert live["deleted"] == 0
-    assert live["deleted_ids"] == []
+    assert live["checked"] == 6 and len(list_calls) == 4
+    assert live["errors"] == ["unexpected_project", "delete_rejected"]
+    assert delete_calls == ["conv-old-idle-1", "conv-old-fail"]
+    assert live["deleted"] == 1 and live["deleted_ids"] == ["conv-old-idle-1"]
+    assert live["rejected_delete_ids"] == ["conv-old-fail"] and not live["unconfirmed_delete_ids"]
     assert live["ok"] is False
     assert secret_token not in json.dumps(live)
 
@@ -677,14 +683,16 @@ def test_tier3_cleaner_uses_scheme_a_and_minimal_allowlist(tmp_path: Path, monke
             json.dumps(
                 {
                     **{k: captured["request"][k] for k in ("operation_id", "slot", "project_id", "dry_run")},
-                    "skipped_unverified": 2,
+                    "skipped_unverified": 0,
+                    "rejected_delete_ids": [],
+                    "unconfirmed_delete_ids": [],
                     "eligible_ids": ["c1", "c2"],
                     "ok": True,
                     "checked": 3,
                     "deleted": 0,
-                    "would_delete": 0,
+                    "would_delete": 2,
                     "deleted_ids": [],
-                    "would_delete_ids": [],
+                    "would_delete_ids": ["c1", "c2"],
                     "skipped_running": 1,
                     "skipped_recent": 0,
                     "errors": [],
@@ -756,9 +764,17 @@ def test_dashboard_agy_slots_api_auth_dry_run_confirm_and_live_cleanup(tmp_path:
 
     def fake_cleaner(req: CleanerRequest, **_kw: Any) -> CleanerExecutionResult:
         calls.append(req)
-        assert req.dry_run
+        ids = ("c1", "c2")
+        if not req.dry_run:
+            return CleanerExecutionResult(ok=True, checked=2, eligible_ids=ids, deleted_ids=ids, deleted=2)
         return CleanerExecutionResult(
-            ok=True, checked=4, eligible_ids=("c1", "c2"), skipped_unverified=2, skipped_running=1, skipped_recent=1
+            ok=True,
+            checked=4,
+            eligible_ids=ids,
+            would_delete=2,
+            would_delete_ids=ids,
+            skipped_running=1,
+            skipped_recent=1,
         )
 
     atomic_write_json(state_path(tmp_path), {"sessions": [], "tasks": []})
@@ -868,9 +884,9 @@ def test_dashboard_agy_slots_api_auth_dry_run_confirm_and_live_cleanup(tmp_path:
     assert dry_resp["dry_run"] is True
     assert dry_resp["checked"] == 4
     assert dry_resp["deleted"] == 0
-    assert dry_resp["would_delete"] == 0 and dry_resp["eligible_ids"] == ["c1", "c2"]
+    assert dry_resp["would_delete"] == 2 and dry_resp["would_delete_ids"] == dry_resp["eligible_ids"] == ["c1", "c2"]
 
-    # 7. Releasable is a Bridge drain state; it cannot enable an unsupported service operation.
+    # 7. Confirmed live cleanup returns the runner's confirmed counts.
     st, live_resp = _json_req(
         server,
         "POST",
@@ -878,17 +894,17 @@ def test_dashboard_agy_slots_api_auth_dry_run_confirm_and_live_cleanup(tmp_path:
         csrf=server.csrf_token,
         payload={"slot": rel_slot.name, "dry_run": False, "confirm": rel_slot.name},
     )
-    assert st == 409 and live_resp["outcome"] == "not_started"
-    assert live_resp["errors"] == ["conditional_delete_unavailable"]
-    assert len(calls) == 1
+    assert st == 200 and live_resp["outcome"] == "completed"
+    assert live_resp["deleted"] == 2 and live_resp["deleted_ids"] == ["c1", "c2"]
+    assert len(calls) == 2
 
     # 8. Subsequent GET /api/agy/slots surfaces the latest cleanup receipt
     st, after_overview = _json_req(server, "GET", "/api/agy/slots")
     assert st == 200
     assert after_overview["last_cleanup"]["slot"] == rel_slot.name
-    assert after_overview["last_cleanup"] == dry_resp
+    assert after_overview["last_cleanup"] == live_resp
     after_by_name = {row["name"]: row for row in after_overview["slots"]}
-    assert after_by_name[rel_slot.name]["last_cleanup"] == dry_resp
+    assert after_by_name[rel_slot.name]["last_cleanup"] == live_resp
 
 
 def test_dashboard_agy_slots_api_default_disabled(tmp_path: Path):
@@ -909,6 +925,7 @@ def test_dashboard_agy_slots_api_default_disabled(tmp_path: Path):
     assert payload["active_slot"] is None
     assert payload["slots"] == []
     assert payload["cleaner"]["available"] is False
+    assert payload["cleaner"]["live_cleanup_available"] is False
 
     st, err = _json_req(
         server,
@@ -1263,15 +1280,171 @@ def test_slot_becomes_active_before_admission(enabled_home, monkeypatch):
     assert conflict.value.payload["slot_status"] == "active"
 
 
-def test_production_live_cleanup_rejects_unconditional_delete_before_launch(enabled_home, monkeypatch):
+@pytest.mark.parametrize(
+    "scenario", ["cli", "list_failure", "name_denied", "desktop", "none", "preview", "partial", "failed", "unknown"]
+)
+def test_production_cleanup_http_process_guard_and_service_receipts(enabled_home, monkeypatch, scenario):
     home = enabled_home
     spec = releasable_slot(home)
-    monkeypatch.setattr(agy_slots, "execute_tier3_cleanup", unexpected_runner)
-    assert overview(home)["cleaner"]["conditional_delete_available"] is False
-    with pytest.raises(SlotCleanupConflictError) as conflict:
-        run_slot(home, spec, None, dry_run=False)
-    assert conflict.value.payload["errors"] == ["conditional_delete_unavailable"]
-    assert conflict.value.payload["outcome"] == "not_started"
+    cli_names = {501: r"C:\fixtures\AGY.EXE", 503: "agy.exe"}
+    names = {502: "Antigravity.exe", 504: "agy.exe.helper", 505: "not-agy.exe", 506: None}
+    if scenario in {"cli", "preview", "name_denied"}:
+        names.update(cli_names)
+    if scenario == "name_denied":
+        names[507] = "denied"
+    if scenario == "none":
+        names.clear()
+    calls, scans, launches = [], [], []
+
+    def pids():
+        scans.append(True)
+        # The preflight runs inside the same project lock used by Bridge dispatch.
+        with (
+            pytest.raises(agy_slots.FileLockTimeout),
+            agy_slots.file_lock(agy_slots._owner_path(spec).with_suffix(".lock"), timeout_sec=0),
+        ):
+            pass
+        if scenario == "list_failure":
+            raise OSError("synthetic process list failure")
+        return list(reversed(names))
+
+    def process(pid):
+        def name():
+            if names[pid] is None:
+                raise agy_slots.psutil.NoSuchProcess(pid)
+            if names[pid] == "denied":
+                raise agy_slots.psutil.AccessDenied(pid)
+            return names[pid]
+
+        return SimpleNamespace(name=name)
+
+    ps = agy_slots.psutil
+    monkeypatch.setattr(
+        agy_slots,
+        "psutil",
+        SimpleNamespace(
+            pids=pids,
+            Process=process,
+            Error=ps.Error,
+            NoSuchProcess=ps.NoSuchProcess,
+            AccessDenied=ps.AccessDenied,
+        ),
+    )
+    monkeypatch.setattr(agy_slots, "resolve_command", lambda *args: ["fixture-agy"])
+    ids = ["old-one", "old-two", "old-three"]
+
+    def service_response(method, payload):
+        if method == "ListConversations":
+            assert payload["projectId"] == spec.project_id
+            items = [
+                {
+                    "id": cid,
+                    "metadata": {"projectId": spec.project_id},
+                    "state": {"runState": "RUN_STATE_IDLE", "updateTime": "2000-01-01T00:00:00Z"},
+                }
+                for cid in [*ids, "fixture-control", ids[0], "changed"]
+            ]
+            items.append({**items[-1], "state": {"runState": "RUN_STATE_RUNNING"}})
+            return 200, {"conversations": items}
+        assert method == "DeleteConversation" and set(payload) == {"conversationId"}
+        cid = payload["conversationId"]
+        calls.append(cid)
+        if scenario == "failed":
+            return 403, {}
+        if cid == ids[1] and scenario in {"partial", "unknown"}:
+            if scenario == "unknown":
+                raise TimeoutError("fixture acknowledgement unavailable")
+            return 404, {}
+        return 200, {}
+
+    class MemoryService:
+        def __init__(self, host, port, *, timeout):
+            assert (host, port) == ("127.0.0.1", 43111)
+
+        def request(self, method, path, body, headers):
+            assert method == "POST" and path.startswith("/product.v1.ConversationService/")
+            self.method = path.rsplit("/", 1)[1]
+            self.payload = json.loads(body)
+
+        def getresponse(self):
+            status, body = service_response(self.method, self.payload)
+            return SimpleNamespace(status=status, read=lambda: json.dumps(body).encode())
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(agy_slot_worker.http.client, "HTTPConnection", MemoryService)
+
+    def launch(argv, *, cwd, **kwargs):
+        launches.append(argv)
+        assert argv[argv.index("--project") + 1] == spec.project_id
+        request = json.loads((Path(cwd) / "request.json").read_text())
+        assert request["allowed_project_ids"] == [spec.project_id]
+        output = run_cleanup_request(
+            request,
+            env={
+                "ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:43111",
+                "ANTIGRAVITY_CSRF_TOKEN": "fixture-marker",
+                "ANTIGRAVITY_CONVERSATION_ID": "fixture-control",
+            },
+        )
+        atomic_write_json(Path(cwd) / "result.json", output)
+        return SimpleNamespace(communicate=lambda **kw: (None, b""), returncode=0 if output["ok"] else 1)
+
+    monkeypatch.setattr(agy_slots.subprocess, "Popen", launch)
+    server = SimpleNamespace(
+        home=home,
+        bound_port=5001,
+        csrf_token="fixture-csrf",
+        agy_now_fn=lambda: FIXED_NOW,
+        agy_projects_dir_override=agy_projects_dir(),
+        agy_cleaner_runner=None,
+    )
+    state = _json_req(server, "GET", "/api/agy/slots")[1]
+    assert state["cleaner"]["live_cleanup_available"] and state["cleaner"]["conditional_delete_available"] is False
+    assert state["cleaner"]["live_block_reason"] is None and not scans
+    dry_run = scenario == "preview"
+    status, result = _json_req(
+        server,
+        "POST",
+        "/api/agy/slots/cleanup",
+        csrf=server.csrf_token,
+        payload={"slot": spec.name, "dry_run": dry_run, "confirm": spec.name},
+    )
+    assert len(scans) == int(not dry_run)
+    if scenario in {"cli", "list_failure", "name_denied"}:
+        assert status == 409 and result["outcome"] == "not_started" and not launches and not calls
+        assert not result["receipt_saved"] and result["deleted"] == 0
+        error = {
+            "cli": "agy_cli_running",
+            "list_failure": "agy_cli_process_list_failed",
+            "name_denied": "agy_cli_process_name_unavailable",
+        }[scenario]
+        assert result["errors"] == [error]
+        if scenario != "list_failure":
+            assert result["blocking_processes"] == [{"pid": 501, "name": "AGY.EXE"}, {"pid": 503, "name": "agy.exe"}]
+        assert _json_req(server, "GET", "/api/agy/slots")[1]["last_cleanup"] is None
+        return
+    assert len(launches) == 1 and result["eligible_ids"] == ids and result["skipped_running"] == 2
+    assert result["counts_confirmed"] and result["receipt_saved"]
+    assert result["would_delete_ids"] == (ids if dry_run else [])
+    assert result["would_delete"] == (len(ids) if dry_run else 0)
+    assert calls == ([] if dry_run else ids[:2] if scenario == "unknown" else ids)
+    if scenario == "unknown":
+        assert status == 502 and result["outcome"] == "unknown" and result["unconfirmed_delete_ids"] == ids[1:2]
+        assert result["deleted_ids"] == ids[:1] and result["errors"] == ["delete_unconfirmed"]
+        with pytest.raises(SlotCleanupConflictError):
+            run_slot(home, spec, unexpected_runner)
+    elif scenario == "partial":
+        assert status == 200 and result["outcome"] == "partial" and result["rejected_delete_ids"] == ids[1:2]
+        assert result["deleted_ids"] == [ids[0], ids[2]] and result["errors"] == ["delete_rejected"]
+    elif scenario == "failed":
+        assert status == 502 and result["outcome"] == "failed" and result["rejected_delete_ids"] == ids
+        assert result["deleted_ids"] == [] and result["errors"] == ["delete_rejected"]
+    else:
+        assert status == 200 and result["outcome"] == "completed" and result["deleted_ids"] == ([] if dry_run else ids)
+    assert result["deleted"] == len(result["deleted_ids"])
+    assert _json_req(server, "GET", "/api/agy/slots")[1]["last_cleanup"] == result
 
 
 @pytest.mark.parametrize(
@@ -1287,7 +1460,7 @@ def test_production_live_cleanup_rejects_unconditional_delete_before_launch(enab
         ("skipped_recent", 1),
         ("eligible_ids", ["same", "same"]),
         ("errors", ["unstructured-fixture-marker"]),
-        ("would_delete", 1),
+        ("would_delete", 0),
         ("deleted_ids", ["unexpected"]),
     ],
 )
@@ -1302,11 +1475,13 @@ def test_worker_receipt_must_match_operation_and_account_for_counts(field, value
         "checked": 1,
         "deleted": 0,
         "deleted_ids": [],
-        "would_delete": 0,
-        "would_delete_ids": [],
+        "would_delete": 1,
+        "would_delete_ids": ["fixture-id"],
+        "rejected_delete_ids": [],
+        "unconfirmed_delete_ids": [],
         "skipped_running": 0,
         "skipped_recent": 0,
-        "skipped_unverified": 1,
+        "skipped_unverified": 0,
         "eligible_ids": ["fixture-id"],
         "errors": [],
     }
@@ -1747,7 +1922,9 @@ def test_reassigned_slot_only_shows_its_own_latest_receipt(enabled_home, old_unc
 
     def inventory(request, **kwargs):
         candidate = "old-candidate" if request.project_id == original.project_id else "new-candidate"
-        return CleanerExecutionResult(True, checked=1, skipped_unverified=1, eligible_ids=(candidate,))
+        return CleanerExecutionResult(
+            True, checked=1, would_delete=1, would_delete_ids=(candidate,), eligible_ids=(candidate,)
+        )
 
     def unconfirmed(*args, **kwargs):
         return CleanerExecutionResult(False, outcome_unknown=True)
@@ -1884,11 +2061,13 @@ def test_valid_worker_counts_survive_unconfirmed_process_timeout(enabled_home, m
                     "checked": 1,
                     "deleted": 0,
                     "deleted_ids": [],
-                    "would_delete": 0,
-                    "would_delete_ids": [],
+                    "would_delete": 1,
+                    "would_delete_ids": ["verified-id"],
+                    "rejected_delete_ids": [],
+                    "unconfirmed_delete_ids": [],
                     "skipped_recent": 0,
                     "skipped_running": 0,
-                    "skipped_unverified": 1,
+                    "skipped_unverified": 0,
                     "eligible_ids": ["verified-id"],
                     "errors": [],
                 },
@@ -1947,7 +2126,7 @@ def test_legacy_receipt_safe_projection_preserves_original(enabled_home):
 def test_worker_repeated_command_does_not_replace_first_receipt(tmp_path, monkeypatch):
     request = tmp_path / "request.json"
     result = tmp_path / "result.json"
-    atomic_write_json(request, {"fixture": True})
+    atomic_write_json(request, {"dry_run": False})
     calls = []
 
     def fake_worker(obj):
@@ -2015,7 +2194,8 @@ async def test_independent_registries_can_queue_concurrent_new_turns_into_active
         await b.stop()
 
 
-def test_late_matching_receipt_updates_visible_counts_without_releasing_slot(enabled_home):
+@pytest.mark.parametrize("old_preview", [False, True])
+def test_late_matching_receipt_updates_visible_counts_without_releasing_slot(enabled_home, old_preview):
     home = enabled_home
     spec = releasable_slot(home)
     result = run_slot(
@@ -2033,15 +2213,26 @@ def test_late_matching_receipt_updates_visible_counts_without_releasing_slot(ena
         "ok": True,
         "checked": 1,
         "deleted": 0,
-        "would_delete": 0,
+        "would_delete": 1,
         "deleted_ids": [],
-        "would_delete_ids": [],
+        "would_delete_ids": ["late-id"],
+        "rejected_delete_ids": [],
+        "unconfirmed_delete_ids": [],
         "eligible_ids": ["late-id"],
         "skipped_running": 0,
         "skipped_recent": 0,
-        "skipped_unverified": 1,
+        "skipped_unverified": 0,
         "errors": [],
     }
+    if old_preview:
+        # R2 pending inventory and its still-running worker predate live receipts.
+        path_store = agy_slots.agy_slot_receipts_path(home)
+        store = json.loads(path_store.read_text(encoding="utf-8"))
+        for row in (raw, store["last_cleanup"], store["by_slot"][spec.name]):
+            row.pop("rejected_delete_ids")
+            row.pop("unconfirmed_delete_ids")
+        raw.update(would_delete=0, would_delete_ids=[], skipped_unverified=1)
+        atomic_write_json(path_store, store)
     atomic_write_json(path, {**raw, "operation_id": str(uuid.uuid4())})
     assert not overview(home)["last_cleanup"]["counts_confirmed"]
     atomic_write_json(path, raw)
@@ -2053,11 +2244,14 @@ def test_late_matching_receipt_updates_visible_counts_without_releasing_slot(ena
         run_slot(home, spec, unexpected_runner)
 
 
-def test_malformed_persisted_operation_is_visible_without_echoing_details(enabled_home):
+@pytest.mark.parametrize(
+    "field,value", [("outcome", ["invalid-fixture-value"]), ("deleted_ids", ["invalid-fixture-value"])]
+)
+def test_malformed_persisted_operation_is_visible_without_echoing_details(enabled_home, field, value):
     home = enabled_home
     spec = releasable_slot(home)
     row = run_slot(home, spec, lambda *a, **kw: CleanerExecutionResult(True))
-    row["outcome"] = ["invalid-fixture-value"]
+    row[field] = value
     atomic_write_json(agy_slots.agy_slot_receipts_path(home), {"by_slot": {spec.name: row}, "last_cleanup": row})
     desc = overview(home)
     assert desc["receipt_error"] and "invalid-fixture-value" not in json.dumps(desc)
