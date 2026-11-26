@@ -44,6 +44,10 @@ class Adapter(ABC):
             set(self.env_config.set) | set(self.agent.env),
         )
 
+    def prepare_turn(self, session: Session) -> None:
+        """Optional sync hook run before persisting state.json and invoking run_turn."""
+        return None
+
     @abstractmethod
     async def ensure_session(self, session: Session) -> None: ...
 

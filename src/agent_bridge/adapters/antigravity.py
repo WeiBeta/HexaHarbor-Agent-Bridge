@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import unquote
 
 from agent_bridge.adapters.base import STDIO_LIMIT, Adapter
+from agent_bridge.agy_slots import select_active_slot
 from agent_bridge.config import AgentConfig
 from agent_bridge.diagnostics import redact_diagnostic
 from agent_bridge.models import Session, Task, TurnResult, agy_effort
@@ -279,6 +280,27 @@ class AgyAdapter(Adapter):
         # Stopping the process makes agy stdout hit EOF, which is otherwise
         # indistinguishable from a normal end of stream.
         self._cancelled: set[str] = set()
+        # Pin a fresh session's chosen slot across prepare_turn -> _build_cmd so
+        # a midnight tick between them never splits persisted metadata from argv.
+        self._pending_slots: dict[str, tuple[str, str]] = {}
+
+    def _select_and_record_slot(self, session: Session) -> tuple[str, str] | None:
+        if session.native_session_id or not self.agent.agy_slots.enabled:
+            return None
+        cached = self._pending_slots.get(session.session_id)
+        if cached is not None:
+            session.agy_slot, session.agy_project_id = cached
+            return cached
+        slot = select_active_slot(self.agent.agy_slots)
+        if slot is None:
+            return None
+        chosen = (slot.name, slot.project_id)
+        session.agy_slot, session.agy_project_id = chosen
+        self._pending_slots[session.session_id] = chosen
+        return chosen
+
+    def prepare_turn(self, session: Session) -> None:
+        self._select_and_record_slot(session)
 
     async def ensure_session(self, session: Session) -> None:
         return None
@@ -304,10 +326,14 @@ class AgyAdapter(Adapter):
         if session.native_session_id:
             cmd += ["--conversation", session.native_session_id]
         else:
-            # Reuse the cwd's existing project so each dispatch does not add a
-            # duplicate to Antigravity's project list; --new-project only when none exists.
-            project_id = find_agy_project(session.cwd, agy_projects_dir()) if session.cwd else None
-            cmd += ["--project", project_id] if project_id else ["--new-project"]
+            slot_choice = self._select_and_record_slot(session)
+            if slot_choice is not None:
+                cmd += ["--project", slot_choice[1]]
+            else:
+                # Reuse the cwd's existing project so each dispatch does not add a
+                # duplicate to Antigravity's project list; --new-project only when none exists.
+                project_id = find_agy_project(session.cwd, agy_projects_dir()) if session.cwd else None
+                cmd += ["--project", project_id] if project_id else ["--new-project"]
         cmd += [
             "-p",
             "",
@@ -573,6 +599,7 @@ class AgyAdapter(Adapter):
                 await stderr_task
             self._procs.pop(session.session_id, None)
             self._cancelled.discard(session.session_id)
+            self._pending_slots.pop(session.session_id, None)
             drop_pid(self.home, session.session_id)
 
     async def cancel(self, session: Session) -> None:

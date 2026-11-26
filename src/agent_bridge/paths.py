@@ -137,6 +137,16 @@ def dashboard_assets_dir() -> Path:
     return Path(__file__).resolve().parent / "dashboard_assets"
 
 
+def agy_slots_dir(home: Path | None = None) -> Path:
+    path = (home or bridge_home()) / "agy_slots"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def agy_slot_receipts_path(home: Path | None = None) -> Path:
+    return agy_slots_dir(home) / "cleanup_receipts.json"
+
+
 def bundled_tray_script() -> Path:
     here = Path(__file__).resolve()
     for candidate in (

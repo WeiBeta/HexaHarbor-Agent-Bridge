@@ -4,10 +4,12 @@ import json
 import os
 import re
 import tomllib
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from agent_bridge.paths import bridge_home, bundled_agents_toml
 from agent_bridge.persist import atomic_write_text
@@ -105,6 +107,132 @@ DEFAULT_INHERIT_KEYS = (
 )
 
 
+_SLOT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_UTC_OFFSET_RE = re.compile(r"^(?:UTC|GMT)?([+-])(\d{1,2})(?::?(\d{2}))?$", re.IGNORECASE)
+_FIXED_IANA_OFFSETS: dict[str, int] = {
+    "etc/utc": 0,
+    "etc/gmt": 0,
+    "asia/shanghai": 8 * 60,
+    "asia/chongqing": 8 * 60,
+    "asia/harbin": 8 * 60,
+    "asia/urumqi": 8 * 60,
+    "asia/hong_kong": 8 * 60,
+    "asia/macau": 8 * 60,
+    "asia/taipei": 8 * 60,
+    "asia/singapore": 8 * 60,
+    "asia/kuala_lumpur": 8 * 60,
+    "asia/manila": 8 * 60,
+    "asia/tokyo": 9 * 60,
+    "asia/seoul": 9 * 60,
+    "asia/bangkok": 7 * 60,
+    "asia/ho_chi_minh": 7 * 60,
+    "asia/jakarta": 7 * 60,
+    "asia/kolkata": 5 * 60 + 30,
+    "asia/dubai": 4 * 60,
+}
+
+AGY_CLEANER_MODES = ("cli_run_command", "disabled")
+DEFAULT_AGY_CLEANER_MODEL = "gemini-3.8-flash-low"
+
+
+def resolve_rotation_timezone(tz_name: str | None) -> tzinfo:
+    """Resolve a rotation timezone string without requiring ``tzdata`` on Windows.
+
+    Accepts ``"local"`` (or empty/None), ``"UTC"``/``"Z"``, fixed UTC offsets
+    such as ``"+08:00"`` / ``"UTC+8"``, and IANA zone names (via ``ZoneInfo``,
+    with fixed-offset fallback for common non-DST Asian/UTC zones when Windows
+    lacks ``tzdata``).
+    """
+    raw = (tz_name or "").strip()
+    if not raw or raw.lower() == "local":
+        return datetime.now().astimezone().tzinfo or UTC
+    upper = raw.upper()
+    if upper in {"UTC", "Z", "GMT"}:
+        return UTC
+    match = _UTC_OFFSET_RE.match(raw)
+    if match:
+        sign = 1 if match.group(1) == "+" else -1
+        hours = int(match.group(2))
+        minutes = int(match.group(3) or "0")
+        if hours > 23 or minutes > 59:
+            raise ValueError(f"invalid UTC offset {tz_name!r}: hours must be 0..23 and minutes 0..59")
+        return timezone(sign * timedelta(hours=hours, minutes=minutes))
+    try:
+        return ZoneInfo(raw)
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        fallback_minutes = _FIXED_IANA_OFFSETS.get(raw.lower())
+        if fallback_minutes is not None:
+            return timezone(timedelta(minutes=fallback_minutes))
+        raise ValueError(
+            f"unknown or unavailable rotation_tz {tz_name!r}; "
+            "install tzdata or use 'local', 'UTC', or a fixed offset like '+08:00'"
+        ) from None
+
+
+class AgySlotSpec(BaseModel):
+    """One pre-created 0-folder Antigravity empty project slot."""
+
+    name: str
+    project_id: str
+
+    @model_validator(mode="after")
+    def _validate_spec(self) -> AgySlotSpec:
+        self.name = self.name.strip()
+        self.project_id = self.project_id.strip()
+        if not self.name or not _SLOT_NAME_RE.match(self.name):
+            raise ValueError(
+                f"invalid agy slot name {self.name!r}; "
+                "use 1..64 ASCII letters, digits, '.', '_' or '-'"
+            )
+        if not self.project_id or any(ch.isspace() or ord(ch) < 32 for ch in self.project_id):
+            raise ValueError(f"invalid agy slot project_id {self.project_id!r}")
+        return self
+
+
+class AgySlotConfig(BaseModel):
+    """Opt-in daily slot rotation and safe ConversationService cleanup for AGY.
+
+    Disabled by default so unconfigured installations behave identically to v0.1.4.
+    """
+
+    enabled: bool = False
+    slots: list[AgySlotSpec] = Field(default_factory=list)
+    rotation_tz: str = "local"
+    grace_hours: int = Field(default=24, ge=0)
+    cleaner_mode: str = "cli_run_command"
+    cleaner_model: str = DEFAULT_AGY_CLEANER_MODEL
+    cleaner_timeout_sec: int = Field(default=120, ge=10)
+    cleaner_max_retries: int = Field(default=2, ge=0, le=5)
+
+    @model_validator(mode="after")
+    def _validate_slots(self) -> AgySlotConfig:
+        self.rotation_tz = (self.rotation_tz or "local").strip() or "local"
+        resolve_rotation_timezone(self.rotation_tz)
+        mode = (self.cleaner_mode or "").strip().lower()
+        if mode not in AGY_CLEANER_MODES:
+            raise ValueError(
+                f"unknown agy_slots.cleaner_mode {self.cleaner_mode!r}; "
+                f"use one of {', '.join(AGY_CLEANER_MODES)}"
+            )
+        self.cleaner_mode = mode
+        self.cleaner_model = (self.cleaner_model or DEFAULT_AGY_CLEANER_MODEL).strip() or DEFAULT_AGY_CLEANER_MODEL
+        seen_names: set[str] = set()
+        seen_projects: set[str] = set()
+        for slot in self.slots:
+            if slot.name in seen_names:
+                raise ValueError(f"duplicate agy slot name {slot.name!r}")
+            if slot.project_id in seen_projects:
+                raise ValueError(f"duplicate agy slot project_id {slot.project_id!r}")
+            seen_names.add(slot.name)
+            seen_projects.add(slot.project_id)
+        if self.enabled and len(self.slots) < 2:
+            raise ValueError(
+                "agy_slots.enabled=true requires at least 2 configured slots "
+                "(recommended: 3 slots for today / yesterday / releasable)"
+            )
+        return self
+
+
 class AgentConfig(BaseModel):
     name: str
     protocol: str
@@ -131,11 +259,13 @@ class AgentConfig(BaseModel):
     # never read.
     config_overrides: list[str] = Field(default_factory=list)
     # Antigravity CLI only: execution mode (--mode accept-edits|auto|plan),
-    # optional terminal sandbox (--sandbox), and explicit opt-in for
-    # --dangerously-skip-permissions (disabled by default).
+    # optional terminal sandbox (--sandbox), explicit opt-in for
+    # --dangerously-skip-permissions (disabled by default), and opt-in daily
+    # empty-project slot rotation.
     agy_mode: str | None = "auto"
     agy_sandbox: bool = False
     skip_permissions: bool = False
+    agy_slots: AgySlotConfig = Field(default_factory=AgySlotConfig)
 
 
 class EnvConfig(BaseModel):
@@ -256,8 +386,8 @@ def _merge_agent_spec(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str
     for key, value in overlay.items():
         if value in (None, [], {}):
             continue
-        if key == "env" and isinstance(out.get("env"), dict) and isinstance(value, dict):
-            out["env"] = {**out["env"], **value}
+        if key in {"env", "agy_slots"} and isinstance(out.get(key), dict) and isinstance(value, dict):
+            out[key] = {**out[key], **value}
         else:
             out[key] = value
     return out

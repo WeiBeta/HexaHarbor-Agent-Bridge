@@ -118,6 +118,8 @@ class Session(BaseModel):
     image_name: str | None = None
     owner_pid: int | None = None
     owner_create_time: float | None = None
+    agy_slot: str | None = None
+    agy_project_id: str | None = None
 
 
 class TaskFailure(BaseModel):

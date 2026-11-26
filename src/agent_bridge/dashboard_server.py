@@ -17,6 +17,7 @@ import threading
 import time
 import webbrowser
 from collections import Counter
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,6 +27,14 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from pydantic import ValidationError
 
+from agent_bridge.adapters.antigravity import agy_projects_dir
+from agent_bridge.agy_slots import (
+    CleanerRunner,
+    SlotCleanupConflictError,
+    SlotConfigError,
+    cleanup_agy_slot,
+    describe_slots,
+)
 from agent_bridge.billing import (
     collect_agent_models,
     compute_record_cost,
@@ -150,6 +159,9 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         home: Path,
         csrf_token: str | None = None,
         auto_backfill: bool = True,
+        agy_cleaner_runner: CleanerRunner | None = None,
+        agy_projects_dir_override: Path | None = None,
+        agy_now_fn: Callable[[], datetime] | None = None,
     ) -> None:
         host, _port = server_address
         host = host.strip().lower()
@@ -160,6 +172,9 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         self.instance_id = os.environ.get(DASHBOARD_LAUNCH_ID_ENV) or secrets.token_urlsafe(24)
         self.started_monotonic = time.monotonic()
         self.auto_backfill = auto_backfill
+        self.agy_cleaner_runner = agy_cleaner_runner
+        self.agy_projects_dir_override = agy_projects_dir_override
+        self.agy_now_fn = agy_now_fn
         self._receipts_watermark: tuple[int, int] = (-1, -1)
         self._backfill_lock = threading.Lock()
         super().__init__(("127.0.0.1", _port), DashboardRequestHandler)
@@ -574,6 +589,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+            if path == "/api/agy/slots":
+                self._handle_get_agy_slots()
+                return
+
             self._send_json({"ok": False, "error": f"not found: {path}"}, status=HTTPStatus.NOT_FOUND)
         except Exception as exc:
             log.exception("dashboard GET %s failed", path)
@@ -662,6 +681,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/service/open-folder":
                 result = open_billing_folder(self.server.home)
                 self._send_json({"ok": True, **result})
+                return
+            if path == "/api/agy/slots/cleanup":
+                self._handle_post_agy_slots_cleanup(body)
                 return
             self._send_json({"ok": False, "error": f"not found: {path}"}, status=HTTPStatus.NOT_FOUND)
         except (ValidationError, ValueError) as exc:
@@ -932,15 +954,102 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         )
 
 
+    def _handle_get_agy_slots(self) -> None:
+        now = self.server.agy_now_fn() if self.server.agy_now_fn is not None else None
+        projects_dir = (
+            self.server.agy_projects_dir_override
+            if self.server.agy_projects_dir_override is not None
+            else agy_projects_dir()
+        )
+        payload = describe_slots(
+            self.server.home,
+            now=now,
+            projects_dir=projects_dir,
+            cleaner_available=True if self.server.agy_cleaner_runner is not None else None,
+        )
+        self._send_json(payload)
+
+    def _handle_post_agy_slots_cleanup(self, body: dict[str, Any]) -> None:
+        raw_slot = body.get("slot")
+        if not isinstance(raw_slot, str) or not raw_slot.strip():
+            self._send_json(
+                {"ok": False, "error": "slot must be a non-empty string"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        raw_dry_run = body.get("dry_run", True)
+        if not isinstance(raw_dry_run, bool):
+            self._send_json(
+                {"ok": False, "error": "dry_run must be a boolean"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        raw_confirm = body.get("confirm")
+        if raw_confirm is not None and not isinstance(raw_confirm, str):
+            self._send_json(
+                {"ok": False, "error": "confirm must be a string"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        raw_project_id = body.get("project_id")
+        if raw_project_id is not None and not isinstance(raw_project_id, str):
+            self._send_json(
+                {"ok": False, "error": "project_id must be a string"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        now = self.server.agy_now_fn() if self.server.agy_now_fn is not None else None
+        projects_dir = (
+            self.server.agy_projects_dir_override
+            if self.server.agy_projects_dir_override is not None
+            else agy_projects_dir()
+        )
+        try:
+            result = cleanup_agy_slot(
+                self.server.home,
+                raw_slot,
+                dry_run=raw_dry_run,
+                confirm=raw_confirm,
+                requested_project_id=raw_project_id,
+                now=now,
+                projects_dir=projects_dir,
+                cleaner_runner=self.server.agy_cleaner_runner,
+            )
+        except SlotConfigError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        except SlotCleanupConflictError as exc:
+            self._send_json(exc.payload, status=HTTPStatus.CONFLICT)
+            return
+
+        status = (
+            HTTPStatus.OK
+            if result.get("ok") or int(result.get("checked") or 0) > 0
+            else HTTPStatus.BAD_GATEWAY
+        )
+        self._send_json(result, status=status)
+
+
 def create_dashboard_server(
     *,
     home: Path | None = None,
     host: str = DEFAULT_DASHBOARD_HOST,
     port: int = DEFAULT_DASHBOARD_PORT,
     backfill: bool = True,
+    agy_cleaner_runner: CleanerRunner | None = None,
+    agy_projects_dir_override: Path | None = None,
+    agy_now_fn: Callable[[], datetime] | None = None,
 ) -> DashboardHTTPServer:
     resolved = home or bridge_home()
-    server = DashboardHTTPServer((host, port), home=resolved, auto_backfill=backfill)
+    server = DashboardHTTPServer(
+        (host, port),
+        home=resolved,
+        auto_backfill=backfill,
+        agy_cleaner_runner=agy_cleaner_runner,
+        agy_projects_dir_override=agy_projects_dir_override,
+        agy_now_fn=agy_now_fn,
+    )
     if backfill:
         try:
             backfill_from_bridge_home(resolved)

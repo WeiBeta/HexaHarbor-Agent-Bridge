@@ -879,6 +879,7 @@ class Registry:
         task = self.tasks[task_id]
         session = self.sessions[task.session_id]
         adapter = self._adapter_for(session)
+        adapter.prepare_turn(session)
         task.status = TaskStatus.running
         task.started_at = iso()
         session.proc_state = ProcState.busy
