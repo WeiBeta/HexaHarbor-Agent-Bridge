@@ -1613,6 +1613,172 @@ async def test_old_idle_slot_binding_survives_restart_until_end(enabled_home):
     assert next(r for r in overview(home)["slots"] if r["name"] == spec.name)["status"] == "releasable"
 
 
+@pytest.fixture
+async def bound_native_turn(enabled_home, monkeypatch):
+    from agent_bridge.models import TurnResult
+    from agent_bridge.registry import Registry
+
+    home = enabled_home
+    commands = []
+    monkeypatch.setattr("agent_bridge.adapters.antigravity.select_active_slot", lambda cfg: SLOT_A)
+    monkeypatch.setattr("agent_bridge.adapters.antigravity.resolve_command", lambda *args: ["fixture-agy"])
+
+    async def run_turn(self, session, task):
+        commands.append(self._build_cmd(session, task))
+        return TurnResult(text="fixture", native_session_id="fixture-original-conversation")
+
+    monkeypatch.setattr(AgyAdapter, "run_turn", run_turn)
+    reg = Registry(home, load_config(home), runtime_context="coordinator")
+    await reg.start()
+    try:
+        first = await reg.dispatch_task("antigravity", "first", str(home), user_requested=True)
+        await reg.wait_task(first["task_id"], timeout_sec=5)
+        assert reg.tasks[first["task_id"]].status == TaskStatus.completed
+        (argv,) = commands
+        assert argv[argv.index("--project") + 1] == SLOT_A.project_id
+    finally:
+        await reg.stop()
+    return home, first, commands
+
+
+@pytest.mark.parametrize("remove_section", [False, True])
+async def test_bound_native_turn_resumes_after_opt_out_and_registration_loss(bound_native_turn, remove_section):
+    from agent_bridge.registry import Registry
+
+    home, first, commands = bound_native_turn
+    assert run_slot(home, SLOT_A, lambda *a, **kw: CleanerExecutionResult(True))["ok"]
+    receipt_path, owner_path = agy_slots.agy_slot_receipts_path(home), agy_slots._owner_path(SLOT_A)
+    history, owner = receipt_path.read_bytes(), owner_path.read_bytes()
+    if remove_section:
+        (home / "agents.toml").write_text("", encoding="utf-8")
+    else:
+        _write_slot_overlay(home, enabled=False)
+    registration = agy_projects_dir() / f"{SLOT_A.project_id}.json"
+    registration.unlink()
+    reg = Registry(home, load_config(home), runtime_context="coordinator")
+    await reg.start()
+    try:
+        resumed = await reg.dispatch_task(
+            "antigravity", "follow-up", str(home), session_id=first["session_id"], user_requested=True
+        )
+        await reg.wait_task(resumed["task_id"], timeout_sec=5)
+        assert resumed["persisted"] and reg.tasks[resumed["task_id"]].status == TaskStatus.completed
+        assert reg.tasks[first["task_id"]].status == TaskStatus.completed
+        _, argv = commands
+        assert argv[argv.index("--conversation") + 1] == "fixture-original-conversation"
+        assert "--project" not in argv and "--new-project" not in argv
+        assert await reg.flush_state()
+        (saved,) = json.loads(state_path(home).read_text(encoding="utf-8"))["sessions"]
+        assert saved["session_id"] == first["session_id"]
+        assert saved["native_session_id"] == "fixture-original-conversation"
+        assert (saved["agy_slot"], saved["agy_project_id"]) == (SLOT_A.name, SLOT_A.project_id)
+        assert receipt_path.read_bytes() == history and owner_path.read_bytes() == owner
+        assert not registration.exists()
+    finally:
+        await reg.stop()
+
+
+@pytest.mark.parametrize("conflict", ["in_progress", "unknown", "identity_mismatch"])
+async def test_opted_out_native_turn_preserves_conflict_guards(bound_native_turn, conflict):
+    from agent_bridge.registry import Registry
+
+    home, first, commands = bound_native_turn
+    entered, release = threading.Event(), threading.Event()
+
+    def runner(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return CleanerExecutionResult(False, outcome_unknown=True)
+
+    cleaning = None
+    if conflict != "identity_mismatch":
+        cleaning = asyncio.create_task(asyncio.to_thread(run_slot, home, SLOT_A, runner))
+        assert await asyncio.to_thread(entered.wait, 4)
+        if conflict == "unknown":
+            release.set()
+            assert (await cleaning)["outcome"] == "unknown"
+    _write_slot_overlay(home, enabled=False)
+    registration = agy_projects_dir() / f"{SLOT_A.project_id}.json"
+    if conflict == "identity_mismatch":
+        atomic_write_json(registration, {"id": SLOT_B.project_id, "projectResources": {}})
+        error = "identity differs"
+    else:
+        registration.unlink()
+        error = "slot guard is held" if conflict == "in_progress" else "no confirmed end"
+    owner = agy_slots._owner_path(SLOT_A)
+    before = owner.read_bytes()
+    reg = Registry(home, load_config(home), runtime_context="coordinator")
+    await reg.start()
+    try:
+        with pytest.raises(agy_slots.SlotGuardError, match=error):
+            await reg.dispatch_task(
+                "antigravity", "follow-up", str(home), session_id=first["session_id"], user_requested=True
+            )
+        assert list(reg.tasks) == [first["task_id"]] and len(commands) == 1
+        assert owner.read_bytes() == before
+    finally:
+        release.set()
+        if cleaning is not None:
+            await cleaning
+        await reg.stop()
+
+
+@pytest.mark.parametrize("old_unconfirmed", [False, True])
+def test_reassigned_slot_only_shows_its_own_latest_receipt(enabled_home, old_unconfirmed):
+    home = enabled_home
+    original = SLOT_A
+    replacement = AgySlotSpec(name=original.name, project_id=EXTERNAL_PROJECT_ID)
+    atomic_write_json(
+        agy_projects_dir() / f"{replacement.project_id}.json", {"id": replacement.project_id, "projectResources": {}}
+    )
+    server = SimpleNamespace(
+        home=home,
+        bound_port=5001,
+        agy_now_fn=lambda: FIXED_NOW,
+        agy_projects_dir_override=agy_projects_dir(),
+        agy_cleaner_runner=lambda *a, **kw: CleanerExecutionResult(True),
+    )
+
+    def get_receipts():
+        status, body = _json_req(server, "GET", "/api/agy/slots")
+        assert status == 200 and body["receipt_error"] is None
+        row = next(row for row in body["slots"] if row["name"] == original.name)
+        return row["project_id"], row["last_cleanup"], body["last_cleanup"]
+
+    def inventory(request, **kwargs):
+        candidate = "old-candidate" if request.project_id == original.project_id else "new-candidate"
+        return CleanerExecutionResult(True, checked=1, skipped_unverified=1, eligible_ids=(candidate,))
+
+    def unconfirmed(*args, **kwargs):
+        return CleanerExecutionResult(False, outcome_unknown=True)
+
+    old = run_slot(home, original, unconfirmed if old_unconfirmed else inventory)
+    path = agy_slots.agy_slot_receipts_path(home)
+    history = path.read_bytes()
+    assert get_receipts() == (original.project_id, old, old)
+    config = home / "agents.toml"
+    original_config = config.read_text(encoding="utf-8")
+    config.write_text(original_config.replace(original.project_id, replacement.project_id), encoding="utf-8")
+    assert get_receipts() == (replacement.project_id, None, old)
+    assert path.read_bytes() == history
+    new = run_slot(home, replacement, inventory)
+    assert get_receipts() == (replacement.project_id, new, new)
+    config.write_text(original_config, encoding="utf-8")
+    assert get_receipts() == (original.project_id, old, new)
+    if old_unconfirmed:
+        stored = agy_slots._load_cleanup_receipts(home)
+        assert agy_slots._unconfirmed_operation(stored, original.project_id) == old["operation_id"]
+        with pytest.raises(SlotCleanupConflictError, match="no confirmed end"):
+            run_slot(home, original, unexpected_runner)
+        assert get_receipts() == (original.project_id, old, new)
+        return
+    latest = run_slot(home, original, inventory)
+    assert latest["operation_id"] != old["operation_id"]
+    assert get_receipts() == (original.project_id, latest, latest)
+    config.write_text(original_config.replace(original.project_id, replacement.project_id), encoding="utf-8")
+    assert get_receipts() == (replacement.project_id, new, latest)
+
+
 def test_interrupted_dashboard_keeps_unconfirmed_operation_across_restart(enabled_home):
     home = enabled_home
     spec = releasable_slot(home)

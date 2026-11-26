@@ -302,7 +302,11 @@ class AgyAdapter(Adapter):
             self._prepared_session_id = None
         slot = bound_slot(session, self.agent.agy_slots)
         if slot is not None:
-            require_empty_project(slot, agy_projects_dir())
+            require_empty_project(
+                slot,
+                agy_projects_dir(),
+                resume_id_after_opt_out=None if self.agent.agy_slots.enabled else session.native_session_id,
+            )
         fallbacks = [*self.agent.fallback_commands, *discovered_agy_commands()]
         cmd = resolve_command(self.agent.command, fallbacks)
         model = task.model or session.model

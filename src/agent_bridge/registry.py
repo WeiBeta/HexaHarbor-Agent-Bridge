@@ -783,7 +783,13 @@ class Registry:
             else:
                 raise SlotGuardError("AGY session has no provable project binding")
             for target in sorted(targets, key=lambda s: s.project_id):
-                await admit_slot_turn(admissions, self.home, target, agy_projects_dir())
+                await admit_slot_turn(
+                    admissions,
+                    self.home,
+                    target,
+                    agy_projects_dir(),
+                    resume_id_after_opt_out=None if agent.agy_slots.enabled else prepared.native_session_id,
+                )
         except (OSError, SlotGuardError, asyncio.CancelledError):
             if session.session_id not in self.sessions:
                 self._adapters.pop(session.session_id, None)

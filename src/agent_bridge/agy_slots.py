@@ -37,6 +37,7 @@ log = logging.getLogger(__name__)
 
 CLEANUP_LOCK_TIMEOUT_SEC = 5.0
 WORKER_COMMAND = "python cleanup_worker.py request.json result.json"
+_MISSING_REGISTRATION = "project registration is missing"
 
 
 class SlotConfigError(ValueError):
@@ -300,10 +301,12 @@ def inspect_slot_project_file(
         return False, None, "invalid project UUID"
     path = projects_dir / f"{project_id}.json"
     try:
-        if path.resolve(strict=True) != projects_dir.resolve(strict=True) / path.name or path.stat().st_nlink != 1:
+        try:
+            links = path.lstat().st_nlink
+        except FileNotFoundError:
+            return False, None, _MISSING_REGISTRATION
+        if links != 1 or path.resolve(strict=True) != projects_dir.resolve(strict=True) / path.name:
             return True, None, "project registration is not a direct, unique file"
-    except FileNotFoundError:
-        return False, None, "project registration is missing"
     except (OSError, RuntimeError):
         return None, None, "project registration location is unreadable"
     try:
@@ -320,8 +323,12 @@ def inspect_slot_project_file(
     return True, None, "project has no recognized explicit empty resource declaration"
 
 
-def require_empty_project(spec: AgySlotSpec, projects_dir: Path) -> None:
+def require_empty_project(spec: AgySlotSpec, projects_dir: Path, *, resume_id_after_opt_out: str | None = None) -> None:
     _, _, reason = inspect_slot_project_file(spec.project_id, projects_dir)
+    # This turn routes by the stored conversation ID. The historical project
+    # UUID is still required for exclusion even when its registration is gone.
+    if reason == _MISSING_REGISTRATION and resume_id_after_opt_out and resume_id_after_opt_out.strip():
+        return
     if reason:
         raise SlotGuardError(reason)
 
@@ -435,7 +442,7 @@ def _safe_runner_error(value: str) -> str:
             "cleaner timed out; execution unconfirmed",
             "cleaner completion unconfirmed",
             "cleaner_failed",
-            "project registration is missing",
+            _MISSING_REGISTRATION,
             "project registration is unreadable",
             "project registration location is unreadable",
             "project registration is not a direct, unique file",
@@ -500,6 +507,14 @@ def _load_cleanup_receipts(home: Path) -> dict[str, Any]:
         or (not data["by_slot"] and data["last_cleanup"] is not None)
     ):
         raise SlotGuardError("cleanup receipt store is invalid")
+    prior = data.get("previous_by_project", {})
+    if not isinstance(prior, dict) or not all(
+        agy_slot_worker.is_canonical_uuid(project_id)
+        and isinstance(rows, dict)
+        and all(_valid_stored_receipt(name, row) and row["project_id"] == project_id for name, row in rows.items())
+        for project_id, rows in prior.items()
+    ):
+        raise SlotGuardError("cleanup receipt store is invalid")
     return data
 
 
@@ -507,25 +522,42 @@ def _save_cleanup_receipt(home: Path, slot_name: str, receipt: dict[str, Any]) -
     path = agy_slot_receipts_path(home)
     with file_lock(path.with_suffix(".lock"), timeout_sec=CLEANUP_LOCK_TIMEOUT_SEC):
         store = _load_cleanup_receipts(home)
+        previous = store["by_slot"].get(slot_name)
+        if previous and previous["project_id"] != receipt["project_id"]:
+            # Keep the last receipt for the displaced binding, including any
+            # unresolved operation, while older readers retain the by_slot shape.
+            prior = store.setdefault("previous_by_project", {})
+            prior.setdefault(previous["project_id"], {})[slot_name] = previous
+            prior.get(receipt["project_id"], {}).pop(slot_name, None)
         store["last_cleanup"] = receipt
         store["by_slot"][slot_name] = receipt
         atomic_write_json(path, store)
 
 
 def _unconfirmed_operation(receipts: dict[str, Any], project_id: str) -> str | None:
-    for row in receipts["by_slot"].values():
+    prior = receipts.get("previous_by_project", {}).get(project_id, {})
+    for row in (*receipts["by_slot"].values(), *prior.values()):
         if row["project_id"] == project_id and row.get("outcome") in {"unconfirmed", "unknown"}:
             return row["operation_id"]
     return None
 
 
-async def admit_slot_turn(admissions: AsyncExitStack, home: Path, spec: AgySlotSpec, projects_dir: Path) -> None:
+async def admit_slot_turn(
+    admissions: AsyncExitStack,
+    home: Path,
+    spec: AgySlotSpec,
+    projects_dir: Path,
+    *,
+    resume_id_after_opt_out: str | None = None,
+) -> None:
     # Queuing concurrent turns is legitimate. Retry briefly on a busy admission lock
     # without blocking this Registry's state flusher. An admitted cleanup wins.
     deadline = asyncio.get_running_loop().time() + CLEANUP_LOCK_TIMEOUT_SEC
     while True:
         try:
-            admissions.enter_context(slot_admission(home, spec, projects_dir))
+            admissions.enter_context(
+                slot_admission(home, spec, projects_dir, resume_id_after_opt_out=resume_id_after_opt_out)
+            )
             return
         except FileLockTimeout:
             if _unconfirmed_operation(_load_cleanup_receipts(home), spec.project_id):
@@ -537,12 +569,17 @@ async def admit_slot_turn(admissions: AsyncExitStack, home: Path, spec: AgySlotS
 
 @contextmanager
 def slot_admission(
-    home: Path, spec: AgySlotSpec, projects_dir: Path, *, claim_on_entry: bool = True
+    home: Path,
+    spec: AgySlotSpec,
+    projects_dir: Path,
+    *,
+    claim_on_entry: bool = True,
+    resume_id_after_opt_out: str | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Serialize dispatch admission and cleanup for this registration, across Bridge homes."""
     path = _owner_path(spec)
     with file_lock(path.with_suffix(".lock"), timeout_sec=0):
-        require_empty_project(spec, projects_dir)
+        require_empty_project(spec, projects_dir, resume_id_after_opt_out=resume_id_after_opt_out)
         receipts = _load_cleanup_receipts(home)
         if _unconfirmed_operation(receipts, spec.project_id):
             raise SlotGuardError("previous cleanup has no confirmed end; inspect its receipt before reuse")
@@ -672,6 +709,9 @@ def describe_slots(
                 guard_error = str(exc)
         if guard_error:
             status = "unknown"
+        last_cleanup = receipts["by_slot"].get(spec.name)
+        if last_cleanup is None or last_cleanup["project_id"] != spec.project_id:
+            last_cleanup = receipts.get("previous_by_project", {}).get(spec.project_id, {}).get(spec.name)
         slot_rows.append(
             {
                 "name": spec.name,
@@ -688,7 +728,7 @@ def describe_slots(
                 "blocked_sessions": blocked,
                 "project_file_exists": exists,
                 "project_is_empty": is_empty,
-                "last_cleanup": _display_receipt(home, receipts["by_slot"].get(spec.name)),
+                "last_cleanup": _display_receipt(home, last_cleanup),
             }
         )
 
