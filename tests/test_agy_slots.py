@@ -1287,7 +1287,7 @@ def test_production_cleanup_http_process_guard_and_service_receipts(enabled_home
     home = enabled_home
     spec = releasable_slot(home)
     cli_names = {501: r"C:\fixtures\AGY.EXE", 503: "agy.exe"}
-    names = {502: "Antigravity.exe", 504: "agy.exe.helper", 505: "not-agy.exe", 506: None}
+    names = {502: "Antigravity.exe", 504: "agy.exe.helper", 505: "not-agy.exe", 506: None, 508: ""}
     if scenario in {"cli", "preview", "name_denied"}:
         names.update(cli_names)
     if scenario == "name_denied":

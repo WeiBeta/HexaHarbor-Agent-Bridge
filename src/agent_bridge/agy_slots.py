@@ -1087,9 +1087,7 @@ def _running_agy_cli_processes() -> tuple[list[dict[str, Any]], bool]:
         except (OSError, psutil.Error):
             complete = False
             continue
-        if not name:
-            complete = False
-            continue
+        # Windows system entries can successfully report an empty executable name.
         basename = ntpath.basename(name)
         if basename.casefold() == "agy.exe":
             matches.append({"pid": pid, "name": basename})
