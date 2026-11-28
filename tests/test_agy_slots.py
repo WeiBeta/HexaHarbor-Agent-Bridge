@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
+import sqlite3
 import subprocess
 import threading
 import uuid
@@ -120,6 +122,7 @@ def isolated_profile(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "agent_bridge.agy_slots.build_worker_env",
         lambda *a, **kw: {
+            "USERPROFILE": str(profile),
             "ANTIGRAVITY_LS_ADDRESS": "fixture-address",
             "antigravity_csrf_token": "fixture-marker",
             "KEEP_SYNTHETIC_SETTING": "yes",
@@ -149,6 +152,30 @@ def _json_req(server, method, path, *, csrf=None, payload=None, extra_headers=No
     getattr(handler, f"do_{method}")()
     assert len(responses) == 1
     return responses[0]
+
+
+def _synthetic_cli_profile():
+    profile = Path.home() / ".gemini" / "antigravity-cli"
+    (profile / "conversations").mkdir(parents=True)
+    (profile / "brain").mkdir()
+    db = sqlite3.connect(profile / "conversation_summaries.db")
+    try:
+        db.execute("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY)")
+        db.commit()
+    finally:
+        db.close()
+    return profile
+
+
+def _batch_fields(request):
+    return {
+        "cutoff_utc": request["cutoff_utc"],
+        "batch_number": request["batch_number"],
+        "self_conversation_id": "fixture-control",
+        "http_200_ids": [],
+        "has_more": False,
+        "worker_elapsed_ms": 3,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -588,7 +615,11 @@ def test_worker_protocol_filters_whitelist_self_running_recent_and_redacts_token
     def list_page(address, marker, method, body, **kw):
         if method == "DeleteConversation":
             delete_calls.append(body["conversationId"])
-            return {"ok": False, "rejected": True} if body["conversationId"] == "conv-old-fail" else {"ok": True}
+            return (
+                {"ok": False, "rejected": True}
+                if body["conversationId"] == "conv-old-fail"
+                else {"ok": True, "http_status": 200}
+            )
         assert method == "ListConversations"
         list_calls.append(body)
         index = int(body.get("pageToken", 0))
@@ -683,6 +714,7 @@ def test_tier3_cleaner_uses_scheme_a_and_minimal_allowlist(tmp_path: Path, monke
             json.dumps(
                 {
                     **{k: captured["request"][k] for k in ("operation_id", "slot", "project_id", "dry_run")},
+                    **_batch_fields(captured["request"]),
                     "skipped_unverified": 0,
                     "rejected_delete_ids": [],
                     "unconfirmed_delete_ids": [],
@@ -1331,7 +1363,8 @@ def test_production_cleanup_http_process_guard_and_service_receipts(enabled_home
         ),
     )
     monkeypatch.setattr(agy_slots, "resolve_command", lambda *args: ["fixture-agy"])
-    ids = ["old-one", "old-two", "old-three"]
+    ids = [str(uuid.uuid4()) for _ in range(3)]
+    _synthetic_cli_profile()
 
     def service_response(method, payload):
         if method == "ListConversations":
@@ -1411,7 +1444,7 @@ def test_production_cleanup_http_process_guard_and_service_receipts(enabled_home
         csrf=server.csrf_token,
         payload={"slot": spec.name, "dry_run": dry_run, "confirm": spec.name},
     )
-    assert len(scans) == int(not dry_run)
+    assert len(scans) == int(not dry_run) + int(bool(result.get("http_200_ids")) and agy_slots.sys.platform == "win32")
     if scenario in {"cli", "list_failure", "name_denied"}:
         assert status == 409 and result["outcome"] == "not_started" and not launches and not calls
         assert not result["receipt_saved"] and result["deleted"] == 0
@@ -1462,11 +1495,18 @@ def test_production_cleanup_http_process_guard_and_service_receipts(enabled_home
         ("errors", ["unstructured-fixture-marker"]),
         ("would_delete", 0),
         ("deleted_ids", ["unexpected"]),
+        ("batch_number", 2),
+        ("cutoff_utc", "1999-01-01T00:00:00+00:00"),
+        ("http_200_ids", ["unexpected"]),
+        ("self_conversation_id", "fixture-id"),
+        ("has_more", True),
+        ("worker_elapsed_ms", -1),
     ],
 )
 def test_worker_receipt_must_match_operation_and_account_for_counts(field, value):
     request = CleanerRequest(SLOT_A.name, SLOT_A.project_id, (SLOT_A.project_id,), FIXED_NOW, True)
     raw = {
+        **_batch_fields(request.identity),
         "operation_id": request.operation_id,
         "slot": SLOT_A.name,
         "project_id": SLOT_A.project_id,
@@ -2057,6 +2097,7 @@ def test_valid_worker_counts_survive_unconfirmed_process_timeout(enabled_home, m
                 Path(cwd) / "result.json",
                 {
                     **raw,
+                    **_batch_fields(request),
                     "ok": True,
                     "checked": 1,
                     "deleted": 0,
@@ -2257,3 +2298,399 @@ def test_malformed_persisted_operation_is_visible_without_echoing_details(enable
     assert desc["receipt_error"] and "invalid-fixture-value" not in json.dumps(desc)
     with pytest.raises(SlotCleanupConflictError):
         run_slot(home, spec, unexpected_runner)
+
+
+@pytest.mark.parametrize(
+    "scenario,count,expected_calls,expected_batches,stop",
+    [
+        ("windows", 53, 53, 2, "completed"),
+        ("cap", 501, 500, 10, "batch_limit"),
+        ("reject", 87, 50, 1, "no_progress"),
+        ("mixed", 53, 53, 2, "worker_failed"),
+        ("changed", 53, 50, 2, "no_progress"),
+        ("busy", 53, 50, 1, "admission_changed"),
+        ("midnight", 53, 50, 1, "admission_changed"),
+        ("unknown", 53, 51, 2, "unknown"),
+        ("late", 53, 50, 2, "unknown"),
+        ("preview", 84, 0, 1, "preview"),
+    ],
+)
+def test_bounded_cleanup_through_production_runner(
+    enabled_home, monkeypatch, scenario, count, expected_calls, expected_batches, stop
+):
+    home = enabled_home
+    spec = releasable_slot(home)
+    windows = scenario in {"windows", "preview"}
+    monkeypatch.setattr(agy_slots, "_WINDOWS_RESIDUALS", windows)
+    profile = _synthetic_cli_profile()
+    ids = [str(uuid.UUID(int=i + 1)) for i in range(count)]
+    # ids[0] represents an old, independently eligible control conversation.
+    artifact = profile / "conversations" / f"{ids[0]}.db"
+    artifact.write_bytes(b"fixture old conversation")
+    new_controls, calls, requests, workspaces = [], [], [], []
+    monkeypatch.setattr(agy_slots, "resolve_command", lambda *args: ["fixture-agy"])
+
+    def processes():
+        if scenario == "busy" and calls:
+            return [{"pid": 17, "name": "agy.exe"}], True
+        return [], True
+
+    monkeypatch.setattr(agy_slots, "_running_agy_cli_processes", processes)
+    if scenario == "midnight":
+        schedule = agy_slots.compute_slot_schedule
+        cfg = load_config(home).get("antigravity").agy_slots
+        active_day = next(
+            t for i in range(1, 4) if select_active_slot(cfg, now=(t := FIXED_NOW + timedelta(days=i))) == spec
+        )
+        monkeypatch.setattr(
+            agy_slots, "compute_slot_schedule", lambda cfg, now=None: schedule(cfg, now=active_day if calls else now)
+        )
+
+    def rpc(address, token, method, payload, **kwargs):
+        if method == "ListConversations":
+            # The service can repeat previously acknowledged items and all controls on every listing.
+            # The first inventory freezes membership; each batch still rechecks age and activity.
+            return {
+                "ok": True,
+                "body": {
+                    "conversations": [
+                        {
+                            "id": cid,
+                            "metadata": {"projectId": spec.project_id},
+                            "state": {
+                                "runState": "RUN_STATE_RUNNING"
+                                if scenario == "changed" and len(requests) == 2
+                                else "RUN_STATE_IDLE",
+                                "updateTime": "2000-01-01T00:00:00Z",
+                            },
+                        }
+                        for cid in [*ids, *new_controls]
+                    ]
+                },
+            }
+        assert method == "DeleteConversation"
+        cid = payload["conversationId"]
+        assert cid in ids and cid not in calls and cid not in new_controls
+        calls.append(cid)
+        if scenario == "reject" or (scenario == "mixed" and len(calls) == 2):
+            return {"ok": False, "rejected": True}
+        if scenario == "unknown" and len(requests) == 2:
+            return {"ok": False}
+        return {"ok": True, "http_status": 200}
+
+    monkeypatch.setattr(agy_slot_worker, "_call_rpc", rpc)
+
+    def launch(argv, *, cwd, **kwargs):
+        directory = Path(cwd)
+        req = json.loads((directory / "request.json").read_text())
+        requests.append(req)
+        workspaces.append(directory)
+        number = len(requests)
+        assert req["batch_number"] == number and req["project_id"] == spec.project_id
+        assert req["operation_id"] == requests[0]["operation_id"] and req["cutoff_utc"] == requests[0]["cutoff_utc"]
+        assert req["target_ids"] == (None if number == 1 else ids[(number - 1) * 50 :])
+        if scenario == "windows" and number > 1:
+            assert not artifact.exists()
+        new_controls.append(str(uuid.uuid4()))
+        if scenario != "late" or number == 1:
+            result = run_cleanup_request(
+                req,
+                env={
+                    "ANTIGRAVITY_CSRF_TOKEN": "synth-marker",
+                    "ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:41001",
+                    "ANTIGRAVITY_CONVERSATION_ID": new_controls[-1],
+                },
+            )
+            atomic_write_json(directory / "result.json", result)
+        return SimpleNamespace(communicate=lambda **kw: (None, b""), returncode=0)
+
+    monkeypatch.setattr(agy_slots.subprocess, "Popen", launch)
+    result = run_slot(home, spec, None, dry_run=scenario == "preview")
+    assert result["receipt_saved"] and result["counts_confirmed"]
+    assert result["stop_reason"] == stop and len(result["batches"]) == len(set(workspaces)) == expected_batches
+    assert len(calls) == expected_calls and all(
+        len(b["http_200_ids"] + b["unconfirmed_delete_ids"] + b["rejected_delete_ids"]) <= 50 for b in result["batches"]
+    )
+    assert result["http_200_ids"] == result["deleted_ids"]
+    assert result["worker_elapsed_ms"] == sum(b["worker_elapsed_ms"] or 0 for b in result["batches"])
+    assert not set(new_controls).intersection(result["eligible_ids"])
+    assert result["eligible_ids"] == ids and result["checked"] == count + 1
+    assert overview(home)["last_cleanup"] == result
+    if scenario == "preview":
+        assert result["would_delete_ids"] == ids and result["deleted"] == result["windows_residual_reclaimed"] == 0
+        assert artifact.read_bytes() == b"fixture old conversation"
+        assert not (Path.home() / ".agent-bridge" / "agy_slot_quarantine").exists()
+    elif scenario == "windows":
+        assert result["ok"] and result["has_more"] is False and result["remaining_ids"] == []
+        assert (
+            result["native_removed"] == 52
+            and result["windows_residual_reclaimed"] == 1
+            and result["residual_locked"] == 0
+        )
+        assert result["batches"][0]["has_more"] and not result["batches"][1]["has_more"]
+    else:
+        assert artifact.read_bytes() == b"fixture old conversation"  # The non-Windows path never opens the profile.
+        assert all(not b["residuals"] for b in result["batches"]) and not result["ok"]
+        if scenario == "cap":
+            assert result["outcome"] == "partial" and result["remaining_ids"] == ids[500:]
+        if scenario == "late":
+            assert result["outcome"] == "unknown" and result["deleted_ids"] == ids[:50]
+            assert result["has_more"] is None and result["pending_batch_number"] == 2
+            raw = run_cleanup_request(
+                requests[1],
+                env={
+                    "ANTIGRAVITY_CSRF_TOKEN": "synth-marker",
+                    "ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:41001",
+                    "ANTIGRAVITY_CONVERSATION_ID": new_controls[-1],
+                },
+            )
+            path = workspaces[1] / "result.json"
+            atomic_write_json(path, {**raw, "batch_number": 1})
+            assert overview(home)["last_cleanup"]["deleted_ids"] == ids[:50]
+            atomic_write_json(path, raw)
+            late = overview(home)["last_cleanup"]
+            assert late["late_worker_receipt"] and late["outcome"] == "unknown" and late["deleted_ids"] == ids
+            assert not late["batches"][1]["process_exited"] and len(requests) == 2
+            with pytest.raises(SlotCleanupConflictError):
+                run_slot(home, spec, unexpected_runner)
+
+
+def _verified_http_batch():
+    cid = str(uuid.uuid4())
+    req = CleanerRequest(SLOT_A.name, SLOT_A.project_id, (SLOT_A.project_id,), FIXED_NOW, False)
+    raw = {
+        **req.identity,
+        **_batch_fields(req.identity),
+        "ok": True,
+        "checked": 1,
+        "eligible_ids": [cid],
+        "deleted_ids": [cid],
+        "deleted": 1,
+        "http_200_ids": [cid],
+        "would_delete": 0,
+        "would_delete_ids": [],
+        "rejected_delete_ids": [],
+        "unconfirmed_delete_ids": [],
+        "skipped_recent": 0,
+        "skipped_running": 0,
+        "skipped_unverified": 0,
+        "errors": [],
+    }
+    res = agy_slots.parse_worker_receipt(raw, req.identity)
+    assert res.worker_receipt_valid
+    return req, replace(res, process_exited=True, profile_matches=True), cid
+
+
+@pytest.mark.parametrize(
+    "gate, reason",
+    [
+        ("preview", None),
+        ("other_os", None),
+        ("no_http", None),
+        ("no_receipt", "receipt_unverified"),
+        ("wrong_project", "receipt_unverified"),
+        ("wrong_batch", "receipt_unverified"),
+        ("no_self", "receipt_unverified"),
+        ("self", "receipt_unverified"),
+        ("not_eligible", "receipt_unverified"),
+        ("opaque_id", "receipt_unverified"),
+        ("process_still_running", "process_exit_unconfirmed"),
+        ("profile_mismatch", "cli_profile_unverified"),
+        ("cli", "agy_cli_running"),
+        ("scan", "agy_cli_scan_unavailable"),
+        ("summary_present", "summary_present"),
+        ("summary_missing", "summary_unavailable"),
+        ("summary_locked", "summary_check_failed"),
+        ("existing_quarantine", "quarantine_unavailable"),
+    ],
+)
+def test_windows_residual_requires_each_gate(monkeypatch, gate, reason):
+    profile = _synthetic_cli_profile()
+    req, res, cid = _verified_http_batch()
+    monkeypatch.setattr(agy_slots, "_WINDOWS_RESIDUALS", gate != "other_os")
+    db = sqlite3.connect(profile / "conversation_summaries.db")
+    source = profile / "conversations" / f"{cid}.db"
+    source.write_bytes(b"fixture payload")
+    root = Path.home() / ".agent-bridge" / "agy_slot_quarantine" / req.operation_id
+    try:
+        if gate == "preview":
+            req = replace(req, dry_run=True)
+        elif gate == "no_http":
+            res = replace(res, http_200_ids=())
+        elif gate == "no_receipt":
+            res = replace(res, worker_receipt_valid=False)
+        elif gate == "wrong_project":
+            req = replace(req, project_id=SLOT_B.project_id)
+        elif gate == "wrong_batch":
+            req = replace(req, batch_number=2)
+        elif gate == "no_self":
+            res = replace(res, self_conversation_id=None)
+        elif gate == "self":
+            res = replace(res, self_conversation_id=cid.upper())
+        elif gate == "not_eligible":
+            res = replace(res, eligible_ids=())
+        elif gate == "opaque_id":
+            res = replace(res, eligible_ids=("not-a-uuid",), http_200_ids=("not-a-uuid",))
+        elif gate == "process_still_running":
+            res = replace(res, process_exited=False)
+        elif gate == "profile_mismatch":
+            res = replace(res, profile_matches=False)
+        elif gate in ("cli", "scan"):
+            monkeypatch.setattr(
+                agy_slots,
+                "_running_agy_cli_processes",
+                lambda: ([{"pid": 123, "name": "AGY.EXE"}], True) if gate == "cli" else ([], False),
+            )
+        elif gate == "summary_present":
+            db.execute("INSERT INTO conversation_summaries VALUES (?)", (cid,))
+            db.commit()
+        elif gate == "summary_missing":
+            db.close()
+            (profile / "conversation_summaries.db").unlink()
+        elif gate == "summary_locked":
+            db.execute("BEGIN EXCLUSIVE")
+        elif gate == "existing_quarantine":
+            occupied = root / "batch-01" / cid
+            agy_slots._extended_path(occupied).mkdir(parents=True)
+            agy_slots._extended_path(occupied / source.name).write_bytes(b"prior fixture")
+        rows = agy_slots._windows_residuals(req, res)
+        if reason:
+            (item,) = rows
+            assert item["status"] == "residual_locked" and item["reason"] == reason and not item["moved"]
+        else:
+            assert rows == []
+        assert source.read_bytes() == b"fixture payload"
+        if gate == "existing_quarantine":
+            assert agy_slots._extended_path(occupied / source.name).read_bytes() == b"prior fixture"
+        else:
+            assert not root.exists()
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("interrupt_move", [False, True])
+def test_windows_quarantine_moves_only_owned_items_and_reports_partial(monkeypatch, interrupt_move):
+    monkeypatch.setattr(agy_slots, "_WINDOWS_RESIDUALS", True)
+    profile = _synthetic_cli_profile()
+    req, res, cid = _verified_http_batch()
+    data = profile / "conversations"
+    for suffix in (".db", ".db-wal", ".db-shm"):
+        (data / (cid + suffix)).write_bytes(suffix.encode())
+    unrelated = data / f"{uuid.uuid4()}.db"
+    unrelated.write_bytes(b"keep")
+    deep = Path(*(["nested-synthetic-data-12345"] * 10), "fixture.txt")
+    original = profile / "brain" / cid / deep
+    agy_slots._extended_path(original.parent).mkdir(parents=True)
+    agy_slots._extended_path(original).write_text("deep fixture", encoding="utf-8")
+    destination = Path.home() / ".agent-bridge" / "agy_slot_quarantine" / req.operation_id / "batch-01" / cid
+    renames = []
+    rename = agy_slots._move_residual
+
+    def rename_fixture(src, dst, before, *, directory):
+        renames.append(Path(src).name)
+        if interrupt_move and Path(src).name.endswith("-wal"):
+            raise PermissionError("fixture sharing violation")
+        return rename(src, dst, before, directory=directory)
+
+    monkeypatch.setattr(agy_slots, "_move_residual", rename_fixture)
+    (item,) = agy_slots._windows_residuals(req, res)
+    assert item["id"] == cid and unrelated.read_bytes() == b"keep"
+    assert agy_slots._extended_path(destination / (cid + ".db")).read_bytes() == b".db"
+    assert not (data / (cid + ".db")).exists()
+    if interrupt_move:
+        assert item["status"] == "residual_locked" and item["moved"] == ["db"]
+        assert item["reason"] == "move_failed" and item["remaining"] == ["wal", "shm", "brain"]
+        assert renames == [cid + ".db", cid + ".db-wal"]
+        assert agy_slots._extended_path(original).read_text(encoding="utf-8") == "deep fixture"
+    else:
+        assert item["status"] == "windows_residual_reclaimed" and item["remaining"] == []
+        assert renames == [cid + ".db", cid + ".db-wal", cid + ".db-shm", cid]
+        assert agy_slots._extended_path(destination / cid / deep).read_text(encoding="utf-8") == "deep fixture"
+    # Reusing an occupied CID quarantine cannot overwrite it or claim a native removal.
+    (again,) = agy_slots._windows_residuals(req, res)
+    assert again["status"] == "residual_locked" and not again["moved"]
+
+
+@pytest.mark.parametrize("where", ["source_parent", "brain", "quarantine"])
+def test_quarantine_rejects_indirect_roots_and_entries(monkeypatch, tmp_path, where):
+    monkeypatch.setattr(agy_slots, "_WINDOWS_RESIDUALS", True)
+    profile = _synthetic_cli_profile()
+    req, res, cid = _verified_http_batch()
+    target = tmp_path / "separate-fixture"
+    target.mkdir()
+    (target / (cid + ".db")).write_bytes(b"other fixture")
+    source_db = profile / "conversations" / (cid + ".db")
+    if where == "source_parent":
+        link = source_db.parent
+        link.rmdir()
+    else:
+        source_db.write_bytes(b"local fixture")
+        link = profile / "brain" / cid if where == "brain" else Path.home() / ".agent-bridge" / "agy_slot_quarantine"
+        link.parent.mkdir(exist_ok=True)
+    if os.name == "nt":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        link.symlink_to(target, target_is_directory=True)
+    try:
+        (item,) = agy_slots._windows_residuals(req, res)
+        assert item["status"] == "residual_locked" and item["moved"] == []
+        assert (target / (cid + ".db")).read_bytes() == b"other fixture"
+        assert list(target.iterdir()) == [target / (cid + ".db")]
+    finally:
+        if os.name == "nt":
+            link.rmdir()
+        else:
+            link.unlink()
+
+
+def test_native_removal_uses_readonly_summary_even_if_artifact_roots_are_absent(monkeypatch):
+    monkeypatch.setattr(agy_slots, "_WINDOWS_RESIDUALS", True)
+    profile = _synthetic_cli_profile()
+    req, res, cid = _verified_http_batch()
+    (profile / "conversations").rmdir()
+    (profile / "brain").rmdir()
+    connect = sqlite3.connect
+    queries = []
+
+    def connect_readonly(database, **kwargs):
+        assert kwargs["uri"] is True and database == (profile / "conversation_summaries.db").as_uri() + "?mode=ro"
+        db = connect(database, **kwargs)
+
+        def execute(sql, params):
+            queries.append((sql, params))
+            return db.execute(sql, params)
+
+        return SimpleNamespace(execute=execute, close=db.close)
+
+    monkeypatch.setattr(agy_slots.sqlite3, "connect", connect_readonly)
+    (row,) = agy_slots._windows_residuals(req, res)
+    assert queries == [("SELECT COUNT(*) FROM conversation_summaries WHERE conversation_id = ?", (cid,))]
+    assert row == {"id": cid, "status": "native_removed", "moved": [], "remaining": [], "reason": None}
+    assert not (profile / "brain").exists() and not (profile / "conversations").exists()
+    assert not (Path.home() / ".agent-bridge" / "agy_slot_quarantine").exists()
+
+
+def test_residual_stays_in_place_when_destination_volume_differs(monkeypatch):
+    monkeypatch.setattr(agy_slots, "_WINDOWS_RESIDUALS", True)
+    profile = _synthetic_cli_profile()
+    req, res, cid = _verified_http_batch()
+    source = profile / "conversations" / (cid + ".db")
+    source.write_bytes(b"original fixture")
+    destination = Path.home() / ".agent-bridge" / "agy_slot_quarantine" / req.operation_id / "batch-01" / cid
+    inspect = agy_slots._checked_entry
+
+    def fake_volume(path, **kwargs):
+        info = inspect(path, **kwargs)
+        if info is not None and path == destination:
+            return SimpleNamespace(st_dev=info.st_dev + 1, st_ino=info.st_ino)
+        return info
+
+    monkeypatch.setattr(agy_slots, "_checked_entry", fake_volume)
+    monkeypatch.setattr(agy_slots, "_move_residual", unexpected_runner)
+    (row,) = agy_slots._windows_residuals(req, res)
+    assert row["status"] == "residual_locked" and row["moved"] == [] and row["remaining"] == ["db"]
+    assert (
+        source.read_bytes() == b"original fixture" and not agy_slots._extended_path(destination / source.name).exists()
+    )

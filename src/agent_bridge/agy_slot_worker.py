@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -16,6 +17,8 @@ from pathlib import Path
 from typing import Any
 
 MAX_LIST_PAGES = 50
+MAX_DELETES_PER_BATCH = 50
+MAX_CLEANUP_BATCHES = 10
 LIST_PAGE_SIZE = 100
 RPC_TIMEOUT_SEC = 15
 
@@ -121,7 +124,11 @@ def _call_rpc(
             return {"ok": False}
         raw = resp.read()
         body = json.loads(raw) if raw else {}
-        return {"ok": isinstance(body, dict) and "error" not in body and "code" not in body, "body": body}
+        return {
+            "ok": isinstance(body, dict) and "error" not in body and "code" not in body,
+            "http_status": resp.status,
+            "body": body,
+        }
     except (OSError, ValueError, http.client.HTTPException):
         return {"ok": False}
     finally:
@@ -136,11 +143,14 @@ def run_cleanup_request(
 ) -> dict[str, Any]:
     """List the target, then perform at most one requested deletion per eligible ID."""
     source_env = os.environ if env is None else env
+    started = time.monotonic_ns()
     slot = request.get("slot")
     project_id = request.get("project_id")
     allowed = request.get("allowed_project_ids")
     dry_run = request.get("dry_run")
     operation_id = request.get("operation_id")
+    batch_number = request.get("batch_number", 1)
+    target_ids = request.get("target_ids")
     cutoff = parse_rfc3339(request.get("cutoff_utc"))
     result: dict[str, Any] = {
         "ok": False,
@@ -148,6 +158,11 @@ def run_cleanup_request(
         "slot": slot if isinstance(slot, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", slot) else None,
         "project_id": project_id if is_canonical_uuid(project_id) else None,
         "dry_run": dry_run if type(dry_run) is bool else None,
+        "batch_number": batch_number if type(batch_number) is int else None,
+        "cutoff_utc": cutoff.astimezone(UTC).isoformat() if cutoff is not None else None,
+        "self_conversation_id": None,
+        "http_200_ids": [],
+        "has_more": False,
         "checked": 0,
         "deleted": 0,
         "would_delete": 0,
@@ -167,6 +182,9 @@ def run_cleanup_request(
 
     def finish() -> dict[str, Any]:
         result["eligible_ids"] = list(eligible)
+        result["worker_elapsed_ms"] = (time.monotonic_ns() - started) // 1_000_000
+        attempted = sum(len(result[k]) for k in ("http_200_ids", "rejected_delete_ids", "unconfirmed_delete_ids"))
+        result["has_more"] = dry_run is False and len(eligible) > attempted
         if dry_run is True:
             result["would_delete_ids"] = list(eligible)
             result["would_delete"] = len(eligible)
@@ -180,6 +198,19 @@ def run_cleanup_request(
         return fail("invalid_mode")
     if not result["operation_id"] or not result["slot"]:
         return fail("invalid_request")
+    if (
+        type(batch_number) is not int
+        or not 1 <= batch_number <= MAX_CLEANUP_BATCHES
+        or (batch_number == 1) != (target_ids is None)
+    ):
+        return fail("invalid_request")
+    if target_ids is not None and (
+        not isinstance(target_ids, list)
+        or not all(isinstance(cid, str) and _ID_RE.fullmatch(cid) for cid in target_ids)
+        or len(set(target_ids)) != len(target_ids)
+    ):
+        return fail("invalid_request")
+    targets = set(target_ids) if target_ids is not None else None
     if not result["project_id"] or not isinstance(allowed, list) or allowed != [project_id]:
         return fail("invalid_whitelist")
     if cutoff is None:
@@ -188,8 +219,9 @@ def run_cleanup_request(
     own_id = source_env.get("ANTIGRAVITY_CONVERSATION_ID", "").strip()
     if not token:
         return fail("missing_credentials")
-    if not _ID_RE.fullmatch(own_id):
+    if not _ID_RE.fullmatch(own_id) or token in own_id:
         return fail("missing_identity")
+    result["self_conversation_id"] = own_id
     try:
         address = validate_loopback_address(source_env.get("ANTIGRAVITY_LS_ADDRESS", ""))
     except ValueError:
@@ -215,6 +247,8 @@ def run_cleanup_request(
             cid = item.get("id")
             if not isinstance(cid, str) or not _ID_RE.fullmatch(cid) or token in cid:
                 return fail("invalid_list")
+            if targets is not None and cid not in targets:
+                continue
             if cid in seen_ids and cid not in eligible:
                 continue
             if cid not in seen_ids:
@@ -226,7 +260,11 @@ def run_cleanup_request(
                 result["skipped_unverified"] += 1
                 if "unexpected_project" not in result["errors"]:
                     result["errors"].append("unexpected_project")
-            elif cid == own_id or not isinstance(state, dict) or state.get("runState") != "RUN_STATE_IDLE":
+            elif (
+                cid.casefold() == own_id.casefold()
+                or not isinstance(state, dict)
+                or state.get("runState") != "RUN_STATE_IDLE"
+            ):
                 result["skipped_running"] += 1
             elif (updated := parse_rfc3339(state.get("updateTime"))) is None or updated >= cutoff:
                 result["skipped_recent"] += 1
@@ -245,9 +283,10 @@ def run_cleanup_request(
 
     # Finish paging before mutating the collection used by the page tokens.
     if not dry_run:
-        for cid in eligible:
+        for cid in list(eligible)[:MAX_DELETES_PER_BATCH]:
             reply = _call_rpc(address, token, "DeleteConversation", {"conversationId": cid}, timeout_sec=timeout_sec)
-            if reply.get("ok") is True:
+            if reply.get("ok") is True and reply.get("http_status") == 200:
+                result["http_200_ids"].append(cid)
                 result["deleted_ids"].append(cid)
                 result["deleted"] += 1
             elif reply.get("rejected") is True:

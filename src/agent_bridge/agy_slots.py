@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import ntpath
 import os
 import re
 import shutil
+import sqlite3
+import stat
 import subprocess
 import sys
 import uuid
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import AsyncExitStack, contextmanager, suppress
-from dataclasses import asdict, dataclass, field, replace
+from contextlib import AsyncExitStack, ExitStack, closing, contextmanager, suppress
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol, TypeGuard
@@ -39,6 +42,8 @@ from agent_bridge.worker_env import build_worker_env, enforce_env_deny
 log = logging.getLogger(__name__)
 
 CLEANUP_LOCK_TIMEOUT_SEC = 5.0
+MAX_CLEANUP_BATCHES = agy_slot_worker.MAX_CLEANUP_BATCHES
+_WINDOWS_RESIDUALS = sys.platform == "win32"
 WORKER_COMMAND = "python cleanup_worker.py request.json result.json"
 _MISSING_REGISTRATION = "project registration is missing"
 
@@ -74,6 +79,8 @@ class CleanerRequest:
     cutoff_utc: datetime
     dry_run: bool
     operation_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    batch_number: int = 1
+    target_ids: tuple[str, ...] | None = None
 
     @property
     def identity(self) -> dict[str, Any]:
@@ -82,6 +89,8 @@ class CleanerRequest:
             "slot": self.slot,
             "project_id": self.project_id,
             "dry_run": self.dry_run,
+            "batch_number": self.batch_number,
+            "cutoff_utc": self.cutoff_utc.astimezone(UTC).isoformat(),
         }
 
 
@@ -102,6 +111,14 @@ class CleanerExecutionResult:
     worker_receipt_valid: bool = False
     rejected_delete_ids: tuple[str, ...] = ()
     unconfirmed_delete_ids: tuple[str, ...] = ()
+    batch_number: int | None = None
+    self_conversation_id: str | None = None
+    http_200_ids: tuple[str, ...] = ()
+    has_more: bool = False
+    worker_elapsed_ms: int | None = None
+    process_exited: bool = False
+    profile_matches: bool = False
+    verified_identity: tuple[str, str, str, bool, int] | None = None
 
 
 class CleanerRunner(Protocol):
@@ -389,13 +406,41 @@ def _display_receipt(home: Path, row: dict[str, Any] | None) -> dict[str, Any] |
             *_COUNT_FIELDS,
         )
         public = {key: row[key] for key in fields}
-        for key in ("rejected_delete_ids", "unconfirmed_delete_ids"):
+        for key in ("rejected_delete_ids", "unconfirmed_delete_ids", *_BATCH_FIELDS):
             if key in row:
                 public[key] = row[key]
         public["blocked_sessions"] = [
             {k: item.get(k) for k in ("session_id", "native_session_id", "proc_state", "last_active_at", "reason")}
             for item in row["blocked_sessions"]
         ]
+        if "batches" in row:
+            number = row["pending_batch_number"]
+            if row["outcome"] not in {"unconfirmed", "unknown"} or number is None:
+                return public
+            batches = row["batches"]
+            if len(batches) == number and batches[-1]["worker_receipt_valid"]:
+                return public
+            targets = row["remaining_ids"] if number > 1 else None
+            expected = {**row, "batch_number": number, "target_ids": targets}
+            path = _batch_workspace(home, row["operation_id"], number) / "result.json"
+            result = _read_worker_receipt(path, expected, "no terminal worker receipt")
+            if not result.worker_receipt_valid:
+                return public
+            request = CleanerRequest(
+                row["slot"],
+                row["project_id"],
+                (row["project_id"],),
+                datetime.fromisoformat(row["cutoff_utc"]),
+                row["dry_run"],
+                row["operation_id"],
+                number,
+            )
+            view = copy.deepcopy(public)
+            view["batches"] = [*view["batches"][: number - 1], _batch_record(request, result, late=True)]
+            _summarize_batches(view)
+            view["errors"] = list(dict.fromkeys([*public["errors"], *view["errors"]]))
+            view["late_worker_receipt"] = True
+            return view
         if row["outcome"] in {"unconfirmed", "unknown"} and not row["counts_confirmed"]:
             # A worker may finish after its caller timed out or the dashboard stopped.
             # Only display its validated evidence. The CLI process may still be active.
@@ -436,6 +481,32 @@ def _display_receipt(home: Path, row: dict[str, Any] | None) -> dict[str, Any] |
 
 
 _COUNT_FIELDS = ("checked", "deleted", "would_delete", "skipped_running", "skipped_recent", "skipped_unverified")
+_ID_FIELDS = ("eligible_ids", "deleted_ids", "would_delete_ids", "rejected_delete_ids", "unconfirmed_delete_ids")
+_BATCH_FIELDS = (
+    "cutoff_utc",
+    "batches",
+    "pending_batch_number",
+    "stop_reason",
+    "http_200_ids",
+    "remaining_ids",
+    "has_more",
+    "worker_elapsed_ms",
+    "native_removed",
+    "windows_residual_reclaimed",
+    "residual_locked",
+)
+_BATCH_STOPS = {
+    "completed",
+    "preview",
+    "unknown",
+    "worker_failed",
+    "no_progress",
+    "targets_changed",
+    "residual_locked",
+    "batch_limit",
+    "admission_changed",
+    "checkpoint_failed",
+}
 
 
 def _safe_runner_error(value: str) -> str:
@@ -452,6 +523,7 @@ def _safe_runner_error(value: str) -> str:
             "cleaner timed out; execution unconfirmed",
             "cleaner completion unconfirmed",
             "cleaner_failed",
+            *_BATCH_STOPS,
             "conditional_delete_unavailable",  # historical inventory-only receipts
             _MISSING_REGISTRATION,
             "project registration is unreadable",
@@ -512,9 +584,16 @@ def _valid_cleanup_counts(raw: dict[str, Any], *, legacy_preview: bool) -> bool:
         or len(unconfirmed) > 1
         or bool(rejected) != ("delete_rejected" in errors)
         or bool(unconfirmed) != ("delete_unconfirmed" in errors)
-        or (raw["ok"] and deleted != eligible)
+        or (raw["ok"] and not raw.get("has_more") and deleted != eligible and "batches" not in raw)
     ):
         return False
+    if "batches" in raw:
+        remaining = raw.get("remaining_ids")
+        return (
+            _valid_receipt_ids(remaining)
+            and not set(accounted).intersection(remaining)
+            and set(accounted).union(remaining) == set(eligible)
+        )
     if {"invalid_list", "list_failed", "pagination_limit"}.intersection(errors):
         return not accounted  # Live mutation begins after the final page.
     if unconfirmed:
@@ -522,7 +601,147 @@ def _valid_cleanup_counts(raw: dict[str, Any], *, legacy_preview: bool) -> bool:
         if unconfirmed[0] not in eligible:
             return False
         eligible = eligible[: eligible.index(unconfirmed[0]) + 1]
+    if raw.get("has_more") is True and "batch_number" in raw:
+        eligible = eligible[: agy_slot_worker.MAX_DELETES_PER_BATCH]
     return set(accounted) == set(eligible)
+
+
+def _valid_batch_history(row: dict[str, Any]) -> bool:
+    batches = row.get("batches")
+    if not isinstance(batches, list) or len(batches) > MAX_CLEANUP_BATCHES or any(k not in row for k in _BATCH_FIELDS):
+        return False
+    if agy_slot_worker.parse_rfc3339(row["cutoff_utc"]) is None:
+        return False
+    pending = row["pending_batch_number"]
+    if pending is not None and (
+        type(pending) is not int
+        or not 1 <= pending <= MAX_CLEANUP_BATCHES
+        or pending not in (len(batches), len(batches) + 1)
+    ):
+        return False
+    if row["stop_reason"] is not None and (
+        not isinstance(row["stop_reason"], str) or row["stop_reason"] not in _BATCH_STOPS
+    ):
+        return False
+    batch_keys = {
+        "cutoff_utc",
+        "operation_id",
+        "slot",
+        "project_id",
+        "dry_run",
+        "batch_number",
+        "counts_confirmed",
+        *_COUNT_FIELDS,
+        *_ID_FIELDS,
+        "http_200_ids",
+        "has_more",
+        "self_conversation_id",
+        "worker_elapsed_ms",
+        "process_exited",
+        "worker_receipt_valid",
+        "errors",
+        "ok",
+        "outcome_unknown",
+        "residuals",
+    }
+    kinds = {"db", "wal", "shm", "brain"}
+    reasons = {
+        "receipt_unverified",
+        "process_exit_unconfirmed",
+        "cli_profile_unverified",
+        "agy_cli_scan_unavailable",
+        "agy_cli_running",
+        "summary_unavailable",
+        "summary_present",
+        "summary_check_failed",
+        "source_unverified",
+        "quarantine_unavailable",
+        "move_failed",
+        "source_reappeared",
+    }
+    remaining: set[str] = set()
+    for number, b in enumerate(batches, 1):
+        if (
+            not isinstance(b, dict)
+            or b.keys() != batch_keys
+            or type(b["batch_number"]) is not int
+            or b["batch_number"] != number
+            or any(b[k] != row[k] for k in ("operation_id", "slot", "project_id", "cutoff_utc"))
+            or b["dry_run"] is not row["dry_run"]
+            or any(
+                type(b[k]) is not bool
+                for k in ("ok", "counts_confirmed", "process_exited", "outcome_unknown", "worker_receipt_valid")
+            )
+            or not isinstance(b["errors"], list)
+            or any(not isinstance(e, str) or _safe_runner_error(e) != e for e in b["errors"])
+            or not all(_valid_receipt_ids(b[k]) for k in (*_ID_FIELDS, "http_200_ids"))
+            or (b["self_conversation_id"] is not None and not _valid_receipt_ids([b["self_conversation_id"]]))
+            or b["self_conversation_id"] in b["eligible_ids"]
+            or b["http_200_ids"] != b["deleted_ids"]
+            or (
+                b["worker_elapsed_ms"] is not None
+                and (type(b["worker_elapsed_ms"]) is not int or b["worker_elapsed_ms"] < 0)
+            )
+            or (b["has_more"] is not None and type(b["has_more"]) is not bool)
+            or not isinstance(b["residuals"], list)
+        ):
+            return False
+        if b["counts_confirmed"]:
+            if not _valid_cleanup_counts(b, legacy_preview=False):
+                return False
+        elif any(b[k] is not None for k in _COUNT_FIELDS) or any(b[k] for k in _ID_FIELDS):
+            return False
+        ids = set(b["eligible_ids"])
+        attempted = set(b["deleted_ids"] + b["rejected_delete_ids"] + b["unconfirmed_delete_ids"])
+        if len(attempted) > agy_slot_worker.MAX_DELETES_PER_BATCH or (number > 1 and not ids <= remaining):
+            return False
+        if number == 1:
+            remaining = ids
+        remaining -= attempted
+        physical_ids = set()
+        for item in b["residuals"]:
+            if (
+                not isinstance(item, dict)
+                or item.keys() != {"id", "status", "reason", "moved", "remaining"}
+                or not isinstance(item["id"], str)
+                or item["id"] not in b["http_200_ids"]
+                or item["id"] in physical_ids
+                or item["status"] not in ("native_removed", "windows_residual_reclaimed", "residual_locked")
+                or not _valid_receipt_ids(item["moved"])
+                or not set(item["moved"]) <= kinds
+                or (
+                    item["remaining"] is not None
+                    and (not _valid_receipt_ids(item["remaining"]) or not set(item["remaining"]) <= kinds)
+                )
+            ):
+                return False
+            if item["status"] == "residual_locked":
+                if not isinstance(item["reason"], str) or item["reason"] not in reasons:
+                    return False
+            elif (
+                item["reason"] is not None
+                or item["remaining"] != []
+                or not b["process_exited"]
+                or not b["worker_receipt_valid"]
+                or not b["self_conversation_id"]
+                or not agy_slot_worker.is_canonical_uuid(item["id"])
+                or (item["status"] == "windows_residual_reclaimed") != bool(item["moved"])
+            ):
+                return False
+            physical_ids.add(item["id"])
+    if not batches:
+        return (
+            pending == 1
+            and not row["counts_confirmed"]
+            and not row["http_200_ids"]
+            and not row["remaining_ids"]
+            and row["has_more"] is None
+            and row["worker_elapsed_ms"] is None
+            and all(row[k] == 0 for k in ("native_removed", "windows_residual_reclaimed", "residual_locked"))
+        )
+    expected = {"batches": batches, "dry_run": row["dry_run"]}
+    _summarize_batches(expected)
+    return all(row.get(k) == value for k, value in expected.items() if k != "errors")
 
 
 def _valid_stored_receipt(name: str, row: Any) -> bool:
@@ -552,6 +771,8 @@ def _valid_stored_receipt(name: str, row: Any) -> bool:
     ):
         return False
     legacy_preview = row["dry_run"] and "unconfirmed_delete_ids" not in row and "rejected_delete_ids" not in row
+    if "batches" in row and not _valid_batch_history(row):
+        return False
     if row["counts_confirmed"]:
         return _valid_cleanup_counts(row, legacy_preview=legacy_preview) and (
             not row.get("unconfirmed_delete_ids") or row["outcome"] == "unknown"
@@ -917,6 +1138,27 @@ def parse_worker_receipt(raw: Any, expected: dict[str, Any]) -> CleanerExecution
     )
     if not _valid_cleanup_counts(raw, legacy_preview=legacy_preview):
         return invalid
+    if "batch_number" in expected:
+        number = raw.get("batch_number")
+        own_id = raw.get("self_conversation_id")
+        elapsed = raw.get("worker_elapsed_ms")
+        eligible = raw["eligible_ids"]
+        attempts = raw["deleted"] + len(raw.get("rejected_delete_ids", [])) + len(raw.get("unconfirmed_delete_ids", []))
+        if (
+            type(number) is not int
+            or number != expected["batch_number"]
+            or raw.get("cutoff_utc") != expected.get("cutoff_utc")
+            or not 1 <= number <= MAX_CLEANUP_BATCHES
+            or type(elapsed) is not int
+            or elapsed < 0
+            or raw.get("http_200_ids") != raw["deleted_ids"]
+            or attempts > agy_slot_worker.MAX_DELETES_PER_BATCH
+            or raw.get("has_more") is not (not raw["dry_run"] and len(eligible) > attempts)
+            or (own_id is not None and not _valid_receipt_ids([own_id]))
+            or (own_id is not None and own_id in eligible)
+            or (expected.get("target_ids") is not None and not set(eligible).issubset(expected["target_ids"]))
+        ):
+            return invalid
     return CleanerExecutionResult(
         ok=raw["ok"],
         **{k: raw[k] for k in _COUNT_FIELDS},
@@ -928,6 +1170,14 @@ def parse_worker_receipt(raw: Any, expected: dict[str, Any]) -> CleanerExecution
         unconfirmed_delete_ids=tuple(raw.get("unconfirmed_delete_ids", [])),
         outcome_unknown=bool(raw.get("unconfirmed_delete_ids")),
         worker_receipt_valid=True,
+        batch_number=raw.get("batch_number"),
+        self_conversation_id=raw.get("self_conversation_id"),
+        http_200_ids=tuple(raw.get("http_200_ids", [])),
+        has_more=raw.get("has_more", False),
+        worker_elapsed_ms=raw.get("worker_elapsed_ms"),
+        verified_identity=(raw["operation_id"], raw["slot"], raw["project_id"], raw["dry_run"], raw["batch_number"])
+        if "batch_number" in expected
+        else None,
     )
 
 
@@ -937,6 +1187,11 @@ def _read_worker_receipt(path: Path, expected: dict[str, Any], missing_reason: s
     except (OSError, ValueError):
         return CleanerExecutionResult(False, errors=(missing_reason,), outcome_unknown=True)
     return parse_worker_receipt(raw, expected)
+
+
+def _batch_workspace(home: Path, operation_id: str, batch_number: int) -> Path:
+    operation = agy_slots_dir(home) / "runs" / operation_id
+    return operation if batch_number == 1 else operation / f"batch-{batch_number:02d}"
 
 
 def execute_tier3_cleanup(
@@ -957,6 +1212,9 @@ def execute_tier3_cleanup(
         or spec is None
         or type(request.dry_run) is not bool
         or not agy_slot_worker.is_canonical_uuid(request.operation_id)
+        or type(request.batch_number) is not int
+        or not 1 <= request.batch_number <= MAX_CLEANUP_BATCHES
+        or (request.batch_number == 1) != (request.target_ids is None)
         or set(request.allowed_project_ids) != {s.project_id for s in slots.slots}
     ):
         return CleanerExecutionResult(False, errors=("invalid cleanup target or mode",))
@@ -986,10 +1244,11 @@ def execute_tier3_cleanup(
     # injects its own CLI Language Server credentials cleanly.
     env = {k: v for k, v in raw_env.items() if not k.upper().startswith("ANTIGRAVITY_")}
 
-    runs_parent = agy_slots_dir(home) / "runs"
-    runner_dir = runs_parent / request.operation_id
+    runner_dir = _batch_workspace(home, request.operation_id, request.batch_number)
     try:
-        runner_dir.mkdir(parents=True)
+        if request.batch_number > 1:
+            _checked_entry(runner_dir.parent, directory=True)
+        runner_dir.mkdir(parents=request.batch_number == 1)
     except FileExistsError:
         return CleanerExecutionResult(
             False, errors=("cleanup operation already has a workspace",), outcome_unknown=True
@@ -1001,8 +1260,8 @@ def execute_tier3_cleanup(
         (runner_dir / "cleanup_worker.py").write_text(worker_source, encoding="utf-8")
         request_payload = {
             **request.identity,
+            "target_ids": list(request.target_ids) if request.target_ids is not None else None,
             "allowed_project_ids": [request.project_id],
-            "cutoff_utc": request.cutoff_utc.astimezone(UTC).isoformat(),
         }
         (runner_dir / "request.json").write_text(
             json.dumps(request_payload, indent=2, ensure_ascii=False) + "\n",
@@ -1053,13 +1312,19 @@ def execute_tier3_cleanup(
             # Descendants can retain the pipe or run independently. Never perform an
             # unbounded second communicate, or treat killing the direct child as proof.
             reason = "cleaner timed out; execution unconfirmed"
-            receipt = _read_worker_receipt(runner_dir / "result.json", request.identity, reason)
+            receipt = _read_worker_receipt(runner_dir / "result.json", request_payload, reason)
             if receipt.worker_receipt_valid:
                 return replace(receipt, ok=False, errors=(*receipt.errors, reason), outcome_unknown=True)
             return CleanerExecutionResult(False, errors=(reason,), outcome_unknown=True)
         reason = f"no valid result.json (agy exit {proc.returncode}, stderr present={bool(stderr)})"
-        result = _read_worker_receipt(runner_dir / "result.json", request.identity, reason)
-        return result
+        result = _read_worker_receipt(runner_dir / "result.json", request_payload, reason)
+        profile_env = {k.upper(): v for k, v in env.items()}
+        profile_matches = (
+            bool(profile_env.get("USERPROFILE"))
+            and Path(profile_env["USERPROFILE"]) == Path.home()
+            and Path(profile_env.get("HOME") or Path.home()) == Path.home()
+        )
+        return replace(result, process_exited=proc.returncode is not None, profile_matches=profile_matches)
     except OSError:
         reason = "cleaner completion unconfirmed" if retain_run else "could not prepare cleanup workspace"
         return CleanerExecutionResult(False, errors=(reason,), outcome_unknown=retain_run)
@@ -1092,6 +1357,455 @@ def _running_agy_cli_processes() -> tuple[list[dict[str, Any]], bool]:
         if basename.casefold() == "agy.exe":
             matches.append({"pid": pid, "name": basename})
     return matches, complete
+
+
+def _extended_path(path: Path) -> Path:
+    # The caller supplies absolute, fixed-root paths. Rename the brain directory
+    # itself: deeply nested files and any links inside it are never traversed.
+    name = str(path)
+    if os.name != "nt" or name.startswith("\\\\?\\"):
+        return path
+    if name.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + name[2:])
+    return Path("\\\\?\\" + name)
+
+
+def _checked_entry(
+    path: Path, *, directory: bool, optional: bool = False, missing_tree_ok: bool = False
+) -> os.stat_result | None:
+    """Reject links, Windows reparse points, indirect parents and non-unique files."""
+    for entry in (*reversed(path.parents), path):
+        try:
+            info = _extended_path(entry).lstat()
+        except FileNotFoundError:
+            if optional and (entry == path or missing_tree_ok):
+                return None
+            raise
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise OSError("indirect path")
+        if entry != path or directory:
+            if not stat.S_ISDIR(info.st_mode):
+                raise OSError("directory expected")
+        elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError("unique file expected")
+    return info
+
+
+def _pin_entry(stack: ExitStack, path: Path, *, directory: bool, for_rename: bool = False) -> int | None:
+    """Keep each checked Windows parent in place while its children are opened or renamed."""
+    handle = None
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_handle = kernel.CreateFileW
+        open_handle.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        open_handle.restype = wintypes.HANDLE
+        close_handle = kernel.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+        # FILE_READ_ATTRIBUTES, OPEN_EXISTING, OPEN_REPARSE_POINT | BACKUP_SEMANTICS.
+        # Directories deny write/delete sharing. SQLite files allow readers and
+        # writers to take normal SQLite locks, while denying path replacement.
+        access = 0x80 | (0x10000 if for_rename else 0)  # DELETE access for handle-based rename
+        share = 1 if directory or for_rename else 3
+        handle = open_handle(str(_extended_path(path)), access, share, None, 3, 0x02200000, None)
+        if handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        stack.callback(close_handle, handle)
+    _checked_entry(path, directory=directory)
+    return handle
+
+
+def _move_residual(source: Path, destination: Path, before: os.stat_result, *, directory: bool) -> None:
+    # The parent directories are already pinned. Open the leaf without following
+    # reparse points and rename that exact file object, never a later occupant.
+    with ExitStack() as pins:
+        handle = _pin_entry(pins, source, directory=directory, for_rename=True)
+        current = _checked_entry(source, directory=directory)
+        if current is None or not os.path.samestat(before, current):
+            raise OSError("source changed")
+        if os.name != "nt":
+            # The production residual stage is Windows-only.
+            os.rename(source, destination)
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        class RenameInfo(ctypes.Structure):
+            _fields_ = [
+                ("flags", wintypes.DWORD),
+                ("root", wintypes.HANDLE),
+                ("length", wintypes.DWORD),
+                ("name", wintypes.WCHAR * 1),
+            ]
+
+        name = str(_extended_path(destination)).encode("utf-16-le")
+        buf = ctypes.create_string_buffer(RenameInfo.name.offset + len(name) + 2)
+        info = RenameInfo.from_buffer(buf)  # zero flags: never replace an existing destination
+        info.length = len(name)
+        ctypes.memmove(ctypes.addressof(buf) + RenameInfo.name.offset, name, len(name))
+        rename = ctypes.WinDLL("kernel32", use_last_error=True).SetFileInformationByHandle
+        rename.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+        rename.restype = wintypes.BOOL
+        if not rename(handle, 3, buf, len(buf)):  # FileRenameInfo; no cross-volume copy fallback
+            raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _quarantine_directory(destination: Path, operation_root: Path, pins: ExitStack) -> None:
+    # Share only the fixed parent and this operation's batch directory. The
+    # final CID directory belongs to exactly one move attempt.
+    root = operation_root.parent
+    for directory in (root.parent, root, operation_root, destination.parent, destination):
+        _checked_entry(directory.parent, directory=True)
+        try:
+            _extended_path(directory).mkdir()
+        except FileExistsError:
+            if directory == destination:
+                raise
+        _pin_entry(pins, directory, directory=True)
+
+
+def _present_residuals(sources: dict[str, Path], absent_roots: set[Path]) -> dict[str, os.stat_result]:
+    present = {}
+    for kind, path in sources.items():
+        if path.parent in absent_roots:
+            if _checked_entry(path.parent, directory=True, optional=True) is not None:
+                raise OSError("an unpinned source directory appeared")
+            continue
+        info = _checked_entry(path, directory=kind == "brain", optional=True)
+        if info is not None:
+            present[kind] = info
+    return present
+
+
+def _quarantine_one(
+    profile: Path,
+    operation_root: Path,
+    batch_number: int,
+    cid: str,
+    db: sqlite3.Connection,
+    absent_roots: set[Path],
+) -> dict[str, Any]:
+    moved: list[str] = []
+    record: dict[str, Any] = {
+        "id": cid,
+        "status": "residual_locked",
+        "reason": "summary_check_failed",
+        "moved": moved,
+        "remaining": None,
+    }
+    try:
+        summary_count = db.execute(
+            "SELECT COUNT(*) FROM conversation_summaries WHERE conversation_id = ?", (cid,)
+        ).fetchone()
+        if summary_count != (0,):
+            record["reason"] = "summary_present"
+            return record
+        source_db = profile / "conversations" / f"{cid}.db"
+        sources = {
+            "db": source_db,
+            "wal": source_db.with_suffix(".db-wal"),
+            "shm": source_db.with_suffix(".db-shm"),
+            "brain": profile / "brain" / cid,
+        }
+        record["reason"] = "source_unverified"
+        present = _present_residuals(sources, absent_roots)
+        record["remaining"] = list(present)
+        destination = operation_root / f"batch-{batch_number:02d}" / cid
+        record["reason"] = "quarantine_unavailable"
+        if _checked_entry(destination, directory=True, optional=True, missing_tree_ok=True) is not None:
+            return record
+        if not present:
+            return {**record, "status": "native_removed", "reason": None}
+        with ExitStack() as pins:
+            _quarantine_directory(destination, operation_root, pins)
+            destination_info = _checked_entry(destination, directory=True)
+            assert destination_info is not None
+            for kind, before in present.items():
+                path = sources[kind]
+                out = destination / path.name
+                record["reason"] = "move_failed"
+                parent = _checked_entry(destination, directory=True)
+                if (
+                    parent is None
+                    or not os.path.samestat(parent, destination_info)
+                    or before.st_dev != parent.st_dev
+                    or _checked_entry(out, directory=kind == "brain", optional=True) is not None
+                ):
+                    raise OSError("destination changed")
+                _move_residual(path, out, before, directory=kind == "brain")
+                moved.append(kind)
+                record["remaining"].remove(kind)
+            record["reason"] = "source_reappeared"
+            record["remaining"] = None
+            record["remaining"] = list(_present_residuals(sources, absent_roots))
+            if not record["remaining"]:
+                record.update(status="windows_residual_reclaimed", reason=None)
+    except (OSError, sqlite3.Error):
+        if record["reason"] in ("move_failed", "source_reappeared"):
+            record["remaining"] = None
+            with suppress(OSError):
+                record["remaining"] = list(_present_residuals(sources, absent_roots))
+    return record
+
+
+def _windows_residuals(request: CleanerRequest, result: CleanerExecutionResult) -> list[dict[str, Any]]:
+    if not _WINDOWS_RESIDUALS or request.dry_run or not result.http_200_ids:
+        return []
+    locked: dict[str, dict[str, Any]] = {
+        cid: {"id": cid, "status": "residual_locked", "reason": "receipt_unverified", "moved": [], "remaining": None}
+        for cid in result.http_200_ids
+    }
+    if (
+        not result.worker_receipt_valid
+        or result.verified_identity
+        != (request.operation_id, request.slot, request.project_id, request.dry_run, request.batch_number)
+        or not result.self_conversation_id
+        or not agy_slot_worker.is_canonical_uuid(request.operation_id)
+    ):
+        return list(locked.values())
+    candidates = [
+        cid
+        for cid in locked
+        if cid in result.eligible_ids
+        and cid.casefold() != result.self_conversation_id.casefold()
+        and agy_slot_worker.is_canonical_uuid(cid)
+    ]
+    if not candidates:
+        return list(locked.values())
+    reason = "process_exit_unconfirmed"
+    try:
+        if result.process_exited and result.profile_matches:
+            reason = "agy_cli_scan_unavailable"
+            matches, complete = _running_agy_cli_processes()
+            if complete and not matches:
+                profile = Path.home() / ".gemini" / "antigravity-cli"
+                quarantine = Path.home() / ".agent-bridge" / "agy_slot_quarantine" / request.operation_id
+                summary = profile / "conversation_summaries.db"
+                with ExitStack() as pins:
+                    reason = "source_unverified"
+                    for directory in (Path.home(), profile.parent, profile):
+                        _pin_entry(pins, directory, directory=True)
+                    absent_roots = set()
+                    for directory in (profile / "conversations", profile / "brain"):
+                        if _checked_entry(directory, directory=True, optional=True) is None:
+                            absent_roots.add(directory)
+                        else:
+                            _pin_entry(pins, directory, directory=True)
+                    reason = "summary_unavailable"
+                    _pin_entry(pins, summary, directory=False)
+                    for suffix in ("-wal", "-shm", "-journal"):
+                        sidecar = summary.with_name(summary.name + suffix)
+                        if _checked_entry(sidecar, directory=False, optional=True) is not None:
+                            _pin_entry(pins, sidecar, directory=False)
+                    with closing(sqlite3.connect(summary.as_uri() + "?mode=ro", uri=True, timeout=0)) as db:
+                        for cid in candidates:
+                            locked[cid] = _quarantine_one(
+                                profile, quarantine, request.batch_number, cid, db, absent_roots
+                            )
+                return list(locked.values())
+            if matches:
+                reason = "agy_cli_running"
+        elif result.process_exited:
+            reason = "cli_profile_unverified"
+    except (OSError, sqlite3.Error, SlotGuardError):
+        pass
+    for cid in candidates:
+        locked[cid]["reason"] = reason
+    return list(locked.values())
+
+
+def _batch_record(request: CleanerRequest, result: CleanerExecutionResult, *, late: bool = False) -> dict[str, Any]:
+    confirmed = result.worker_receipt_valid or not result.outcome_unknown
+    record = {
+        **request.identity,
+        "counts_confirmed": confirmed,
+        **{key: getattr(result, key) if confirmed else None for key in _COUNT_FIELDS},
+        **{key: list(getattr(result, key)) if confirmed else [] for key in _ID_FIELDS},
+        "http_200_ids": list(result.http_200_ids),
+        "has_more": result.has_more if result.worker_receipt_valid else None,
+        "self_conversation_id": result.self_conversation_id,
+        "worker_elapsed_ms": result.worker_elapsed_ms,
+        "process_exited": result.process_exited,
+        "worker_receipt_valid": result.worker_receipt_valid,
+        "errors": [_safe_runner_error(e) for e in result.errors],
+        "ok": result.ok,
+        "outcome_unknown": result.outcome_unknown,
+    }
+    if late:
+        record["residuals"] = (
+            [
+                {
+                    "id": cid,
+                    "status": "residual_locked",
+                    "reason": "process_exit_unconfirmed",
+                    "moved": [],
+                    "remaining": None,
+                }
+                for cid in result.http_200_ids
+            ]
+            if _WINDOWS_RESIDUALS
+            else []
+        )
+    else:
+        record["residuals"] = _windows_residuals(request, result)
+    return record
+
+
+def _summarize_batches(payload: dict[str, Any]) -> None:
+    # checked/skipped/eligible describe the first inventory. Later lists can see
+    # changes, but they can only operate on the as-yet unattempted original IDs.
+    batches = payload["batches"]
+    first = batches[0]
+    payload["counts_confirmed"] = first["counts_confirmed"]
+    for key in _COUNT_FIELDS:
+        payload[key] = first[key]
+    for key in _ID_FIELDS:
+        payload[key] = (
+            list(first[key])
+            if key in ("eligible_ids", "would_delete_ids")
+            else [cid for b in batches for cid in b[key]]
+        )
+    if first["counts_confirmed"]:
+        payload["deleted"] = len(payload["deleted_ids"])
+    payload["http_200_ids"] = [cid for batch in batches for cid in batch["http_200_ids"]]
+    attempted = set(payload["deleted_ids"] + payload["rejected_delete_ids"] + payload["unconfirmed_delete_ids"])
+    payload["remaining_ids"] = (
+        [] if payload["dry_run"] else [cid for cid in first["eligible_ids"] if cid not in attempted]
+    )
+    payload["has_more"] = bool(payload["remaining_ids"]) if batches[-1]["counts_confirmed"] else None
+    times = [batch["worker_elapsed_ms"] for batch in batches if batch["worker_elapsed_ms"] is not None]
+    payload["worker_elapsed_ms"] = sum(times) if times else None
+    residuals = [r for batch in batches for r in batch["residuals"]]
+    for status in ("native_removed", "windows_residual_reclaimed", "residual_locked"):
+        payload[status] = sum(r["status"] == status for r in residuals)
+    payload["errors"] = list(dict.fromkeys(e for batch in batches for e in batch["errors"]))
+
+
+def _continuation_allowed(
+    home: Path,
+    spec: AgySlotSpec,
+    config: AgySlotConfig,
+    agent: AgentConfig | None,
+    operation_id: str,
+    projects_dir: Path,
+    now: datetime | None,
+) -> bool:
+    current, _, agy_agents = _resolve_agy_agent(home, agent)
+    if (
+        current is None
+        or current.agy_slots != config
+        or _unconfirmed_operation(_load_cleanup_receipts(home), spec.project_id) != operation_id
+    ):
+        return False
+    require_empty_project(spec, projects_dir)
+    state = _read_slot_state(home)
+    sessions, tasks = validate_slot_state(state)
+    owner = _read_owner(spec, home, state)
+    if (
+        not owner
+        or owner.get("operation_id") != operation_id
+        or find_blocking_sessions(spec, sessions, tasks, agy_agents)
+    ):
+        return False
+    local_now, timings = compute_slot_schedule(config, now=now)
+    slot = next(t for t in timings if t.spec == spec)
+    if slot.is_active or (slot.grace_until is not None and local_now.astimezone(UTC) < slot.grace_until):
+        return False
+    matches, complete = _running_agy_cli_processes()
+    return complete and not matches
+
+
+def _cleanup_outcome(payload: dict[str, Any], unknown: bool) -> str:
+    if unknown:
+        return "unknown"
+    if payload["ok"]:
+        return "completed"
+    progress = payload["checked"] if payload["dry_run"] else payload["deleted"]
+    return "partial" if progress else "failed"
+
+
+def _execute_batches(
+    payload: dict[str, Any],
+    request: CleanerRequest,
+    home: Path,
+    agent: AgentConfig,
+    env: EnvConfig,
+    continuation_allowed: Callable[[], bool],
+    runner: CleanerRunner | None,
+) -> tuple[bool, bool]:
+    """Keep the outer admission held. Return whether termination is unknown and workspaces can be removed."""
+    for number in range(1, MAX_CLEANUP_BATCHES + 1):
+        if number > 1:
+            try:
+                if not continuation_allowed():
+                    raise SlotGuardError("admission_changed")
+            except (ValueError, OSError, SlotGuardError):
+                stop = "admission_changed"
+                break
+            request = replace(request, batch_number=number, target_ids=tuple(payload["remaining_ids"]))
+            payload["pending_batch_number"] = number
+            try:
+                _save_cleanup_receipt(home, request.slot, {**payload, "receipt_saved": True})
+            except (SlotGuardError, OSError):
+                payload["pending_batch_number"] = None
+                stop = "checkpoint_failed"
+                break
+        try:
+            result = (runner or execute_tier3_cleanup)(request, agent_cfg=agent, home=home, env_config=env)
+        except Exception:
+            result = CleanerExecutionResult(False, errors=("cleaner completion unconfirmed",), outcome_unknown=True)
+        record = _batch_record(request, result)
+        if runner is not None and number == 1 and result.batch_number is None:
+            # Existing injected runners return one result, without native batch or disk evidence.
+            for field_name in _BATCH_FIELDS:
+                payload.pop(field_name)
+            for field_name in (*_COUNT_FIELDS, *_ID_FIELDS, "ok", "errors", "counts_confirmed"):
+                payload[field_name] = record[field_name]
+            payload["outcome"] = _cleanup_outcome(payload, result.outcome_unknown)
+            return result.outcome_unknown, False
+        payload["batches"].append(record)
+        _summarize_batches(payload)
+        if result.outcome_unknown or (result.worker_receipt_valid and not result.process_exited):
+            stop = "unknown"
+            break
+        payload["pending_batch_number"] = None
+        if payload["residual_locked"]:
+            stop = "residual_locked"
+            break
+        if request.dry_run:
+            stop = "preview" if result.ok else "worker_failed"
+            break
+        if not payload["remaining_ids"]:
+            stop = "worker_failed" if payload["errors"] else "completed"
+            break
+        if not result.http_200_ids:
+            stop = "no_progress"
+            break
+        if not result.has_more:
+            stop = "targets_changed"
+            break
+    else:
+        stop = "batch_limit"
+    payload["stop_reason"] = stop
+    unknown = stop in ("unknown", "checkpoint_failed")
+    if stop not in ("completed", "preview", "worker_failed", "unknown") and stop not in payload["errors"]:
+        payload["errors"].append(stop)
+    payload["ok"] = stop in ("completed", "preview") and not payload["errors"]
+    payload["outcome"] = _cleanup_outcome(payload, unknown)
+    return unknown, not unknown and runner is None and all(
+        b["worker_receipt_valid"] and b["process_exited"] for b in payload["batches"]
+    )
 
 
 def cleanup_agy_slot(
@@ -1197,6 +1911,19 @@ def cleanup_agy_slot(
                 dry_run,
                 request_id,
             )
+            payload.update(
+                cutoff_utc=request.identity["cutoff_utc"],
+                batches=[],
+                pending_batch_number=1,
+                stop_reason=None,
+                http_200_ids=[],
+                remaining_ids=[],
+                has_more=None,
+                worker_elapsed_ms=None,
+                native_removed=0,
+                windows_residual_reclaimed=0,
+                residual_locked=0,
+            )
             owner_path = _owner_path(target_spec)
             # A killed dashboard leaves an explicit, durable exclusion instead of
             # silently releasing the project when the OS drops its advisory lock.
@@ -1208,37 +1935,15 @@ def cleanup_agy_slot(
                 atomic_write_json(owner_path, owner)
                 payload.update(outcome="not_started", counts_confirmed=True, **dict.fromkeys(_COUNT_FIELDS, 0))
                 raise SlotGuardError("could not persist cleanup admission") from None
-            try:
-                result = (cleaner_runner or execute_tier3_cleanup)(
-                    request,
-                    agent_cfg=resolved_agent,
-                    home=home,
-                    env_config=env_config or resolved_env,
-                )
-            except Exception:
-                result = CleanerExecutionResult(False, errors=("cleaner completion unconfirmed",), outcome_unknown=True)
-            payload.update(asdict(result))
-            unknown = payload.pop("outcome_unknown")
-            counts_confirmed = payload.pop("worker_receipt_valid") or not unknown
-            payload["counts_confirmed"] = counts_confirmed
-            for key in (
-                "deleted_ids",
-                "would_delete_ids",
-                "eligible_ids",
-                "rejected_delete_ids",
-                "unconfirmed_delete_ids",
-            ):
-                payload[key] = list(payload[key]) if counts_confirmed else []
-            payload["errors"] = [_safe_runner_error(e) for e in result.errors]
-            if unknown:
-                payload["outcome"] = "unknown"
-                if not counts_confirmed:
-                    payload.update(dict.fromkeys(_COUNT_FIELDS))
-            elif result.ok:
-                payload["outcome"] = "completed"
-            else:
-                progress = result.checked if dry_run else result.deleted
-                payload["outcome"] = "partial" if progress else "failed"
+            unknown, remove_workspace = _execute_batches(
+                payload,
+                request,
+                home,
+                resolved_agent,
+                env_config or resolved_env,
+                lambda: _continuation_allowed(home, target_spec, slot_cfg, agent_cfg, request_id, projects_dir, now),
+                cleaner_runner,
+            )
             try:
                 _save_cleanup_receipt(home, target_spec.name, {**payload, "receipt_saved": True})
                 payload["receipt_saved"] = True
@@ -1251,7 +1956,7 @@ def cleanup_agy_slot(
                 except OSError:
                     payload["guard_error"] = "completed operation; project ownership could not be released"
                 else:
-                    if cleaner_runner is None and result.worker_receipt_valid:
+                    if remove_workspace:
                         # The durable receipt now contains the confirmed result.
                         try:
                             shutil.rmtree(agy_slots_dir(home) / "runs" / request_id)
