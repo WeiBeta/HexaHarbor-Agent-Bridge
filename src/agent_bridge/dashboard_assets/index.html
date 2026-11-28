@@ -468,6 +468,25 @@
           </form>
         </div>
 
+        <!-- AGY Slot Rotation & Cleanup -->
+        <div class="panel agy-slots-panel" id="agy-slots-panel">
+          <div class="section-head agy-slots-head">
+            <div class="agy-head-text">
+              <h2 class="section-title">
+                <span data-i18n="agySlots.title">AGY 槽位轮转与清理</span>
+                <span class="badge" id="agy-slots-state-badge" data-i18n="agySlots.badgeLoading">加载中</span>
+                <span class="badge hidden" id="agy-slots-cleaner-badge"></span>
+              </h2>
+              <div class="section-sub" data-i18n="agySlots.subtitle">查看每日轮转槽位状态、执行无破坏预演，并对已过冷静期且无活跃会话的槽位执行二次确认清理。</div>
+            </div>
+            <div class="inline-actions agy-slots-head-actions">
+              <button type="button" class="btn btn-ghost btn-sm" id="btn-agy-slots-refresh" data-i18n="agySlots.refreshBtn">刷新槽位状态</button>
+            </div>
+          </div>
+
+          <div id="agy-slots-root"></div>
+        </div>
+
         <div class="kpi-grid" id="storage-kpis"></div>
 
         <div class="panel">
@@ -617,6 +636,26 @@
           <div class="inline-actions">
             <button type="button" class="btn btn-ghost" id="btn-clear-cancel" data-i18n="common.cancel">取消</button>
             <button type="submit" class="btn btn-danger" data-i18n="storage.clearModalConfirm">确认清空</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- AGY Slot Live Cleanup Second-Confirmation Modal -->
+  <div class="modal-backdrop hidden" id="agy-cleanup-modal-backdrop">
+    <div class="modal agy-modal" role="dialog" aria-modal="true" aria-labelledby="agy-modal-title">
+      <div class="modal-head">
+        <h3 id="agy-modal-title" class="danger-text" data-i18n="agySlots.modalTitle">二次确认 · 正式清理 AGY 槽位</h3>
+        <button type="button" class="btn btn-ghost btn-sm" id="btn-agy-modal-close" data-i18n="common.close">关闭</button>
+      </div>
+      <form id="form-agy-cleanup-confirm">
+        <div class="modal-body" id="agy-modal-body"></div>
+        <div class="modal-foot">
+          <span></span>
+          <div class="inline-actions">
+            <button type="button" class="btn btn-ghost" id="btn-agy-modal-cancel" data-i18n="agySlots.modalCancelBtn">取消</button>
+            <button type="submit" class="btn btn-danger" id="btn-agy-modal-confirm" data-i18n="agySlots.modalConfirmBtn">确认执行正式清理</button>
           </div>
         </div>
       </form>
