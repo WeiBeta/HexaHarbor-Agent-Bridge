@@ -1444,7 +1444,9 @@ def test_production_cleanup_http_process_guard_and_service_receipts(enabled_home
         csrf=server.csrf_token,
         payload={"slot": spec.name, "dry_run": dry_run, "confirm": spec.name},
     )
-    assert len(scans) == int(not dry_run) + int(bool(result.get("http_200_ids")) and agy_slots.sys.platform == "win32")
+    assert len(scans) == int(not dry_run) + (
+        len(result.get("http_200_ids", [])) if agy_slots.sys.platform == "win32" else 0
+    )
     if scenario in {"cli", "list_failure", "name_denied"}:
         assert status == 409 and result["outcome"] == "not_started" and not launches and not calls
         assert not result["receipt_saved"] and result["deleted"] == 0
@@ -2304,6 +2306,9 @@ def test_malformed_persisted_operation_is_visible_without_echoing_details(enable
     "scenario,count,expected_calls,expected_batches,stop",
     [
         ("windows", 53, 53, 2, "completed"),
+        ("later_cli", 53, 50, 1, "residual_locked"),
+        ("later_incomplete", 53, 50, 1, "residual_locked"),
+        ("later_scan_error", 53, 50, 1, "residual_locked"),
         ("cap", 501, 500, 10, "batch_limit"),
         ("reject", 87, 50, 1, "no_progress"),
         ("mixed", 53, 53, 2, "worker_failed"),
@@ -2320,17 +2325,31 @@ def test_bounded_cleanup_through_production_runner(
 ):
     home = enabled_home
     spec = releasable_slot(home)
-    windows = scenario in {"windows", "preview"}
+    interrupted_scan = scenario in {"later_cli", "later_incomplete", "later_scan_error"}
+    windows = scenario in {"windows", "preview"} or interrupted_scan
     monkeypatch.setattr(agy_slots, "_WINDOWS_RESIDUALS", windows)
     profile = _synthetic_cli_profile()
     ids = [str(uuid.UUID(int=i + 1)) for i in range(count)]
     # ids[0] represents an old, independently eligible control conversation.
     artifact = profile / "conversations" / f"{ids[0]}.db"
     artifact.write_bytes(b"fixture old conversation")
+    untouched = [profile / "conversations" / f"{cid}.db" for cid in ids[1:3]]
+    if interrupted_scan:
+        for file in untouched:
+            file.write_bytes(b"untouched fixture")
+    residual_scans = []
     new_controls, calls, requests, workspaces = [], [], [], []
     monkeypatch.setattr(agy_slots, "resolve_command", lambda *args: ["fixture-agy"])
 
     def processes():
+        if interrupted_scan and calls:
+            residual_scans.append(artifact.exists())
+            if len(residual_scans) == 2:
+                if scenario == "later_cli":
+                    return [{"pid": 72, "name": "AGY.EXE"}], True
+                if scenario == "later_scan_error":
+                    raise agy_slots.SlotGuardError("agy_cli_process_list_failed")
+                return [], False
         if scenario == "busy" and calls:
             return [{"pid": 17, "name": "agy.exe"}], True
         return [], True
@@ -2420,6 +2439,18 @@ def test_bounded_cleanup_through_production_runner(
         assert result["would_delete_ids"] == ids and result["deleted"] == result["windows_residual_reclaimed"] == 0
         assert artifact.read_bytes() == b"fixture old conversation"
         assert not (Path.home() / ".agent-bridge" / "agy_slot_quarantine").exists()
+    elif interrupted_scan:
+        assert residual_scans == [True, False] and result["outcome"] == "partial"
+        assert result["windows_residual_reclaimed"] == 1 and result["residual_locked"] == 49
+        assert (
+            result["native_removed"] == 0 and result["http_200_ids"] == ids[:50] and result["remaining_ids"] == ids[50:]
+        )
+        first, *rest = result["batches"][0]["residuals"]
+        assert first["id"] == ids[0] and first["moved"] == ["db"] and first["remaining"] == []
+        assert [row["id"] for row in rest] == ids[1:50]
+        reason = "agy_cli_running" if scenario == "later_cli" else "agy_cli_scan_unavailable"
+        assert all(row["reason"] == reason and row["moved"] == [] and row["remaining"] is None for row in rest)
+        assert all(file.read_bytes() == b"untouched fixture" for file in untouched)
     elif scenario == "windows":
         assert result["ok"] and result["has_more"] is False and result["remaining_ids"] == []
         assert (
@@ -2694,3 +2725,91 @@ def test_residual_stays_in_place_when_destination_volume_differs(monkeypatch):
     assert (
         source.read_bytes() == b"original fixture" and not agy_slots._extended_path(destination / source.name).exists()
     )
+
+
+def test_repeated_get_after_interrupted_move_keeps_physical_progress_unknown(enabled_home, monkeypatch):
+    home = enabled_home
+    spec = releasable_slot(home)
+    profile = _synthetic_cli_profile()
+    cid = str(uuid.uuid4())
+    db = profile / "conversations" / f"{cid}.db"
+    wal = db.with_suffix(".db-wal")
+    db.write_bytes(b"test db")
+    wal.write_bytes(b"test wal")
+    monkeypatch.setattr(agy_slots, "_WINDOWS_RESIDUALS", True)
+    operation_ids = []
+
+    def confirmed_worker(req, **kwargs):
+        operation_ids.append(req.operation_id)
+        raw = {
+            **req.identity,
+            **_batch_fields(req.identity),
+            "ok": True,
+            "checked": 1,
+            "eligible_ids": [cid],
+            "http_200_ids": [cid],
+            "deleted_ids": [cid],
+            "deleted": 1,
+            "rejected_delete_ids": [],
+            "unconfirmed_delete_ids": [],
+            "would_delete": 0,
+            "would_delete_ids": [],
+            "skipped_running": 0,
+            "skipped_recent": 0,
+            "skipped_unverified": 0,
+            "errors": [],
+        }
+        directory = agy_slots._batch_workspace(home, req.operation_id, req.batch_number)
+        directory.mkdir(parents=True)
+        atomic_write_json(directory / "result.json", raw)
+        result = agy_slots.parse_worker_receipt(raw, req.identity)
+        assert result.worker_receipt_valid
+        return replace(result, process_exited=True, profile_matches=True)
+
+    class ParentStopped(BaseException):
+        pass
+
+    move = agy_slots._move_residual
+
+    def stop_before_wal(source, destination, before, **kwargs):
+        if source == wal:
+            raise ParentStopped()
+        move(source, destination, before, **kwargs)
+
+    monkeypatch.setattr(agy_slots, "_move_residual", stop_before_wal)
+    with pytest.raises(ParentStopped):
+        run_slot(home, spec, confirmed_worker, dry_run=False)
+    (operation_id,) = operation_ids
+    quarantine = Path.home() / ".agent-bridge" / "agy_slot_quarantine" / operation_id / "batch-01" / cid
+    moved_db = agy_slots._extended_path(quarantine / db.name)
+    owner = agy_slots._owner_path(spec)
+    receipts = agy_slots.agy_slot_receipts_path(home)
+    before_get = (owner.read_bytes(), receipts.read_bytes(), moved_db.read_bytes(), wal.read_bytes())
+    assert not db.exists() and before_get[2:] == (b"test db", b"test wal")
+
+    monkeypatch.setattr(agy_slots, "_windows_residuals", unexpected_runner)
+    monkeypatch.setattr(agy_slots, "_move_residual", unexpected_runner)
+    for _ in range(2):
+        server = SimpleNamespace(
+            home=home,
+            bound_port=5001,
+            agy_now_fn=lambda: FIXED_NOW,
+            agy_projects_dir_override=agy_projects_dir(),
+            agy_cleaner_runner=unexpected_runner,
+        )
+        code, body = _json_req(server, "GET", "/api/agy/slots")
+        assert code == 200
+        slot = next(row for row in body["slots"] if row["name"] == spec.name)
+        assert slot["status"] == "unknown" and slot["unconfirmed_operation_id"] == operation_id
+        view = body["last_cleanup"]
+        assert slot["last_cleanup"] == view and view["late_worker_receipt"] and view["counts_confirmed"]
+        assert view["http_200_ids"] == [cid] and view["deleted"] == 1 and view["residual_locked"] == 1
+        assert view["native_removed"] == view["windows_residual_reclaimed"] == 0
+        (row,) = view["batches"][0]["residuals"]
+        assert row["id"] == cid and row["status"] == "residual_locked"
+        assert row["moved"] is None and row["remaining"] is None
+        assert (owner.read_bytes(), receipts.read_bytes(), moved_db.read_bytes(), wal.read_bytes()) == before_get
+        assert not db.exists() and not agy_slots._extended_path(quarantine / wal.name).exists()
+    with pytest.raises(SlotCleanupConflictError):
+        run_slot(home, spec, unexpected_runner, dry_run=False)
+    assert operation_ids == [operation_id]

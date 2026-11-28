@@ -1583,44 +1583,49 @@ def _windows_residuals(request: CleanerRequest, result: CleanerExecutionResult) 
     ]
     if not candidates:
         return list(locked.values())
-    reason = "process_exit_unconfirmed"
-    try:
-        if result.process_exited and result.profile_matches:
-            reason = "agy_cli_scan_unavailable"
-            matches, complete = _running_agy_cli_processes()
-            if complete and not matches:
-                profile = Path.home() / ".gemini" / "antigravity-cli"
-                quarantine = Path.home() / ".agent-bridge" / "agy_slot_quarantine" / request.operation_id
-                summary = profile / "conversation_summaries.db"
-                with ExitStack() as pins:
-                    reason = "source_unverified"
-                    for directory in (Path.home(), profile.parent, profile):
-                        _pin_entry(pins, directory, directory=True)
-                    absent_roots = set()
-                    for directory in (profile / "conversations", profile / "brain"):
-                        if _checked_entry(directory, directory=True, optional=True) is None:
-                            absent_roots.add(directory)
-                        else:
+    completed = 0
+    reason = "process_exit_unconfirmed" if not result.process_exited else "cli_profile_unverified"
+    if result.process_exited and result.profile_matches:
+        profile = Path.home() / ".gemini" / "antigravity-cli"
+        quarantine = Path.home() / ".agent-bridge" / "agy_slot_quarantine" / request.operation_id
+        summary = profile / "conversation_summaries.db"
+        db = None
+        absent_roots: set[Path] = set()
+        try:
+            with ExitStack() as pins:
+                for cid in candidates:
+                    # Another slot can start a CLI between two CIDs under this project's lock.
+                    reason = "agy_cli_scan_unavailable"
+                    matches, complete = _running_agy_cli_processes()
+                    if matches:
+                        reason = "agy_cli_running"
+                        break
+                    if not complete:
+                        break
+                    if db is None:
+                        reason = "source_unverified"
+                        for directory in (Path.home(), profile.parent, profile):
                             _pin_entry(pins, directory, directory=True)
-                    reason = "summary_unavailable"
-                    _pin_entry(pins, summary, directory=False)
-                    for suffix in ("-wal", "-shm", "-journal"):
-                        sidecar = summary.with_name(summary.name + suffix)
-                        if _checked_entry(sidecar, directory=False, optional=True) is not None:
-                            _pin_entry(pins, sidecar, directory=False)
-                    with closing(sqlite3.connect(summary.as_uri() + "?mode=ro", uri=True, timeout=0)) as db:
-                        for cid in candidates:
-                            locked[cid] = _quarantine_one(
-                                profile, quarantine, request.batch_number, cid, db, absent_roots
-                            )
-                return list(locked.values())
-            if matches:
-                reason = "agy_cli_running"
-        elif result.process_exited:
-            reason = "cli_profile_unverified"
-    except (OSError, sqlite3.Error, SlotGuardError):
-        pass
-    for cid in candidates:
+                        for directory in (profile / "conversations", profile / "brain"):
+                            if _checked_entry(directory, directory=True, optional=True) is None:
+                                absent_roots.add(directory)
+                            else:
+                                _pin_entry(pins, directory, directory=True)
+                        reason = "summary_unavailable"
+                        _pin_entry(pins, summary, directory=False)
+                        for suffix in ("-wal", "-shm", "-journal"):
+                            sidecar = summary.with_name(summary.name + suffix)
+                            if _checked_entry(sidecar, directory=False, optional=True) is not None:
+                                _pin_entry(pins, sidecar, directory=False)
+                        # mode=ro observes current WAL data. SQLite may create its own WAL/SHM sidecars.
+                        db = pins.enter_context(
+                            closing(sqlite3.connect(summary.as_uri() + "?mode=ro", uri=True, timeout=0))
+                        )
+                    locked[cid] = _quarantine_one(profile, quarantine, request.batch_number, cid, db, absent_roots)
+                    completed += 1
+        except (OSError, sqlite3.Error, SlotGuardError):
+            pass
+    for cid in candidates[completed:]:
         locked[cid]["reason"] = reason
     return list(locked.values())
 
@@ -1649,7 +1654,8 @@ def _batch_record(request: CleanerRequest, result: CleanerExecutionResult, *, la
                     "id": cid,
                     "status": "residual_locked",
                     "reason": "process_exit_unconfirmed",
-                    "moved": [],
+                    # The parent may have stopped between moves, before saving a physical receipt.
+                    "moved": None,
                     "remaining": None,
                 }
                 for cid in result.http_200_ids
