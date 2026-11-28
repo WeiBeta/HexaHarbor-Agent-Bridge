@@ -1771,7 +1771,7 @@ input[type="checkbox"] {
 
   .tabs {
     max-width: 100%;
-    overflow-x: auto;
+    flex-wrap: wrap;
   }
 
   .tab {

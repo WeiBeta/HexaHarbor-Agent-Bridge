@@ -1884,10 +1884,11 @@
     if (!slot || !preview || !preview.payload || typeof preview.payload !== "object") return false;
     const p = preview.payload;
     if (preview.slot !== slot.name || preview.project_id !== slot.project_id) return false;
+    if (p.slot !== slot.name || p.project_id !== slot.project_id) return false;
     if (preview.httpStatus !== 200) return false;
     if (p.dry_run !== true || p.ok !== true) return false;
     if (p.outcome !== "completed") return false;
-    if (p.counts_confirmed === false) return false;
+    if (p.counts_confirmed !== true) return false;
     if (p.stop_reason !== undefined && p.stop_reason !== null && p.stop_reason !== "preview" && p.stop_reason !== "completed") {
       return false;
     }
@@ -1914,7 +1915,8 @@
 
   function agyEvaluateLiveConditions(data, slot, confirmText, preview) {
     const cleanerOk = agyLiveCleanupAvailable(data);
-    const hasPreview = agyIsValidPreviewForSlot(slot, preview);
+    const hasPreview = agyIsValidPreviewForSlot(slot, preview) &&
+      Array.isArray(preview.payload.eligible_ids) && preview.payload.eligible_ids.length > 0;
     const status = slot ? agyNormalizeStatus(slot.status) : "unknown";
     const isReleasable = Boolean(slot && status === "releasable" && !slot.guard_error);
     const confirmMatches = Boolean(slot && typeof slot.name === "string" && slot.name.length > 0 && confirmText === slot.name);
@@ -2081,6 +2083,10 @@
       }
     } finally {
       state.agySlotsLoading = false;
+      if (state.agySlotsError) {
+        state.agySlots = null;
+        invalidateAgyConfirmState({ clearPreview: true, markInvalidated: true });
+      }
       if (refreshBtn) {
         refreshBtn.disabled = state.agyBusyMode !== null;
         refreshBtn.textContent = t("agySlots.refreshBtn");

@@ -838,6 +838,27 @@ async function runScenario() {
     );
   }
 
+  else if (scenarioName === "preview_evidence") {
+    nextGetPayload = allFiveSlotsPayload();
+    await api.loadAgySlots();
+    api.selectAgySlot("slotB");
+    for (const invalid of [
+      { eligible_ids: [], would_delete_ids: [], would_delete: 0 },
+      { project_id: "11111111-1111-4111-8111-111111111111" },
+      { slot: "slotA" },
+      { counts_confirmed: null },
+    ]) {
+      nextPostResp = { status: 200, data: { ...validPreviewPayload(), ...invalid } };
+      await api.runAgyDryRunPreview();
+      const input = doc.getElementById("agy-confirm-input");
+      input.value = "slotB";
+      input.dispatch("input", { target: input });
+      api.openAgyCleanupModal();
+      assert.strictEqual(api.getState().modalOpen, false, JSON.stringify(invalid));
+      await api.submitAgyLiveCleanup();
+    }
+    assert.ok(requests.every((r) => r.method !== "POST" || r.body.dry_run === true));
+  }
   else if (scenarioName === "cancel_confirm_and_invalidation") {
     nextGetPayload = allFiveSlotsPayload();
     await api.loadAgySlots();
@@ -1069,7 +1090,9 @@ def _run_node_scenario(scenario: str) -> None:
             encoding="utf-8",
             check=False,
         )
-    assert completed.returncode == 0, f"Node scenario {scenario} failed:\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+    assert completed.returncode == 0, (
+        f"Node scenario {scenario} failed:\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+    )
     parsed = json.loads(completed.stdout)
     assert parsed["ok"] is True
 
@@ -1088,6 +1111,10 @@ def test_agy_slots_partial_unknown_502_concepts_and_tristate():
 
 def test_agy_slots_cancel_confirm_and_invalidation_paths():
     _run_node_scenario("cancel_confirm_and_invalidation")
+
+
+def test_live_action_requires_matching_preview_receipt_with_candidates():
+    _run_node_scenario("preview_evidence")
 
 
 def test_agy_slots_refresh_get_only():
@@ -1204,7 +1231,16 @@ def _start_synthetic_server() -> tuple[ThreadingHTTPServer, threading.Thread, _S
                 self._send_json(200, {"ok": True, "revision": rev, "locale": locale, "imported_receipts": 0})
                 return
             if path == "/api/summary":
-                self._send_json(200, {"ok": True, "overview": {"tasks": 0, "active_days": 0, "total_tokens": 0, "effective_cost_usd": None}, "daily": [], "by_model": [], "by_agent": []})
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "overview": {"tasks": 0, "active_days": 0, "total_tokens": 0, "effective_cost_usd": None},
+                        "daily": [],
+                        "by_model": [],
+                        "by_agent": [],
+                    },
+                )
                 return
             if path == "/api/pricing":
                 self._send_json(200, {"ok": True, "config": {"models": {}, "harness_discounts": []}, "observed": []})
@@ -1223,7 +1259,11 @@ def _start_synthetic_server() -> tuple[ThreadingHTTPServer, threading.Thread, _S
                             "tray_running": False,
                             "is_checkout": True,
                             "log_path": "synthetic/dashboard.log",
-                            "config": {"auto_start": False, "tray_enabled": False, "port": self.server.server_address[1]},
+                            "config": {
+                                "auto_start": False,
+                                "tray_enabled": False,
+                                "port": self.server.server_address[1],
+                            },
                             "autostart": {"enabled": False, "matches_current": True},
                         },
                     },
@@ -1682,7 +1722,6 @@ def test_agy_slots_real_browser_e2e_bilingual_and_375px_viewport():
             "about:blank",
         ],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
     )
     try:
         ws_url = None
@@ -1691,7 +1730,9 @@ def test_agy_slots_real_browser_e2e_bilingual_and_375px_viewport():
             try:
                 with urllib.request.urlopen(f"http://127.0.0.1:{cdp_port}/json/list", timeout=1) as resp:
                     targets = json.loads(resp.read().decode("utf-8"))
-                page_target = next((t for t in targets if t.get("type") == "page" and t.get("webSocketDebuggerUrl")), None)
+                page_target = next(
+                    (t for t in targets if t.get("type") == "page" and t.get("webSocketDebuggerUrl")), None
+                )
                 if page_target:
                     ws_url = page_target["webSocketDebuggerUrl"]
                     break
@@ -1710,7 +1751,9 @@ def test_agy_slots_real_browser_e2e_bilingual_and_375px_viewport():
                 timeout=45,
                 check=False,
             )
-        assert completed.returncode == 0, f"Browser E2E failed:\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+        assert completed.returncode == 0, (
+            f"Browser E2E failed:\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+        )
         parsed = json.loads(completed.stdout)
         assert parsed["ok"] is True
         assert parsed["m375Zh"]["rootOverflow"] <= 1

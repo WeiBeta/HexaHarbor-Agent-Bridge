@@ -553,7 +553,7 @@
     "liveSectionTitle": "正式清理（不可逆删除）",
     "checklistTitle": "正式清理前置条件（全部满足后解锁）",
     "checkPreviewOk": "已具备当前槽位与当前项目 UUID 的有效预演结果",
-    "checkPreviewMissing": "缺少当前槽位与当前项目 UUID 的有效预演结果（请先执行预演；换槽、改绑、状态变化或预演失败后会自动作废）",
+    "checkPreviewMissing": "请先完成当前槽位及项目 UUID 的有效预演，至少列出一个可清理会话。",
     "checkReleasableOk": "当前槽位状态仍为「可释放」（releasable）",
     "checkReleasableMissing": "当前槽位状态不是「可释放」（当前：{status}）",
     "checkConfirmOk": "确认输入框已精确匹配槽名（{slot}）",

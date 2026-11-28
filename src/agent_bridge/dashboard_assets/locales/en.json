@@ -553,7 +553,7 @@
     "liveSectionTitle": "Live Cleanup (Irreversible Delete)",
     "checklistTitle": "Live Cleanup Prerequisites (all required)",
     "checkPreviewOk": "Valid dry-run preview present for this slot and project UUID",
-    "checkPreviewMissing": "Missing valid preview for this slot and project UUID (run preview first; invalidated on slot switch, rebind, status change, or preview failure)",
+    "checkPreviewMissing": "A completed preview for this slot and project UUID must list at least one eligible conversation.",
     "checkReleasableOk": "Slot status is still Releasable (releasable)",
     "checkReleasableMissing": "Slot status is not Releasable (current: {status})",
     "checkConfirmOk": "Confirmation input exactly matches slot name ({slot})",
